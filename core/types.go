@@ -62,6 +62,10 @@ func ToolResultMessage(toolCallID, content string) Message {
 	return Message{Role: "tool", Content: &content, ToolCallID: toolCallID}
 }
 
+func GoalMessage(content string) Message {
+	return Message{Role: "goal", Content: &content}
+}
+
 type Tool interface {
 	Name() string
 	Schema() json.RawMessage
