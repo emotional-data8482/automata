@@ -6,10 +6,10 @@ require (
 	github.com/charmbracelet/bubbles v0.20.0
 	github.com/charmbracelet/bubbletea v1.2.4
 	github.com/charmbracelet/lipgloss v1.0.0
-	github.com/emotional-data/automata v0.0.0
-	github.com/emotional-data/automata/extensions/claude v0.0.0
-	github.com/emotional-data/automata/extensions/tavily v0.0.0
-	github.com/emotional-data/automata/tools v0.0.0
+	github.com/emotional-data/automata v0.1.0
+	github.com/emotional-data/automata/extensions/claude v0.1.0
+	github.com/emotional-data/automata/extensions/tavily v0.1.0
+	github.com/emotional-data/automata/tools v0.1.0
 	github.com/joho/godotenv v1.5.1
 )
 

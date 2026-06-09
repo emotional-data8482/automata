@@ -3,8 +3,8 @@ module github.com/emotional-data/automata/examples/claude
 go 1.26.2
 
 require (
-	github.com/emotional-data/automata v0.0.0
-	github.com/emotional-data/automata/extensions/claude v0.0.0
+	github.com/emotional-data/automata v0.1.0
+	github.com/emotional-data/automata/extensions/claude v0.1.0
 )
 
 require (
