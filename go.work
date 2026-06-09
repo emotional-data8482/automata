@@ -1,0 +1,10 @@
+go 1.26.2
+
+use (
+	.
+	./examples/claude
+	./examples/deep_research
+	./extensions/claude
+	./extensions/tavily
+	./tools
+)
