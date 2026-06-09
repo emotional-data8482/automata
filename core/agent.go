@@ -131,7 +131,12 @@ func (a *Agent) RegisterFunc(name, description string, fn func(context.Context) 
 }
 
 func (a *Agent) Run(ctx context.Context, task string) (string, error) {
-	l := newLoop(a)
+	return a.runSync(ctx, newLoop(a, nil), task)
+}
+
+// runSync drives a pre-built loop through the non-streaming path. Split from
+// Run so a [Session] can supply a loop seeded with its transcript.
+func (a *Agent) runSync(ctx context.Context, l *Loop, task string) (string, error) {
 	return l.run(ctx, task, "sync", func(ctx context.Context, _ *slog.Logger, messages []Message, tools []Tool) (Message, error) {
 		return retry.Do(ctx, a.retryCfg, func() (Message, error) {
 			return a.provider.Invoke(ctx, messages, tools)

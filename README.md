@@ -19,7 +19,7 @@ agents run inside a web server, not a notebook.
 
 | Module / package | What it is |
 |---|---|
-| `core` | Agent, Loop, Tool, Provider, streaming, hooks, approval |
+| `core` | Agent, Loop, Session, Tool, Provider, streaming, hooks, approval |
 | `tools` (module) | First-party tools: `HTTPFetch`, `ReadFile`/`WriteFile` (sandboxed), `Shell` (allow-listed), `WebSearch` |
 | `extensions/claude` (module) | Anthropic provider (`core.StreamProvider`) |
 | `extensions/tavily` (module) | Tavily backend for `tools.WebSearch` |
@@ -67,6 +67,26 @@ func main() {
 	}
 	fmt.Println(out)
 }
+```
+
+## Sessions and transcripts
+
+`Agent.Run` is one-shot. For multi-turn conversations — and for the audit
+trail — use a `Session`: every run continues the same conversation, and the
+full transcript (system prompt, tasks, replies, tool calls and results) is
+plain data you can persist and resume. The transcript is recorded even when a
+run fails, so you can always see what happened.
+
+```go
+sess := agent.NewSession()
+draft, _ := sess.Run(ctx, "Draft a refund policy for our SaaS")
+final, _ := sess.Run(ctx, "Make it friendlier and add a 30-day clause")
+
+// Persist anywhere; resume later, even in another process.
+blob, _ := json.Marshal(sess.Messages())
+var transcript []core.Message
+_ = json.Unmarshal(blob, &transcript)
+sess = agent.ResumeSession(transcript)
 ```
 
 ## Multi-agent: sub-agents are just tools

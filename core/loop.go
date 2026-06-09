@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 
 	"golang.org/x/sync/errgroup"
 
@@ -27,8 +28,12 @@ var (
 	// over-aggressive safety filter.
 	ErrEmptyResponse = errors.New("assistant returned no content and no tool calls")
 
-	// ErrToolNotFound is returned when the model requests a tool the agent
-	// does not have registered.
+	// ErrToolNotFound is embedded in the tool result fed back to the model
+	// when it requests a tool the agent does not have registered. Models
+	// occasionally hallucinate tool names, so an unknown tool is recoverable —
+	// the result names the available tools and the run continues — rather
+	// than a hard failure. It also appears as the Err on the corresponding
+	// StreamToolResult event.
 	ErrToolNotFound = errors.New("tool not found")
 )
 
@@ -53,11 +58,15 @@ type Loop struct {
 	streaming bool
 }
 
-// newLoop creates a run-scoped Loop for the agent, seeding the conversation with
-// the agent's system prompt (if any) and indexing its tools for lookup.
-func newLoop(a *Agent) *Loop {
+// newLoop creates a run-scoped Loop for the agent and indexes its tools for
+// lookup. With no history the conversation is seeded with the agent's system
+// prompt (if any); a non-empty history (a [Session] transcript, which already
+// carries its system message) is copied in verbatim instead.
+func newLoop(a *Agent, history []Message) *Loop {
 	var messages []Message
-	if a.systemPrompt != "" {
+	if len(history) > 0 {
+		messages = append([]Message(nil), history...)
+	} else if a.systemPrompt != "" {
 		messages = []Message{SystemMessage(a.systemPrompt)}
 	}
 	toolsByName := make(map[string]Tool, len(a.tools))
@@ -230,7 +239,17 @@ func (l *Loop) executeTool(ctx context.Context, call ToolCall, messages []Messag
 	a := l.agent
 	tool, ok := l.toolsByName[call.Function.Name]
 	if !ok {
-		return "", fmt.Errorf("%w: %q", ErrToolNotFound, call.Function.Name)
+		// A hallucinated tool name is model error, not program error: feed it
+		// back like any other tool failure so the model can pick a real tool.
+		names := make([]string, len(a.tools))
+		for i, t := range a.tools {
+			names[i] = t.Name()
+		}
+		err := fmt.Errorf("%w: %q (available tools: %s)", ErrToolNotFound, call.Function.Name, strings.Join(names, ", "))
+		l.log.WarnContext(ctx, "tool not found", "tool", call.Function.Name)
+		notFound := fmt.Sprintf("error: %s", err.Error())
+		l.emit(StreamEvent{Kind: StreamToolResult, ToolCall: call, Result: notFound, Err: err})
+		return notFound, nil
 	}
 
 	// When this run is streaming, hand the sink to the tool via context so a

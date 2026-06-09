@@ -31,13 +31,18 @@ type partialToolCall struct {
 // concurrently), but RunStream serializes the calls, so the callback need not be
 // safe for concurrent use.
 func (a *Agent) RunStream(ctx context.Context, task string, onEvent func(StreamEvent)) (string, error) {
+	return a.runStream(ctx, newLoop(a, nil), task, onEvent)
+}
+
+// runStream drives a pre-built loop through the streaming path. Split from
+// RunStream so a [Session] can supply a loop seeded with its transcript.
+func (a *Agent) runStream(ctx context.Context, l *Loop, task string, onEvent func(StreamEvent)) (string, error) {
 	if onEvent == nil {
 		onEvent = func(StreamEvent) {}
 	}
 
 	sp, streamOK := a.provider.(StreamProvider)
 
-	l := newLoop(a)
 	l.streaming = true
 	var mu sync.Mutex
 	l.emit = func(ev StreamEvent) {
