@@ -66,7 +66,7 @@ func TestAsToolFuncRendersTask(t *testing.T) {
 		}}},
 		{Role: "assistant", Content: &final},
 	}})
-	orch.RegisterTool(AsToolFunc[researchArgs](sub, "researcher", "delegate research", renderResearch))
+	orch.RegisterTool(AsToolFunc(sub, "researcher", "delegate research", renderResearch))
 
 	out, err := orch.Run(context.Background(), "go")
 	if err != nil {
@@ -97,7 +97,7 @@ func TestAsToolFuncInvalidArgs(t *testing.T) {
 		}}},
 		{Role: "assistant", Content: &final},
 	}})
-	orch.RegisterTool(AsToolFunc[researchArgs](sub, "researcher", "delegate research", renderResearch))
+	orch.RegisterTool(AsToolFunc(sub, "researcher", "delegate research", renderResearch))
 
 	var result string
 	out, err := orch.RunStream(context.Background(), "go", func(ev StreamEvent) {
@@ -134,7 +134,7 @@ func TestAsToolFuncEmptyArgsRenderZero(t *testing.T) {
 		}}},
 		{Role: "assistant", Content: &final},
 	}})
-	orch.RegisterTool(AsToolFunc[researchArgs](sub, "researcher", "delegate research", renderResearch))
+	orch.RegisterTool(AsToolFunc(sub, "researcher", "delegate research", renderResearch))
 
 	if _, err := orch.Run(context.Background(), "go"); err != nil {
 		t.Fatalf("Run: %v", err)
@@ -147,7 +147,7 @@ func TestAsToolFuncEmptyArgsRenderZero(t *testing.T) {
 // TestAsToolFuncSchemaFromP pins that the schema advertised to the model is
 // still derived from P, exactly as with AsTool.
 func TestAsToolFuncSchemaFromP(t *testing.T) {
-	tool := AsToolFunc[researchArgs](New(&scriptedProvider{}), "researcher", "delegate research", renderResearch)
+	tool := AsToolFunc(New(&scriptedProvider{}), "researcher", "delegate research", renderResearch)
 
 	var schema struct {
 		Name        string `json:"name"`
@@ -188,7 +188,7 @@ func TestAsToolFuncStreamsTagged(t *testing.T) {
 		}}},
 		{Role: "assistant", Content: &final},
 	}})
-	orch.RegisterTool(AsToolFunc[researchArgs](sub, "researcher", "delegate research", renderResearch))
+	orch.RegisterTool(AsToolFunc(sub, "researcher", "delegate research", renderResearch))
 
 	var tagged []string
 	if _, err := orch.RunStream(context.Background(), "go", func(ev StreamEvent) {
