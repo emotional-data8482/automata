@@ -2,12 +2,58 @@ package core
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
 	"strings"
 	"testing"
 )
+
+// --- block-message test helpers -------------------------------------------
+
+// asstText builds an assistant message carrying a single text block.
+func asstText(s string) Message { return AssistantMessage(TextBlock{Text: s}) }
+
+// toolUse builds a ToolUseBlock with the given raw JSON arguments.
+func toolUse(id, name, args string) ToolUseBlock {
+	return ToolUseBlock{ID: id, Name: name, Input: json.RawMessage(args)}
+}
+
+// asstTool builds an assistant message carrying a single tool_use block.
+func asstTool(id, name, args string) Message {
+	return AssistantMessage(toolUse(id, name, args))
+}
+
+// withUsage attaches usage to a message and returns it, for terse literals.
+func withUsage(m Message, u *Usage) Message {
+	m.Usage = u
+	return m
+}
+
+// streamMessage emits a scripted assistant Message as the StreamChunk sequence a
+// provider would produce: a start delta per block, then its content, then usage.
+func streamMessage(ch chan<- StreamChunk, m Message) {
+	for idx, blk := range m.Blocks {
+		switch b := blk.(type) {
+		case TextBlock:
+			ch <- StreamChunk{Deltas: []BlockDelta{{Index: idx, Type: "text"}}}
+			ch <- StreamChunk{Deltas: []BlockDelta{{Index: idx, Text: b.Text}}}
+		case ThinkingBlock:
+			ch <- StreamChunk{Deltas: []BlockDelta{{Index: idx, Type: "thinking"}}}
+			ch <- StreamChunk{Deltas: []BlockDelta{{Index: idx, Text: b.Thinking}}}
+			if b.Signature != "" {
+				ch <- StreamChunk{Deltas: []BlockDelta{{Index: idx, Signature: b.Signature}}}
+			}
+		case ToolUseBlock:
+			ch <- StreamChunk{Deltas: []BlockDelta{{Index: idx, Type: "tool_use", ID: b.ID, Name: b.Name}}}
+			ch <- StreamChunk{Deltas: []BlockDelta{{Index: idx, PartialJSON: string(b.Input)}}}
+		}
+	}
+	if m.Usage != nil {
+		ch <- StreamChunk{Usage: m.Usage}
+	}
+}
 
 // scriptedStreamProvider replays a fixed sequence of StreamChunks for each turn,
 // letting tests drive RunStream's streaming path without a network.
@@ -18,11 +64,11 @@ type scriptedStreamProvider struct {
 
 var _ StreamProvider = (*scriptedStreamProvider)(nil)
 
-func (p *scriptedStreamProvider) Invoke(context.Context, []Message, []Tool) (Message, error) {
-	return Message{}, errors.New("Invoke should not be used on the streaming path")
+func (p *scriptedStreamProvider) Invoke(context.Context, Request) (Response, error) {
+	return Response{}, errors.New("Invoke should not be used on the streaming path")
 }
 
-func (p *scriptedStreamProvider) InvokeStream(context.Context, []Message, []Tool) (<-chan StreamChunk, error) {
+func (p *scriptedStreamProvider) InvokeStream(context.Context, Request) (<-chan StreamChunk, error) {
 	if p.calls >= len(p.turns) {
 		return nil, fmt.Errorf("no script for turn %d", p.calls)
 	}
@@ -45,13 +91,13 @@ type scriptedProvider struct {
 	calls int
 }
 
-func (p *scriptedProvider) Invoke(context.Context, []Message, []Tool) (Message, error) {
+func (p *scriptedProvider) Invoke(context.Context, Request) (Response, error) {
 	if p.calls >= len(p.turns) {
-		return Message{}, fmt.Errorf("no script for turn %d", p.calls)
+		return Response{}, fmt.Errorf("no script for turn %d", p.calls)
 	}
 	m := p.turns[p.calls]
 	p.calls++
-	return m, nil
+	return Response{Message: m}, nil
 }
 
 // recordingProvider implements both Provider and StreamProvider, replaying the
@@ -76,12 +122,13 @@ func (p *recordingProvider) next() (Message, error) {
 	return m, nil
 }
 
-func (p *recordingProvider) Invoke(context.Context, []Message, []Tool) (Message, error) {
+func (p *recordingProvider) Invoke(context.Context, Request) (Response, error) {
 	p.syncCalls++
-	return p.next()
+	m, err := p.next()
+	return Response{Message: m}, err
 }
 
-func (p *recordingProvider) InvokeStream(context.Context, []Message, []Tool) (<-chan StreamChunk, error) {
+func (p *recordingProvider) InvokeStream(context.Context, Request) (<-chan StreamChunk, error) {
 	p.streamCalls++
 	m, err := p.next()
 	if err != nil {
@@ -90,17 +137,7 @@ func (p *recordingProvider) InvokeStream(context.Context, []Message, []Tool) (<-
 	ch := make(chan StreamChunk)
 	go func() {
 		defer close(ch)
-		if m.Content != nil && *m.Content != "" {
-			ch <- StreamChunk{ContentDelta: *m.Content}
-		}
-		for i, tc := range m.ToolCalls {
-			ch <- StreamChunk{ToolCalls: []StreamToolCallFragment{{
-				Index: i, ID: tc.ID, Type: tc.Type, Name: tc.Function.Name, Arguments: tc.Function.Arguments,
-			}}}
-		}
-		if m.Usage != nil {
-			ch <- StreamChunk{Usage: m.Usage}
-		}
+		streamMessage(ch, m)
 	}()
 	return ch, nil
 }
@@ -115,8 +152,8 @@ type echoArgs struct {
 // blocks (e.g. leading text) toward it, so tool calls don't always start at 0.
 func toolCallChunksAt(index int, id, name, args string) []StreamChunk {
 	return []StreamChunk{
-		{ToolCalls: []StreamToolCallFragment{{Index: index, ID: id, Type: "function", Name: name}}},
-		{ToolCalls: []StreamToolCallFragment{{Index: index, Arguments: args}}},
+		{Deltas: []BlockDelta{{Index: index, Type: "tool_use", ID: id, Name: name}}},
+		{Deltas: []BlockDelta{{Index: index, PartialJSON: args}}},
 	}
 }
 
@@ -124,12 +161,24 @@ func toolCallChunks(id, name, args string) []StreamChunk {
 	return toolCallChunksAt(0, id, name, args)
 }
 
+// textChunksAt builds the two-chunk sequence a stream produces for a text block
+// at the given content-block index: a start delta (announcing the type) then a
+// content delta.
+func textChunksAt(index int, s string) []StreamChunk {
+	return []StreamChunk{
+		{Deltas: []BlockDelta{{Index: index, Type: "text"}}},
+		{Deltas: []BlockDelta{{Index: index, Text: s}}},
+	}
+}
+
+func textChunks(s string) []StreamChunk { return textChunksAt(0, s) }
+
 func TestRunStreamEmitsTextToolCallAndResult(t *testing.T) {
 	provider := &scriptedStreamProvider{turns: [][]StreamChunk{
-		// Turn 1: a content delta, then a tool call.
-		append([]StreamChunk{{ContentDelta: "Let me check. "}}, toolCallChunks("call_1", "echo", `{"msg":"hi"}`)...),
+		// Turn 1: leading text (block 0), then a tool call (block 1).
+		append(textChunks("Let me check. "), toolCallChunksAt(1, "call_1", "echo", `{"msg":"hi"}`)...),
 		// Turn 2: the final answer, no tool calls.
-		{{ContentDelta: "Done."}},
+		textChunks("Done."),
 	}}
 
 	agent := New(provider)
@@ -144,11 +193,11 @@ func TestRunStreamEmitsTextToolCallAndResult(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RunStream: %v", err)
 	}
-	if out != "Done." {
-		t.Errorf("final output = %q, want %q", out, "Done.")
+	if out.Output != "Done." {
+		t.Errorf("final output = %q, want %q", out.Output, "Done.")
 	}
 
-	call := ToolCall{ID: "call_1", Type: "function", Function: FunctionCall{Name: "echo", Arguments: `{"msg":"hi"}`}}
+	call := toolUse("call_1", "echo", `{"msg":"hi"}`)
 	want := []StreamEvent{
 		{Kind: StreamText, Text: "Let me check. "},
 		{Kind: StreamToolCall, ToolCall: call},
@@ -159,28 +208,34 @@ func TestRunStreamEmitsTextToolCallAndResult(t *testing.T) {
 		t.Fatalf("got %d events, want %d:\n got: %+v\nwant: %+v", len(got), len(want), got, want)
 	}
 	// Compare field-by-field; all Err are expected nil here (avoid DeepEqual
-	// over the error field).
+	// over the error field and the RawMessage in ToolCall).
 	for i := range want {
 		if got[i].Err != nil {
 			t.Errorf("event %d: unexpected Err %v", i, got[i].Err)
 		}
 		if got[i].Kind != want[i].Kind || got[i].Text != want[i].Text ||
-			got[i].Result != want[i].Result || got[i].ToolCall != want[i].ToolCall {
+			got[i].Result != want[i].Result || !toolCallEqual(got[i].ToolCall, want[i].ToolCall) {
 			t.Errorf("event %d mismatch:\n got: %+v\nwant: %+v", i, got[i], want[i])
 		}
 	}
+}
+
+// toolCallEqual compares two ToolUseBlocks by value, treating Input as raw
+// bytes (json.RawMessage is not comparable with ==).
+func toolCallEqual(a, b ToolUseBlock) bool {
+	return a.ID == b.ID && a.Name == b.Name && string(a.Input) == string(b.Input)
 }
 
 // TestRunStreamSkipsGapToolSlots reproduces the case where the model emits
 // leading text (content block 0) then tool calls (blocks 1, 2). The block-0 gap
 // must not become a phantom unnamed tool call.
 func TestRunStreamSkipsGapToolSlots(t *testing.T) {
-	turn1 := []StreamChunk{{ContentDelta: "Let me fetch both. "}}
+	turn1 := textChunks("Let me fetch both. ")
 	turn1 = append(turn1, toolCallChunksAt(1, "c1", "now", `{"tz":"Asia/Tokyo"}`)...)
 	turn1 = append(turn1, toolCallChunksAt(2, "c2", "now", `{"tz":""}`)...)
 	provider := &scriptedStreamProvider{turns: [][]StreamChunk{
 		turn1,
-		{{ContentDelta: "done"}},
+		textChunks("done"),
 	}}
 
 	agent := New(provider)
@@ -193,7 +248,7 @@ func TestRunStreamSkipsGapToolSlots(t *testing.T) {
 		switch ev.Kind {
 		case StreamToolCall:
 			calls++
-			if ev.ToolCall.Function.Name == "" {
+			if ev.ToolCall.Name == "" {
 				t.Errorf("phantom tool call with empty name: %+v", ev.ToolCall)
 			}
 		case StreamToolResult:
@@ -203,8 +258,8 @@ func TestRunStreamSkipsGapToolSlots(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RunStream: %v", err)
 	}
-	if out != "done" {
-		t.Errorf("final output = %q, want %q", out, "done")
+	if out.Output != "done" {
+		t.Errorf("final output = %q, want %q", out.Output, "done")
 	}
 	if calls != 2 || results != 2 {
 		t.Errorf("got %d tool calls / %d results, want 2 / 2", calls, results)
@@ -214,7 +269,7 @@ func TestRunStreamSkipsGapToolSlots(t *testing.T) {
 func TestRunStreamToolResultCarriesError(t *testing.T) {
 	provider := &scriptedStreamProvider{turns: [][]StreamChunk{
 		toolCallChunks("call_1", "boom", `{}`),
-		{{ContentDelta: "recovered"}},
+		textChunks("recovered"),
 	}}
 
 	agent := New(provider)
@@ -238,18 +293,20 @@ func TestRunStreamToolResultCarriesError(t *testing.T) {
 	if result.Err == nil || !strings.Contains(result.Err.Error(), "kaboom") {
 		t.Errorf("result.Err = %v, want one containing %q", result.Err, "kaboom")
 	}
-	if result.Result != "error: kaboom" {
-		t.Errorf("result.Result = %q, want %q", result.Result, "error: kaboom")
+	// The core result is the raw error text (no "error: " prefix — that's the
+	// provider's job now), and IsError is set.
+	if result.Result != "kaboom" {
+		t.Errorf("result.Result = %q, want %q", result.Result, "kaboom")
+	}
+	if !result.IsError {
+		t.Error("result.IsError = false, want true")
 	}
 }
 
 func TestRunStreamFallbackEmitsToolEvents(t *testing.T) {
-	thinking, final := "thinking", "final"
 	provider := &scriptedProvider{turns: []Message{
-		{Role: "assistant", Content: &thinking, ToolCalls: []ToolCall{
-			{ID: "c1", Type: "function", Function: FunctionCall{Name: "echo", Arguments: `{"msg":"yo"}`}},
-		}},
-		{Role: "assistant", Content: &final},
+		AssistantMessage(TextBlock{Text: "thinking"}, toolUse("c1", "echo", `{"msg":"yo"}`)),
+		asstText("final"),
 	}}
 
 	agent := New(provider)
@@ -268,8 +325,8 @@ func TestRunStreamFallbackEmitsToolEvents(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RunStream: %v", err)
 	}
-	if out != "final" {
-		t.Errorf("final output = %q, want %q", out, "final")
+	if out.Output != "final" {
+		t.Errorf("final output = %q, want %q", out.Output, "final")
 	}
 
 	wantKinds := []StreamEventKind{StreamText, StreamToolCall, StreamToolResult, StreamText}
@@ -285,10 +342,9 @@ func TestRunStreamFallbackEmitsToolEvents(t *testing.T) {
 // StreamUsage event when the provider reports it.
 func TestRunStreamEmitsUsage(t *testing.T) {
 	provider := &scriptedStreamProvider{turns: [][]StreamChunk{
-		{
-			{ContentDelta: "hi"},
-			{Usage: &Usage{InputTokens: 12, OutputTokens: 7}},
-		},
+		append(textChunks("hi"),
+			StreamChunk{Usage: &Usage{InputTokens: 12, OutputTokens: 7}},
+		),
 	}}
 
 	agent := New(provider)
@@ -317,18 +373,18 @@ func TestRunStreamEmitsUsage(t *testing.T) {
 // parent stream tagged with the tool's name — and that a plain Run instead
 // routes the sub-agent through its non-streaming path.
 func TestAsToolStreamsSubAgentEvents(t *testing.T) {
-	subCall := ToolCall{ID: "s1", Type: "function", Function: FunctionCall{Name: "subagent", Arguments: "{}"}}
+	subCall := toolUse("s1", "subagent", "{}")
 	final := "done"
 	subText := "sub result"
 
 	// Streaming parent: sub-agent should stream and its text should arrive tagged.
 	t.Run("streaming propagates tagged events", func(t *testing.T) {
-		subProvider := &recordingProvider{turns: []Message{{Role: "assistant", Content: &subText}}}
+		subProvider := &recordingProvider{turns: []Message{asstText(subText)}}
 		sub := New(subProvider)
 
 		orch := New(&recordingProvider{turns: []Message{
-			{Role: "assistant", ToolCalls: []ToolCall{subCall}},
-			{Role: "assistant", Content: &final},
+			AssistantMessage(subCall),
+			asstText(final),
 		}})
 		orch.RegisterTool(AsTool[struct{}](sub, "subagent", "a sub-agent"))
 
@@ -348,8 +404,8 @@ func TestAsToolStreamsSubAgentEvents(t *testing.T) {
 		if err != nil {
 			t.Fatalf("RunStream: %v", err)
 		}
-		if out != final {
-			t.Errorf("output = %q, want %q", out, final)
+		if out.Output != final {
+			t.Errorf("output = %q, want %q", out.Output, final)
 		}
 		if subProvider.streamCalls != 1 || subProvider.syncCalls != 0 {
 			t.Errorf("sub-agent path: streamCalls=%d syncCalls=%d, want 1/0", subProvider.streamCalls, subProvider.syncCalls)
@@ -364,12 +420,12 @@ func TestAsToolStreamsSubAgentEvents(t *testing.T) {
 
 	// Non-streaming parent: sub-agent should run through Invoke, not InvokeStream.
 	t.Run("plain Run does not stream sub-agent", func(t *testing.T) {
-		subProvider := &recordingProvider{turns: []Message{{Role: "assistant", Content: &subText}}}
+		subProvider := &recordingProvider{turns: []Message{asstText(subText)}}
 		sub := New(subProvider)
 
 		orch := New(&recordingProvider{turns: []Message{
-			{Role: "assistant", ToolCalls: []ToolCall{subCall}},
-			{Role: "assistant", Content: &final},
+			AssistantMessage(subCall),
+			asstText(final),
 		}})
 		orch.RegisterTool(AsTool[struct{}](sub, "subagent", "a sub-agent"))
 
@@ -377,8 +433,8 @@ func TestAsToolStreamsSubAgentEvents(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Run: %v", err)
 		}
-		if out != final {
-			t.Errorf("output = %q, want %q", out, final)
+		if out.Output != final {
+			t.Errorf("output = %q, want %q", out.Output, final)
 		}
 		if subProvider.syncCalls != 1 || subProvider.streamCalls != 0 {
 			t.Errorf("sub-agent path: syncCalls=%d streamCalls=%d, want 1/0", subProvider.syncCalls, subProvider.streamCalls)
@@ -392,13 +448,13 @@ func TestAsToolStreamsSubAgentEvents(t *testing.T) {
 // batch order, then the StreamToolResult events (completion order — tools run
 // concurrently, so results may arrive in any order within the turn).
 func TestRunStreamTurnOrdering(t *testing.T) {
-	turn1 := []StreamChunk{{ContentDelta: "Let me check. "}}
+	turn1 := textChunks("Let me check. ")
 	turn1 = append(turn1, toolCallChunksAt(1, "c1", "echo", `{"msg":"a"}`)...)
 	turn1 = append(turn1, toolCallChunksAt(2, "c2", "echo", `{"msg":"b"}`)...)
 	turn1 = append(turn1, StreamChunk{Usage: &Usage{InputTokens: 12, OutputTokens: 7}})
 	provider := &scriptedStreamProvider{turns: [][]StreamChunk{
 		turn1,
-		{{ContentDelta: "done"}, {Usage: &Usage{InputTokens: 20, OutputTokens: 3}}},
+		append(textChunks("done"), StreamChunk{Usage: &Usage{InputTokens: 20, OutputTokens: 3}}),
 	}}
 
 	agent := New(provider)
@@ -413,8 +469,8 @@ func TestRunStreamTurnOrdering(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RunStream: %v", err)
 	}
-	if out != "done" {
-		t.Errorf("final output = %q, want %q", out, "done")
+	if out.Output != "done" {
+		t.Errorf("final output = %q, want %q", out.Output, "done")
 	}
 
 	wantKinds := []StreamEventKind{
@@ -457,24 +513,22 @@ func TestRunStreamTurnOrdering(t *testing.T) {
 func TestAsToolNestedTagsAndUsage(t *testing.T) {
 	leafText := "leaf-says"
 	leafProvider := &recordingProvider{turns: []Message{
-		{Role: "assistant", Content: &leafText, Usage: &Usage{InputTokens: 5, OutputTokens: 3}},
+		withUsage(asstText(leafText), &Usage{InputTokens: 5, OutputTokens: 3}),
 	}}
 	leaf := New(leafProvider)
 
 	midText := "mid-says"
 	midProvider := &recordingProvider{turns: []Message{
-		{Role: "assistant", ToolCalls: []ToolCall{{ID: "L1", Type: "function", Function: FunctionCall{Name: "leaf", Arguments: "{}"}}},
-			Usage: &Usage{InputTokens: 7, OutputTokens: 2}},
-		{Role: "assistant", Content: &midText, Usage: &Usage{InputTokens: 9, OutputTokens: 4}},
+		withUsage(asstTool("L1", "leaf", "{}"), &Usage{InputTokens: 7, OutputTokens: 2}),
+		withUsage(asstText(midText), &Usage{InputTokens: 9, OutputTokens: 4}),
 	}}
 	mid := New(midProvider)
 	mid.RegisterTool(AsTool[struct{}](leaf, "leaf", "leaf sub-agent"))
 
 	topText := "top-says"
 	orchProvider := &recordingProvider{turns: []Message{
-		{Role: "assistant", ToolCalls: []ToolCall{{ID: "M1", Type: "function", Function: FunctionCall{Name: "mid", Arguments: "{}"}}},
-			Usage: &Usage{InputTokens: 11, OutputTokens: 1}},
-		{Role: "assistant", Content: &topText, Usage: &Usage{InputTokens: 13, OutputTokens: 6}},
+		withUsage(asstTool("M1", "mid", "{}"), &Usage{InputTokens: 11, OutputTokens: 1}),
+		withUsage(asstText(topText), &Usage{InputTokens: 13, OutputTokens: 6}),
 	}}
 	orch := New(orchProvider)
 	orch.RegisterTool(AsTool[struct{}](mid, "mid", "mid sub-agent"))
@@ -490,8 +544,8 @@ func TestAsToolNestedTagsAndUsage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RunStream: %v", err)
 	}
-	if out != topText {
-		t.Errorf("output = %q, want %q", out, topText)
+	if out.Output != topText {
+		t.Errorf("output = %q, want %q", out.Output, topText)
 	}
 
 	wantText := map[string]string{"": topText, "mid": midText, "leaf": leafText}
@@ -501,18 +555,24 @@ func TestAsToolNestedTagsAndUsage(t *testing.T) {
 		}
 	}
 
-	wantUsage := map[string]Usage{
-		"":     {InputTokens: 24, OutputTokens: 7}, // 11+13 / 1+6
-		"mid":  {InputTokens: 16, OutputTokens: 6}, // 7+9 / 2+4
-		"leaf": {InputTokens: 5, OutputTokens: 3},
+	// The orchestrator calls "mid" with tool-call ID "M1"; mid calls "leaf" with
+	// "L1". Those IDs surface as the InvocationID on each lane, and events keep
+	// the innermost (agent, invocation) pair.
+	wantUsage := []struct {
+		agent, invocationID string
+		want                Usage
+	}{
+		{"", "", Usage{InputTokens: 24, OutputTokens: 7}},      // 11+13 / 1+6
+		{"mid", "M1", Usage{InputTokens: 16, OutputTokens: 6}}, // 7+9 / 2+4
+		{"leaf", "L1", Usage{InputTokens: 5, OutputTokens: 3}},
 	}
-	for agent, want := range wantUsage {
-		view, ok := acc.View(agent)
+	for _, c := range wantUsage {
+		view, ok := acc.View(c.agent, c.invocationID)
 		if !ok {
-			t.Fatalf("no view for agent %q", agent)
+			t.Fatalf("no view for agent %q invocation %q", c.agent, c.invocationID)
 		}
-		if view.Usage != want {
-			t.Errorf("usage for agent %q = %+v, want %+v", agent, view.Usage, want)
+		if view.Usage != c.want {
+			t.Errorf("usage for agent %q = %+v, want %+v", c.agent, view.Usage, c.want)
 		}
 	}
 	if totals := acc.Totals(); totals != (Usage{InputTokens: 45, OutputTokens: 16}) {
