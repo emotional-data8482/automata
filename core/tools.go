@@ -7,6 +7,8 @@ import (
 	"reflect"
 	"strings"
 	"time"
+
+	"github.com/emotional-data/automata/retry"
 )
 
 type funcTool[P any] struct {
@@ -43,6 +45,33 @@ func Func[P any](name, description string, handler func(context.Context, P) (str
 	var zero P
 	schema := buildSchema(name, description, reflect.TypeOf(zero))
 	return &funcTool[P]{name: name, schema: schema, handler: handler}
+}
+
+// retryTool wraps a [Tool] so its Execute is retried under cfg. See
+// [WithToolRetry].
+type retryTool struct {
+	Tool
+	cfg retry.Config
+}
+
+func (t *retryTool) Execute(ctx context.Context, args string) (string, error) {
+	return retry.Do(ctx, t.cfg, func() (string, error) {
+		return t.Tool.Execute(ctx, args)
+	})
+}
+
+// WithToolRetry wraps t so its Execute is retried under cfg, using the same
+// [retry] policy the agent applies to provider calls. The run loop does not
+// retry tools on its own (a retry there would replay a whole sub-agent run), so
+// this is the opt-in for plain tools — an HTTP fetch, a database query — whose
+// transient failures are worth retrying. The wrapped tool keeps t's name and
+// schema; only Execute is affected.
+//
+// Do not wrap an [AsTool] sub-agent with this: sub-agents already retry at
+// their provider layer, and retrying the Execute would re-run the entire
+// sub-agent, re-emitting its stream events and double-counting its usage.
+func WithToolRetry(t Tool, cfg retry.Config) Tool {
+	return &retryTool{Tool: t, cfg: cfg}
 }
 
 func buildSchema(name, description string, t reflect.Type) json.RawMessage {
