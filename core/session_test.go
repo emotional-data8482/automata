@@ -21,17 +21,17 @@ func roles(messages []Message) []string {
 func TestSessionMultiTurn(t *testing.T) {
 	four, eight := "4", "8"
 	provider := &capturingProvider{turns: []Message{
-		{Role: "assistant", Content: &four},
-		{Role: "assistant", Content: &eight},
+		asstText(four),
+		asstText(eight),
 	}}
 	agent := New(provider).WithSystemPrompt("You are a calculator.")
 
 	s := agent.NewSession()
-	if out, err := s.Run(context.Background(), "2+2?"); err != nil || out != four {
-		t.Fatalf("first run = %q, %v", out, err)
+	if out, err := s.Run(context.Background(), "2+2?"); err != nil || out.Output != four {
+		t.Fatalf("first run = %q, %v", out.Output, err)
 	}
-	if out, err := s.Run(context.Background(), "double it"); err != nil || out != eight {
-		t.Fatalf("second run = %q, %v", out, err)
+	if out, err := s.Run(context.Background(), "double it"); err != nil || out.Output != eight {
+		t.Fatalf("second run = %q, %v", out.Output, err)
 	}
 
 	want := []string{"system", "user", "assistant", "user"}
@@ -39,7 +39,7 @@ func TestSessionMultiTurn(t *testing.T) {
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Errorf("second turn saw roles %v, want %v", got, want)
 	}
-	if c := provider.received[1][2].Content; c == nil || *c != four {
+	if provider.received[1][2].Text() != four {
 		t.Errorf("second turn is missing the first assistant reply")
 	}
 }
@@ -47,12 +47,9 @@ func TestSessionMultiTurn(t *testing.T) {
 // TestSessionTranscriptIncludesToolTurns verifies Messages() exposes the full
 // conversation: system prompt, task, assistant tool calls, and tool results.
 func TestSessionTranscriptIncludesToolTurns(t *testing.T) {
-	done := "done"
 	provider := &capturingProvider{turns: []Message{
-		{Role: "assistant", ToolCalls: []ToolCall{
-			{ID: "c1", Type: "function", Function: FunctionCall{Name: "echo", Arguments: `{"msg":"hi"}`}},
-		}},
-		{Role: "assistant", Content: &done},
+		asstTool("c1", "echo", `{"msg":"hi"}`),
+		asstText("done"),
 	}}
 	agent := New(provider).WithSystemPrompt("sys")
 	agent.RegisterTool(Func("echo", "echoes msg", func(_ context.Context, a echoArgs) (string, error) {
@@ -75,9 +72,7 @@ func TestSessionTranscriptIncludesToolTurns(t *testing.T) {
 // records everything up to the failure.
 func TestSessionTranscriptSurvivesError(t *testing.T) {
 	provider := &capturingProvider{turns: []Message{
-		{Role: "assistant", ToolCalls: []ToolCall{
-			{ID: "c1", Type: "function", Function: FunctionCall{Name: "echo", Arguments: `{"msg":"x"}`}},
-		}},
+		asstTool("c1", "echo", `{"msg":"x"}`),
 	}}
 	agent := New(provider).WithMaxSteps(1)
 	agent.RegisterTool(Func("echo", "echoes msg", func(_ context.Context, a echoArgs) (string, error) {
@@ -103,8 +98,8 @@ func TestSessionTranscriptSurvivesError(t *testing.T) {
 func TestSessionResumeRoundTrip(t *testing.T) {
 	first, second := "first", "second"
 	provider := &capturingProvider{turns: []Message{
-		{Role: "assistant", Content: &first},
-		{Role: "assistant", Content: &second},
+		asstText(first),
+		asstText(second),
 	}}
 	agent := New(provider).WithSystemPrompt("sys")
 
@@ -123,8 +118,8 @@ func TestSessionResumeRoundTrip(t *testing.T) {
 	}
 
 	resumed := agent.ResumeSession(transcript)
-	if out, err := resumed.Run(context.Background(), "two"); err != nil || out != second {
-		t.Fatalf("resumed run = %q, %v", out, err)
+	if out, err := resumed.Run(context.Background(), "two"); err != nil || out.Output != second {
+		t.Fatalf("resumed run = %q, %v", out.Output, err)
 	}
 
 	seen := provider.received[1]
@@ -143,13 +138,57 @@ func TestSessionResumeRoundTrip(t *testing.T) {
 	}
 }
 
+// TestSessionPersistsEveryBlockType pins the compatibility surface: a
+// transcript containing every block type — thinking (with signature), tool_use,
+// tool_result (with an image), and a provider RawBlock — survives a JSON
+// round-trip through ResumeSession with its blocks intact.
+func TestSessionPersistsEveryBlockType(t *testing.T) {
+	transcript := []Message{
+		SystemMessage("sys"),
+		UserMessage("do it"),
+		{Role: "assistant", Blocks: Blocks{
+			ThinkingBlock{Thinking: "reasoning", Signature: "sig-1"},
+			RawBlock{Provider: "anthropic", Type: "redacted_thinking", Data: []byte(`{"data":"enc"}`)},
+			TextBlock{Text: "calling the tool"},
+			ToolUseBlock{ID: "t1", Name: "lookup", Input: []byte(`{"q":"x"}`)},
+		}},
+		{Role: "tool", Blocks: Blocks{ToolResultBlock{
+			ToolUseID: "t1",
+			Content:   Blocks{TextBlock{Text: "see figure"}, ImageBlock{MediaType: "image/png", URL: "u"}},
+		}}},
+	}
+
+	agent := New(&capturingProvider{turns: []Message{asstText("final")}})
+	blob, err := json.Marshal(agent.ResumeSession(transcript).Messages())
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var reloaded []Message
+	if err := json.Unmarshal(blob, &reloaded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	// Re-marshal both and compare bytes: proves the blocks round-trip exactly.
+	orig, _ := json.Marshal(transcript)
+	round, _ := json.Marshal(reloaded)
+	if string(orig) != string(round) {
+		t.Errorf("transcript did not round-trip:\n orig:  %s\n round: %s", orig, round)
+	}
+
+	// Spot-check the resumed session still runs and continues the history.
+	resumed := agent.ResumeSession(reloaded)
+	if out, err := resumed.Run(context.Background(), "next"); err != nil || out.Output != "final" {
+		t.Fatalf("resumed run = %q, %v", out.Output, err)
+	}
+}
+
 // TestSessionRunStream verifies the streaming variant continues history and
 // delivers events like Agent.RunStream.
 func TestSessionRunStream(t *testing.T) {
 	hello, again := "hello", "again"
 	provider := &capturingProvider{turns: []Message{
-		{Role: "assistant", Content: &hello},
-		{Role: "assistant", Content: &again},
+		asstText(hello),
+		asstText(again),
 	}}
 	agent := New(provider)
 
