@@ -22,14 +22,15 @@ import (
 // are NOT safe to call concurrently with a run; configure the Agent fully
 // before starting any runs.
 type Agent struct {
-	systemPrompt string
-	tools        []Tool
-	provider     Provider
-	maxSteps     int
-	retryCfg     retry.Config
-	tracer       tracing.Tracer
-	log          *slog.Logger
-	approver     Approver
+	systemPrompt       string
+	tools              []Tool
+	provider           Provider
+	maxSteps           int
+	retryCfg           retry.Config
+	tracer             tracing.Tracer
+	log                *slog.Logger
+	approver           Approver
+	defaultCallOptions CallOptions
 
 	preSendHooks []PreSendHook
 }
@@ -85,6 +86,13 @@ func (a *Agent) WithApprover(ap Approver) *Agent {
 	return a
 }
 
+// WithDefaultCallOptions sets the [CallOptions] applied to every run of this
+// agent. A per-run [WithCallOptions] override is merged over these defaults.
+func (a *Agent) WithDefaultCallOptions(o CallOptions) *Agent {
+	a.defaultCallOptions = o
+	return a
+}
+
 // WithPreSendHook registers a PreSendHook. Hooks fire in registration order
 // once per turn, immediately before each provider invocation. Each hook
 // receives the output of the previous hook.
@@ -130,35 +138,49 @@ func (a *Agent) RegisterFunc(name, description string, fn func(context.Context) 
 	}))
 }
 
-func (a *Agent) Run(ctx context.Context, task string) (string, error) {
-	return a.runSync(ctx, newLoop(a, nil), task)
+// Run executes the agent on task and returns the [RunResult]. Options override
+// the agent's default [CallOptions] for this run only. The result is populated
+// as far as the run got, even on error.
+func (a *Agent) Run(ctx context.Context, task string, opts ...RunOption) (RunResult, error) {
+	return a.runSync(ctx, newLoop(a, nil), task, opts...)
 }
 
 // runSync drives a pre-built loop through the non-streaming path. Split from
 // Run so a [Session] can supply a loop seeded with its transcript.
-func (a *Agent) runSync(ctx context.Context, l *Loop, task string) (string, error) {
-	return l.run(ctx, task, "sync", func(ctx context.Context, _ *slog.Logger, messages []Message, tools []Tool) (Message, error) {
-		return retry.Do(ctx, a.retryCfg, func() (Message, error) {
-			return a.provider.Invoke(ctx, messages, tools)
+func (a *Agent) runSync(ctx context.Context, l *Loop, task string, opts ...RunOption) (RunResult, error) {
+	cfg := a.newRunConfig(opts)
+	return l.run(ctx, task, "sync", cfg, func(ctx context.Context, _ *slog.Logger, req Request) (Response, error) {
+		return retry.Do(ctx, a.retryCfg, func() (Response, error) {
+			return a.provider.Invoke(ctx, req)
 		})
 	})
 }
 
-// RunResult is delivered on the channel returned by [Agent.RunBackground].
-type RunResult struct {
-	Output string
+// newRunConfig resolves the effective run configuration: the agent's default
+// CallOptions with each RunOption applied in order.
+func (a *Agent) newRunConfig(opts []RunOption) runConfig {
+	cfg := runConfig{options: a.defaultCallOptions}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	return cfg
+}
+
+// BackgroundResult is delivered on the channel returned by [Agent.RunBackground].
+type BackgroundResult struct {
+	Result RunResult
 	Err    error
 }
 
 // RunBackground runs the agent in a goroutine and returns a buffered channel
 // that receives the result when the run completes. The channel is closed after
 // the single result is sent. Cancel the run via ctx.
-func (a *Agent) RunBackground(ctx context.Context, task string) <-chan RunResult {
-	ch := make(chan RunResult, 1)
+func (a *Agent) RunBackground(ctx context.Context, task string, opts ...RunOption) <-chan BackgroundResult {
+	ch := make(chan BackgroundResult, 1)
 	go func() {
 		defer close(ch)
-		out, err := a.Run(ctx, task)
-		ch <- RunResult{Output: out, Err: err}
+		res, err := a.Run(ctx, task, opts...)
+		ch <- BackgroundResult{Result: res, Err: err}
 	}()
 	return ch
 }
@@ -185,17 +207,24 @@ func (t *agentTool) Execute(ctx context.Context, args string) (string, error) {
 	}
 	// If an enclosing run is streaming, run the sub-agent in streaming mode too
 	// and forward its events into the parent's sink, tagged with this tool's
-	// name. The tag is only stamped when empty so a deeper sub-agent's tag
-	// survives. Otherwise fall back to a plain non-streaming run.
+	// name and this invocation's ID. Both are only stamped when empty so a
+	// deeper sub-agent's tags survive (innermost wins). Otherwise fall back to a
+	// plain non-streaming run.
 	if emit := emitterFrom(ctx); emit != nil {
-		return t.agent.RunStream(ctx, task, func(ev StreamEvent) {
+		invocationID := toolCallIDFrom(ctx)
+		res, err := t.agent.RunStream(ctx, task, func(ev StreamEvent) {
 			if ev.Agent == "" {
 				ev.Agent = t.name
 			}
+			if ev.InvocationID == "" {
+				ev.InvocationID = invocationID
+			}
 			emit(ev)
 		})
+		return res.Output, err
 	}
-	return t.agent.Run(ctx, task)
+	res, err := t.agent.Run(ctx, task)
+	return res.Output, err
 }
 
 // AsTool adapts an Agent into a Tool that an orchestrator can register and the
