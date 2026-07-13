@@ -61,10 +61,11 @@ var _ core.StreamProvider = (*Provider)(nil)
 const DefaultMaxTokens int64 = 16000
 
 type Provider struct {
-	model       string
-	maxTokens   int64
-	cacheSystem bool
-	client      anthropic.Client
+	model             string
+	maxTokens         int64
+	cacheSystem       bool
+	cacheConversation bool
+	client            anthropic.Client
 }
 
 // New builds a Provider for the given Claude model. If apiKey is empty the
@@ -103,14 +104,37 @@ func (p *Provider) WithSystemPromptCache() *Provider {
 	return p
 }
 
-func (p *Provider) buildParams(messages []core.Message, tools []core.Tool) (anthropic.MessageNewParams, error) {
-	system, msgs, err := convertMessages(messages)
+// WithConversationCache attaches a cache_control: ephemeral breakpoint to the
+// last content block of the last message on every request, so the whole
+// conversation prefix up to that point is cached and re-read cheaply on the next
+// turn. This is the big cost lever for multi-turn agent loops, where the prefix
+// is stable and grows by one turn each request.
+//
+// It composes with [Provider.WithSystemPromptCache] (that caches the
+// tools+system prefix; this caches the messages prefix) — two of Anthropic's
+// four cache breakpoints. The breakpoint is placed on the last cacheable block,
+// walking back past thinking blocks, which reject cache_control.
+//
+// Note: a context [core.Compactor] rewrites the message prefix when it
+// compacts, which invalidates this cache for that turn; the cache re-warms on
+// the turns that follow.
+func (p *Provider) WithConversationCache() *Provider {
+	p.cacheConversation = true
+	return p
+}
+
+func (p *Provider) buildParams(req core.Request) (anthropic.MessageNewParams, error) {
+	system, msgs, err := convertMessages(req.Messages)
 	if err != nil {
 		return anthropic.MessageNewParams{}, err
 	}
+	maxTokens := p.maxTokens
+	if req.Options.MaxTokens > 0 {
+		maxTokens = int64(req.Options.MaxTokens)
+	}
 	params := anthropic.MessageNewParams{
 		Model:     anthropic.Model(p.model),
-		MaxTokens: p.maxTokens,
+		MaxTokens: maxTokens,
 		Messages:  msgs,
 	}
 	if len(system) > 0 {
@@ -119,26 +143,90 @@ func (p *Provider) buildParams(messages []core.Message, tools []core.Tool) (anth
 		}
 		params.System = system
 	}
-	if len(tools) > 0 {
-		params.Tools = convertTools(tools)
+	if len(req.Tools) > 0 {
+		params.Tools = convertTools(req.Tools)
 	}
+	if p.cacheConversation {
+		applyConversationCache(params.Messages)
+	}
+	applyCallOptions(&params, req.Options)
 	return params, nil
 }
 
-func (p *Provider) Invoke(ctx context.Context, messages []core.Message, tools []core.Tool) (core.Message, error) {
-	params, err := p.buildParams(messages, tools)
+// applyConversationCache stamps a cache_control breakpoint on the last cacheable
+// content block of the last message, walking back past blocks that reject it
+// (thinking / redacted_thinking).
+func applyConversationCache(msgs []anthropic.MessageParam) {
+	if len(msgs) == 0 {
+		return
+	}
+	last := &msgs[len(msgs)-1]
+	for i := len(last.Content) - 1; i >= 0; i-- {
+		if setBlockCacheControl(&last.Content[i]) {
+			return
+		}
+	}
+}
+
+// setBlockCacheControl sets an ephemeral cache_control on b's active variant,
+// reporting whether the variant supports it (thinking blocks do not).
+func setBlockCacheControl(b *anthropic.ContentBlockParamUnion) bool {
+	cc := anthropic.NewCacheControlEphemeralParam()
+	switch {
+	case b.OfText != nil:
+		b.OfText.CacheControl = cc
+	case b.OfImage != nil:
+		b.OfImage.CacheControl = cc
+	case b.OfToolUse != nil:
+		b.OfToolUse.CacheControl = cc
+	case b.OfToolResult != nil:
+		b.OfToolResult.CacheControl = cc
+	default:
+		return false
+	}
+	return true
+}
+
+// applyCallOptions maps the provider-agnostic [core.CallOptions] onto Anthropic
+// request params. Options the API cannot honor are ignored.
+func applyCallOptions(params *anthropic.MessageNewParams, o core.CallOptions) {
+	if o.Temperature != nil {
+		params.Temperature = anthropic.Float(*o.Temperature)
+	}
+	if len(o.StopSequences) > 0 {
+		params.StopSequences = o.StopSequences
+	}
+	if o.ThinkingBudget > 0 {
+		params.Thinking = anthropic.ThinkingConfigParamOfEnabled(int64(o.ThinkingBudget))
+	}
+	if o.ToolChoice != nil {
+		switch o.ToolChoice.Mode {
+		case core.ToolChoiceNone:
+			params.ToolChoice = anthropic.ToolChoiceUnionParam{OfNone: &anthropic.ToolChoiceNoneParam{}}
+		case core.ToolChoiceAny:
+			params.ToolChoice = anthropic.ToolChoiceUnionParam{OfAny: &anthropic.ToolChoiceAnyParam{}}
+		case core.ToolChoiceTool:
+			params.ToolChoice = anthropic.ToolChoiceUnionParam{
+				OfTool: &anthropic.ToolChoiceToolParam{Name: o.ToolChoice.Name},
+			}
+		}
+	}
+}
+
+func (p *Provider) Invoke(ctx context.Context, req core.Request) (core.Response, error) {
+	params, err := p.buildParams(req)
 	if err != nil {
-		return core.Message{}, err
+		return core.Response{}, err
 	}
 	resp, err := p.client.Messages.New(ctx, params)
 	if err != nil {
-		return core.Message{}, fmt.Errorf("anthropic invoke: %w", wrapAPIError(err))
+		return core.Response{}, fmt.Errorf("anthropic invoke: %w", wrapAPIError(err))
 	}
-	return convertResponse(resp), nil
+	return core.Response{Message: convertResponse(resp), StopReason: string(resp.StopReason)}, nil
 }
 
-func (p *Provider) InvokeStream(ctx context.Context, messages []core.Message, tools []core.Tool) (<-chan core.StreamChunk, error) {
-	params, err := p.buildParams(messages, tools)
+func (p *Provider) InvokeStream(ctx context.Context, req core.Request) (<-chan core.StreamChunk, error) {
+	params, err := p.buildParams(req)
 	if err != nil {
 		return nil, err
 	}
@@ -177,18 +265,26 @@ func (p *Provider) InvokeStream(ctx context.Context, messages []core.Message, to
 					}
 				}
 			case anthropic.ContentBlockStartEvent:
-				// A new tool_use block starts: announce its index/id/name so the
-				// stream assembler can register the slot before InputJSONDelta
-				// fragments arrive.
-				if tu, ok := ev.ContentBlock.AsAny().(anthropic.ToolUseBlock); ok {
-					if !send(core.StreamChunk{
-						ToolCalls: []core.StreamToolCallFragment{{
-							Index: int(ev.Index),
-							ID:    tu.ID,
-							Type:  "function",
-							Name:  tu.Name,
-						}},
-					}) {
+				// A new content block starts: announce its index and type so the
+				// stream assembler can register the slot (and, for tool_use, its
+				// id/name) before delta fragments arrive.
+				switch cb := ev.ContentBlock.AsAny().(type) {
+				case anthropic.TextBlock:
+					if !send(core.StreamChunk{Deltas: []core.BlockDelta{{
+						Index: int(ev.Index), Type: "text",
+					}}}) {
+						return
+					}
+				case anthropic.ThinkingBlock:
+					if !send(core.StreamChunk{Deltas: []core.BlockDelta{{
+						Index: int(ev.Index), Type: "thinking",
+					}}}) {
+						return
+					}
+				case anthropic.ToolUseBlock:
+					if !send(core.StreamChunk{Deltas: []core.BlockDelta{{
+						Index: int(ev.Index), Type: "tool_use", ID: cb.ID, Name: cb.Name,
+					}}}) {
 						return
 					}
 				}
@@ -198,19 +294,36 @@ func (p *Provider) InvokeStream(ctx context.Context, messages []core.Message, to
 					if d.Text == "" {
 						continue
 					}
-					if !send(core.StreamChunk{ContentDelta: d.Text}) {
+					if !send(core.StreamChunk{Deltas: []core.BlockDelta{{
+						Index: int(ev.Index), Text: d.Text,
+					}}}) {
+						return
+					}
+				case anthropic.ThinkingDelta:
+					if d.Thinking == "" {
+						continue
+					}
+					if !send(core.StreamChunk{Deltas: []core.BlockDelta{{
+						Index: int(ev.Index), Text: d.Thinking,
+					}}}) {
+						return
+					}
+				case anthropic.SignatureDelta:
+					if d.Signature == "" {
+						continue
+					}
+					if !send(core.StreamChunk{Deltas: []core.BlockDelta{{
+						Index: int(ev.Index), Signature: d.Signature,
+					}}}) {
 						return
 					}
 				case anthropic.InputJSONDelta:
 					if d.PartialJSON == "" {
 						continue
 					}
-					if !send(core.StreamChunk{
-						ToolCalls: []core.StreamToolCallFragment{{
-							Index:     int(ev.Index),
-							Arguments: d.PartialJSON,
-						}},
-					}) {
+					if !send(core.StreamChunk{Deltas: []core.BlockDelta{{
+						Index: int(ev.Index), PartialJSON: d.PartialJSON,
+					}}}) {
 						return
 					}
 				}
