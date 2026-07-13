@@ -59,15 +59,15 @@ func (a *Agent) ResumeSession(transcript []Message) *Session {
 	}
 }
 
-// Run continues the conversation with task and returns the assistant's final
-// reply, like [Agent.Run] but with history. The transcript is updated even
-// when an error is returned.
-func (s *Session) Run(ctx context.Context, task string) (string, error) {
+// Run continues the conversation with task and returns the [RunResult], like
+// [Agent.Run] but with history. The transcript is updated even when an error is
+// returned.
+func (s *Session) Run(ctx context.Context, task string, opts ...RunOption) (RunResult, error) {
 	s.runMu.Lock()
 	defer s.runMu.Unlock()
 
 	l := newLoop(s.agent, s.Messages())
-	out, err := s.agent.runSync(ctx, l, task)
+	out, err := s.agent.runSync(ctx, l, task, opts...)
 	s.commit(l.messages)
 	return out, err
 }
@@ -75,12 +75,12 @@ func (s *Session) Run(ctx context.Context, task string) (string, error) {
 // RunStream continues the conversation like [Session.Run] while delivering
 // the live event stream to onEvent, with the same contract as
 // [Agent.RunStream]. The transcript is updated even when an error is returned.
-func (s *Session) RunStream(ctx context.Context, task string, onEvent func(StreamEvent)) (string, error) {
+func (s *Session) RunStream(ctx context.Context, task string, onEvent func(StreamEvent), opts ...RunOption) (RunResult, error) {
 	s.runMu.Lock()
 	defer s.runMu.Unlock()
 
 	l := newLoop(s.agent, s.Messages())
-	out, err := s.agent.runStream(ctx, l, task, onEvent)
+	out, err := s.agent.runStream(ctx, l, task, onEvent, opts...)
 	s.commit(l.messages)
 	return out, err
 }
