@@ -26,7 +26,7 @@ const (
 //   - Reason is surfaced to the model on Deny; it is optional on other outcomes.
 type Decision struct {
 	Outcome Outcome
-	// Args replaces call.Function.Arguments when Outcome == Modify.
+	// Args replaces the call's Input when Outcome == Modify.
 	Args json.RawMessage
 	// Reason is returned to the model as "denied: <Reason>" when Outcome == Deny.
 	Reason string
@@ -40,7 +40,7 @@ type Decision struct {
 // Returning an error aborts the run entirely, the same way a context error
 // from a tool does. Prefer returning Deny with a Reason for recoverable cases.
 type Approver interface {
-	Approve(ctx context.Context, call ToolCall, messages []Message) (Decision, error)
+	Approve(ctx context.Context, call ToolUseBlock, messages []Message) (Decision, error)
 }
 
 // AllowAll is the default Approver. It permits every call unconditionally.
@@ -48,14 +48,14 @@ var AllowAll Approver = allowAll{}
 
 type allowAll struct{}
 
-func (allowAll) Approve(_ context.Context, _ ToolCall, _ []Message) (Decision, error) {
+func (allowAll) Approve(_ context.Context, _ ToolUseBlock, _ []Message) (Decision, error) {
 	return Decision{Outcome: Allow}, nil
 }
 
 // ApproverFunc is a function that implements [Approver]. It lets callers pass
 // an inline function to [WithApprover] without defining a named type.
-type ApproverFunc func(ctx context.Context, call ToolCall, messages []Message) (Decision, error)
+type ApproverFunc func(ctx context.Context, call ToolUseBlock, messages []Message) (Decision, error)
 
-func (f ApproverFunc) Approve(ctx context.Context, call ToolCall, messages []Message) (Decision, error) {
+func (f ApproverFunc) Approve(ctx context.Context, call ToolUseBlock, messages []Message) (Decision, error) {
 	return f(ctx, call, messages)
 }
