@@ -4,7 +4,9 @@ use (
 	.
 	./examples/claude
 	./examples/deep_research
+	./examples/openai
 	./extensions/claude
+	./extensions/openai
 	./extensions/tavily
 	./tools
 )
