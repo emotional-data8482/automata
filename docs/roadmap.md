@@ -1,16 +1,44 @@
 # Roadmap
 
-Planned additions to automata, prompted by building the multi-agent
-`examples/deep_research` agent. That example exercised the framework at the
-intersection of *streaming* and *multi-agent orchestration* and surfaced three
-gaps worth closing. They're ordered by leverage — #1 most changes the
-"time to first useful agent" story.
-
 **Guiding principle (unchanged):** `core` stays primitive-only and
 dependency-light (today: just `golang.org/x/sync`). Anything that pulls a vendor
 SDK or an API key lives in its own module under `extensions/<name>/`, wired via
-`go.work` + a `replace` directive — the same pattern as `extensions/claude`.
-These proposals keep that boundary.
+`go.work` — the same pattern as `extensions/claude`.
+
+## v0.2.0 — shipped
+
+A milestone focused on not degrading top-end provider quality and on running
+agents in long-lived, multi-turn settings.
+
+- **Block-based message model.** `Message` is now a list of typed `Block`s
+  (`TextBlock`, `ThinkingBlock` with signature, `ToolUseBlock`,
+  `ToolResultBlock` with `IsError`, `ImageBlock`, and a `RawBlock` escape hatch),
+  a type-tagged JSON envelope that round-trips through persistence. Claude's
+  thinking blocks now survive tool loops; tool-result errors use the native
+  `is_error`; images are representable.
+- **Structured run results.** `Run`/`RunStream` (and the `Session` variants)
+  return a `RunResult` — output text, final message, transcript, summed usage,
+  step count, and stop reason — populated even on error (max-steps returns
+  partials).
+- **Per-call provider options.** `Provider` takes a `Request` with `CallOptions`
+  (temperature, max tokens, stop sequences, tool choice, thinking budget), set
+  per-agent (`WithDefaultCallOptions`) or per-run (`WithCallOptions`).
+- **Typed output.** `RunTyped[T]` returns the final answer decoded into a Go
+  struct via a forced schema-derived tool.
+- **Context management.** `core.Compactor` (a pre-send hook that summarizes older
+  turns) and the Claude provider's `WithConversationCache()`; see
+  [context.md](context.md).
+- **OpenAI extension.** `extensions/openai`, a stdlib-only Chat Completions
+  provider that works against any OpenAI-compatible base URL.
+- **Fixes.** Sub-agent double-retry removed (tools own retries; opt in with
+  `WithToolRetry`); stream events carry an `InvocationID` so parallel same-name
+  sub-agents no longer garble the accumulator; `retry.Do` no longer silently
+  succeeds on a non-positive `MaxAttempts`.
+
+## Earlier: the v0.1.0 tools/streaming proposals
+
+The three proposals below were prompted by building `examples/deep_research` and
+all shipped in v0.1.0. Retained here for context.
 
 ---
 
