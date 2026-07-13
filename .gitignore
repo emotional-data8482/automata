@@ -31,3 +31,11 @@ profile.cov
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# Binary files
+examples/claude/claude
+examples/deep_research/deep_research
+examples/openai/openai
+
+# Example artifacts
+examples/deep_research/why-is-the-sky-blue.md
