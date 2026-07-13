@@ -60,7 +60,7 @@ func main() {
 			case core.StreamText:
 				fmt.Print(ev.Text)
 			case core.StreamToolCall:
-				fmt.Printf("\n\033[2m→ %s(%s)\033[0m\n", ev.ToolCall.Function.Name, ev.ToolCall.Function.Arguments)
+				fmt.Printf("\n\033[2m→ %s(%s)\033[0m\n", ev.ToolCall.Name, string(ev.ToolCall.Input))
 			case core.StreamToolResult:
 				if ev.Err != nil {
 					fmt.Printf("\033[2m← error: %v\033[0m\n", ev.Err)
