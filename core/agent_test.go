@@ -17,14 +17,14 @@ type capturingProvider struct {
 	received [][]Message
 }
 
-func (p *capturingProvider) Invoke(_ context.Context, messages []Message, _ []Tool) (Message, error) {
-	p.received = append(p.received, append([]Message(nil), messages...))
+func (p *capturingProvider) Invoke(_ context.Context, req Request) (Response, error) {
+	p.received = append(p.received, append([]Message(nil), req.Messages...))
 	if p.calls >= len(p.turns) {
-		return Message{}, fmt.Errorf("no script for turn %d", p.calls)
+		return Response{}, fmt.Errorf("no script for turn %d", p.calls)
 	}
 	m := p.turns[p.calls]
 	p.calls++
-	return m, nil
+	return Response{Message: m}, nil
 }
 
 // lastUserMessage returns the content of the most recent role:"user" message
@@ -33,8 +33,8 @@ func (p *capturingProvider) lastUserMessage(t *testing.T) string {
 	t.Helper()
 	for i := len(p.received) - 1; i >= 0; i-- {
 		for j := len(p.received[i]) - 1; j >= 0; j-- {
-			if m := p.received[i][j]; m.Role == "user" && m.Content != nil {
-				return *m.Content
+			if m := p.received[i][j]; m.Role == "user" {
+				return m.Text()
 			}
 		}
 	}
@@ -54,17 +54,13 @@ func renderResearch(p researchArgs) string {
 // TestAsToolFuncRendersTask pins feature: the sub-agent receives the rendered
 // natural-language task, not the model's raw JSON arguments.
 func TestAsToolFuncRendersTask(t *testing.T) {
-	notes := "notes"
-	subProvider := &capturingProvider{turns: []Message{{Role: "assistant", Content: &notes}}}
+	subProvider := &capturingProvider{turns: []Message{asstText("notes")}}
 	sub := New(subProvider)
 
 	final := "final"
 	orch := New(&scriptedProvider{turns: []Message{
-		{Role: "assistant", ToolCalls: []ToolCall{{
-			ID: "r1", Type: "function",
-			Function: FunctionCall{Name: "researcher", Arguments: `{"topic":"GLP-1","questions":["cost","supply"]}`},
-		}}},
-		{Role: "assistant", Content: &final},
+		asstTool("r1", "researcher", `{"topic":"GLP-1","questions":["cost","supply"]}`),
+		asstText(final),
 	}})
 	orch.RegisterTool(AsToolFunc(sub, "researcher", "delegate research", renderResearch))
 
@@ -72,8 +68,8 @@ func TestAsToolFuncRendersTask(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if out != final {
-		t.Errorf("output = %q, want %q", out, final)
+	if out.Output != final {
+		t.Errorf("output = %q, want %q", out.Output, final)
 	}
 
 	want := "Research: GLP-1\nQuestions:\n- cost\n- supply"
@@ -91,28 +87,29 @@ func TestAsToolFuncInvalidArgs(t *testing.T) {
 
 	final := "recovered"
 	orch := New(&scriptedProvider{turns: []Message{
-		{Role: "assistant", ToolCalls: []ToolCall{{
-			ID: "r1", Type: "function",
-			Function: FunctionCall{Name: "researcher", Arguments: `{"topic":`},
-		}}},
-		{Role: "assistant", Content: &final},
+		asstTool("r1", "researcher", `{"topic":`),
+		asstText(final),
 	}})
 	orch.RegisterTool(AsToolFunc(sub, "researcher", "delegate research", renderResearch))
 
 	var result string
+	var isError bool
 	out, err := orch.RunStream(context.Background(), "go", func(ev StreamEvent) {
 		if ev.Kind == StreamToolResult {
 			result = ev.Result
+			isError = ev.IsError
 		}
 	})
 	if err != nil {
 		t.Fatalf("RunStream: %v", err)
 	}
-	if out != final {
-		t.Errorf("output = %q, want %q", out, final)
+	if out.Output != final {
+		t.Errorf("output = %q, want %q", out.Output, final)
 	}
-	if !strings.HasPrefix(result, "error: invalid args") {
-		t.Errorf("tool result = %q, want prefix %q", result, "error: invalid args")
+	// The core result carries the raw error text (no "error: " prefix) with the
+	// IsError flag set.
+	if !strings.HasPrefix(result, "invalid args") || !isError {
+		t.Errorf("tool result = %q (isError %v), want prefix %q with isError", result, isError, "invalid args")
 	}
 	if subProvider.calls != 0 {
 		t.Errorf("sub-agent was invoked %d times on invalid args, want 0", subProvider.calls)
@@ -122,17 +119,13 @@ func TestAsToolFuncInvalidArgs(t *testing.T) {
 // TestAsToolFuncEmptyArgsRenderZero pins parity with Func: "", "null" and "{}"
 // render the zero value of P instead of failing.
 func TestAsToolFuncEmptyArgsRenderZero(t *testing.T) {
-	done := "done"
-	subProvider := &capturingProvider{turns: []Message{{Role: "assistant", Content: &done}}}
+	subProvider := &capturingProvider{turns: []Message{asstText("done")}}
 	sub := New(subProvider)
 
 	final := "final"
 	orch := New(&scriptedProvider{turns: []Message{
-		{Role: "assistant", ToolCalls: []ToolCall{{
-			ID: "r1", Type: "function",
-			Function: FunctionCall{Name: "researcher", Arguments: "{}"},
-		}}},
-		{Role: "assistant", Content: &final},
+		asstTool("r1", "researcher", "{}"),
+		asstText(final),
 	}})
 	orch.RegisterTool(AsToolFunc(sub, "researcher", "delegate research", renderResearch))
 
@@ -177,16 +170,13 @@ func TestAsToolFuncSchemaFromP(t *testing.T) {
 // streaming behavior: sub-agent events arrive tagged with the tool name.
 func TestAsToolFuncStreamsTagged(t *testing.T) {
 	subText := "sub result"
-	subProvider := &recordingProvider{turns: []Message{{Role: "assistant", Content: &subText}}}
+	subProvider := &recordingProvider{turns: []Message{asstText(subText)}}
 	sub := New(subProvider)
 
 	final := "done"
 	orch := New(&recordingProvider{turns: []Message{
-		{Role: "assistant", ToolCalls: []ToolCall{{
-			ID: "r1", Type: "function",
-			Function: FunctionCall{Name: "researcher", Arguments: `{"topic":"x"}`},
-		}}},
-		{Role: "assistant", Content: &final},
+		asstTool("r1", "researcher", `{"topic":"x"}`),
+		asstText(final),
 	}})
 	orch.RegisterTool(AsToolFunc(sub, "researcher", "delegate research", renderResearch))
 
