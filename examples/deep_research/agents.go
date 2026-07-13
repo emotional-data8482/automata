@@ -114,10 +114,10 @@ func buildOrchestrator(cfg appConfig, store *todoStore, sink func(tea.Msg)) *cor
 		WithSystemPrompt(orchestratorPrompt).
 		WithMaxSteps(30)
 	a.RegisterTool(todoTool(store, sink))
-	a.RegisterTool(core.AsToolFunc[researchParams](researcher, "researcher",
+	a.RegisterTool(core.AsToolFunc(researcher, "researcher",
 		"Delegate a focused research assignment. Provide a topic and optional specific questions; returns concise notes with source URLs.",
 		renderResearchTask))
-	a.RegisterTool(core.AsToolFunc[writeParams](writer, "writer",
+	a.RegisterTool(core.AsToolFunc(writer, "writer",
 		"Delegate writing the final report. Provide a title, an outline, and the combined research notes; it composes the Markdown, saves the file, and returns the saved path.",
 		renderWriteTask))
 	return a

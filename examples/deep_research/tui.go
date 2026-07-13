@@ -151,10 +151,10 @@ func (m model) startRun(topic string) tea.Cmd {
 	return func() tea.Msg {
 		orch := m.build(topic)
 		go func() {
-			out, err := orch.RunStream(m.ctx, topic, func(ev core.StreamEvent) {
+			res, err := orch.RunStream(m.ctx, topic, func(ev core.StreamEvent) {
 				m.sub <- uiEvent{ev: ev}
 			})
-			m.sub <- doneMsg{output: out, err: err}
+			m.sub <- doneMsg{output: res.Output, err: err}
 		}()
 		return nil
 	}
@@ -269,7 +269,7 @@ func (m model) renderLog() string {
 		}
 		for _, tc := range v.ToolCalls {
 			b.WriteByte('\n')
-			b.WriteString(wrap.Render("→ " + tc.Call.Function.Name + "(" + snippet(tc.Call.Function.Arguments, 80) + ")"))
+			b.WriteString(wrap.Render("→ " + tc.Call.Name + "(" + snippet(string(tc.Call.Input), 80) + ")"))
 			if !tc.Done {
 				continue
 			}
@@ -344,7 +344,7 @@ func (m model) footer() string {
 	searches := 0
 	for _, v := range m.acc.Views() {
 		for _, tc := range v.ToolCalls {
-			if tc.Call.Function.Name == "web_search" {
+			if tc.Call.Name == "web_search" {
 				searches++
 			}
 		}
