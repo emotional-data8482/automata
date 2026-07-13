@@ -7,31 +7,42 @@ stream — event kinds, ordering guarantees, sub-agent tagging, and the
 here is pinned by tests in `core/stream_test.go` and
 `core/accumulator_test.go`.
 
+`RunStream` returns the same `core.RunResult` as `Run` (final output, transcript,
+usage, steps, stop reason) once the run completes; the callback sees the live
+events along the way.
+
 ```go
-out, err := agent.RunStream(ctx, task, func(ev core.StreamEvent) {
+res, err := agent.RunStream(ctx, task, func(ev core.StreamEvent) {
     switch ev.Kind {
     case core.StreamText:       // assistant text delta in ev.Text
-    case core.StreamToolCall:   // assembled call in ev.ToolCall, about to execute
-    case core.StreamToolResult: // ev.Result (and ev.Err) for ev.ToolCall
+    case core.StreamThinking:   // model reasoning delta in ev.Text
+    case core.StreamToolCall:   // assembled ToolUseBlock in ev.ToolCall, about to execute
+    case core.StreamToolResult: // ev.Result (+ ev.IsError, ev.Err) for ev.ToolCall
     case core.StreamUsage:      // per-turn token usage in ev.Usage
     }
 })
+_ = res.Output
 ```
 
 ## Event kinds
 
-| Kind               | Populated fields                | Meaning |
-|--------------------|---------------------------------|---------|
-| `StreamText`       | `Text` (+ `Agent`)              | One assistant content delta. |
-| `StreamToolCall`   | `ToolCall` (+ `Agent`)          | A tool call the model requested, fully assembled (name + arguments), emitted before execution. |
-| `StreamToolResult` | `ToolCall`, `Result`, `Err` (+ `Agent`) | A finished tool call. `Result` is the exact string fed back to the model; `Err` is non-nil if the tool returned an error (the run still continues — see tool error semantics on `core.Func`). |
-| `StreamUsage`      | `Usage` (+ `Agent`)             | Token usage for one completed provider turn. |
+| Kind               | Populated fields                     | Meaning |
+|--------------------|--------------------------------------|---------|
+| `StreamText`       | `Text`                               | One assistant content delta. |
+| `StreamThinking`   | `Text`                               | One model reasoning delta (only when extended thinking is enabled). |
+| `StreamToolCall`   | `ToolCall` (a `ToolUseBlock`)        | A tool call the model requested, fully assembled (name + input), emitted before execution. |
+| `StreamToolResult` | `ToolCall`, `Result`, `IsError`, `Err` | A finished tool call. `Result` is the core-level string fed back to the model; `IsError` and `Err` are set if the tool failed (the run still continues — see tool error semantics on `core.Func`). |
+| `StreamUsage`      | `Usage`                              | Token usage for one completed provider turn. |
+
+Every event also carries `Agent` and `InvocationID` identifying which
+(sub-)agent lane it came from — see [Sub-agent tagging](#sub-agent-tagging-streameventagent-streameventinvocationid) below.
 
 ## Ordering guarantees
 
 Within one turn of the loop, events arrive in this order:
 
-1. **Text deltas**, in stream order.
+1. **Text and thinking deltas**, in stream order (`StreamText` /
+   `StreamThinking`).
 2. **`StreamUsage`**, once per turn — after the turn's text, before its tool
    calls. Emitted only when the provider reports usage for the turn.
 3. **`StreamToolCall`** events, serially, in the order the model issued the
@@ -53,10 +64,11 @@ its own. Keep it fast — it runs on the loop's critical path.
 
 If the provider implements only `core.Provider` (not `core.StreamProvider`),
 `RunStream` falls back to one non-streaming invocation per turn and delivers
-each turn's whole content as a single `StreamText` event. Tool-call,
-tool-result, and usage events fire exactly as above.
+each turn's whole thinking as one `StreamThinking` event and its whole text as
+one `StreamText` event. Tool-call, tool-result, and usage events fire exactly
+as above.
 
-## Sub-agent tagging (`StreamEvent.Agent`)
+## Sub-agent tagging (`StreamEvent.Agent`, `StreamEvent.InvocationID`)
 
 Agents registered as tools via `core.AsTool` / `core.AsToolFunc`
 auto-stream: when the enclosing run is streaming, the sub-agent runs in
@@ -64,11 +76,18 @@ streaming mode too, and its events are forwarded into the parent's stream.
 
 - `Agent == ""` — the event came from the top-level agent being streamed.
 - `Agent == "<tool name>"` — the event came from that sub-agent.
-- **Nesting: the innermost tag wins.** A wrapper stamps its tool name only
-  when the tag is still empty, so events from `orchestrator → mid → leaf`
-  arrive tagged `"leaf"` for leaf's events and `"mid"` for mid's own events.
+- `InvocationID` — the ID of the tool call that started the sub-agent
+  invocation. It is empty for top-level events. Two concurrent calls to the
+  **same** sub-agent tool share an `Agent` name but have distinct
+  `InvocationID`s, so `(Agent, InvocationID)` uniquely identifies the lane an
+  event belongs to. Without it, parallel same-name sub-agents would interleave
+  into a single stream.
+- **Nesting: the innermost tags win.** A wrapper stamps its tool name and the
+  invocation ID only when they are still empty, so events from
+  `orchestrator → mid → leaf` arrive tagged `("leaf", <leaf's call id>)` for
+  leaf's events and `("mid", <mid's call id>)` for mid's own events.
 - Sub-agent `StreamUsage` events are tagged like everything else, so token
-  usage is attributable per agent.
+  usage is attributable per invocation.
 
 Under a plain (non-streaming) `Run`, sub-agents run non-streaming — no events
 are produced anywhere.
@@ -87,11 +106,18 @@ out, err := orchestrator.RunStream(ctx, topic, func(ev core.StreamEvent) {
 })
 ```
 
-- `Views()` returns one `AgentView` per agent — assembled `Text`, every tool
-  call paired with its result (`ToolCalls []ToolCallView`), and per-agent
-  summed `Usage` — top-level agent first, then sub-agents in first-seen order.
-- `View(agent)` returns a single agent's view ("" for top-level).
-- `Totals()` returns usage summed across all agents and turns.
+- `Views()` returns one `AgentView` per lane — assembled `Text` and `Thinking`,
+  every tool call paired with its result (`ToolCalls []ToolCallView`, each with
+  `Call ToolUseBlock`, `Result`, `IsError`), and per-lane summed `Usage` —
+  top-level agent first, then sub-agent invocations in first-seen order. Each
+  view carries its `Agent` and `InvocationID`; parallel calls to the same
+  sub-agent tool appear as separate views with the same `Agent` but distinct
+  `InvocationID`s.
+- `View(agent, invocationID)` returns a single lane's view (both "" for
+  top-level).
+- `ViewsFor(agent)` returns every invocation lane sharing an `Agent` name, in
+  first-seen order.
+- `Totals()` returns usage summed across all lanes and turns.
 - Views are **copies**: a snapshot taken now is immune to later events.
 - All methods are safe for concurrent use, so a server can snapshot from
   another goroutine (e.g. an SSE handler) while the run streams.
