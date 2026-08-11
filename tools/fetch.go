@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/emotional-data/automata/core"
+	"github.com/emotional-data8482/automata/core"
 )
 
 const (

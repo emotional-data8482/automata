@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/emotional-data/automata/core"
+	"github.com/emotional-data8482/automata/core"
 )
 
 // Searcher is the pluggable backend behind [WebSearch]: the tool stays

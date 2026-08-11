@@ -1,2 +1,4 @@
+github.com/emotional-data8482/automata v0.2.1 h1:MxR4wEDkHK7Xfb6WtMFPJ4bBOn8fRdiTmx8NSWdz8jc=
+github.com/emotional-data8482/automata v0.2.1/go.mod h1:aIRcMDcjKZAjMp1YMDjxx1B4sKypVXgldbgmY8qxkp8=
 golang.org/x/sync v0.20.0 h1:e0PTpb7pjO8GAtTs2dQ6jYa5BWYlMuX047Dco/pItO4=
 golang.org/x/sync v0.20.0/go.mod h1:9xrNwdLfx4jkKbNva9FpL6vEN7evnE43NNNJQ2LF3+0=

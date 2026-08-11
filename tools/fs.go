@@ -7,7 +7,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/emotional-data/automata/core"
+	"github.com/emotional-data8482/automata/core"
 )
 
 const readMaxBytes = 256 << 10 // 256 KiB
