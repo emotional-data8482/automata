@@ -7,8 +7,8 @@ import (
 	"log/slog"
 	"reflect"
 
-	"github.com/emotional-data/automata/retry"
-	"github.com/emotional-data/automata/tracing"
+	"github.com/emotional-data8482/automata/retry"
+	"github.com/emotional-data8482/automata/tracing"
 )
 
 // Agent is the unified definition of an agent, whether it runs as a top-level

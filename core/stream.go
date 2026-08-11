@@ -8,7 +8,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/emotional-data/automata/retry"
+	"github.com/emotional-data8482/automata/retry"
 )
 
 // partialBlock accumulates the deltas for one content block as a stream

@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/emotional-data/automata/retry"
+	"github.com/emotional-data8482/automata/retry"
 )
 
 type funcTool[P any] struct {

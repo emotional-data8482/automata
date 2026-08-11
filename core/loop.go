@@ -10,7 +10,7 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
-	"github.com/emotional-data/automata/tracing"
+	"github.com/emotional-data8482/automata/tracing"
 )
 
 // Sentinel errors returned by a run. Callers can use errors.Is to distinguish
