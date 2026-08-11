@@ -24,7 +24,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/emotional-data/automata/core"
+	"github.com/emotional-data8482/automata/core"
 )
 
 var _ core.StreamProvider = (*Provider)(nil)
