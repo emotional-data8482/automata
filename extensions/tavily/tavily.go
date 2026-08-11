@@ -15,7 +15,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/emotional-data/automata/tools"
+	"github.com/emotional-data8482/automata/tools"
 )
 
 const defaultBaseURL = "https://api.tavily.com"
