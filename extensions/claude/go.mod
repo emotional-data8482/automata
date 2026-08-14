@@ -1,10 +1,10 @@
-module github.com/emotional-data/automata/extensions/claude
+module github.com/emotional-data8482/automata/extensions/claude
 
 go 1.26.2
 
 require (
 	github.com/anthropics/anthropic-sdk-go v1.21.0
-	github.com/emotional-data/automata v0.1.0
+	github.com/emotional-data8482/automata v0.2.1
 )
 
 require (
