@@ -51,7 +51,7 @@ func HTTPFetch() core.Tool {
 			if err != nil {
 				return "", err
 			}
-			req.Header.Set("User-Agent", "automata-tools/0.1 (+https://github.com/emotional-data/automata)")
+			req.Header.Set("User-Agent", "automata-tools/0.1 (+https://github.com/emotional-data8482/automata)")
 
 			resp, err := client.Do(req)
 			if err != nil {
