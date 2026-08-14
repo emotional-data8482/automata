@@ -9,7 +9,7 @@ import (
 
 	"github.com/anthropics/anthropic-sdk-go"
 
-	"github.com/emotional-data/automata/retry"
+	"github.com/emotional-data8482/automata/retry"
 )
 
 func TestAPIError_Retryable(t *testing.T) {
