@@ -77,11 +77,23 @@ type ToolChoice struct {
 	Name string
 }
 
-// Response is a single provider turn: the assistant message and the provider's
-// raw finish reason (e.g. "end_turn", "tool_use").
+// Response is a single provider turn: the assistant message, a provider-neutral
+// stop reason, and the provider's original reason for diagnostics.
+//
+// Providers should always set StopReason. RawStopReason should be copied
+// verbatim from the provider (for example, OpenAI's "length" or Anthropic's
+// "max_tokens"). The loop tolerates an empty StopReason for compatibility with
+// older custom providers, inferring end-turn versus tool-use from Message, but
+// a nonempty unrecognized reason is treated as [StopUnknown], never success.
 type Response struct {
-	Message    Message
-	StopReason string
+	Message       Message
+	StopReason    StopReason
+	RawStopReason string
+
+	// completionErr is set by core's streaming adapter when a response ended
+	// after partial data because of cancellation or a transport failure. It is
+	// folded into the CompletionError returned by the loop.
+	completionErr error
 }
 
 // Provider performs a non-streaming provider invocation.
