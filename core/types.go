@@ -3,8 +3,103 @@ package core
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"strings"
 )
+
+// StopReason is the provider-neutral reason a provider turn or agent run
+// stopped. Provider adapters map their wire values onto these constants and
+// retain the original value in Response.RawStopReason.
+type StopReason string
+
+const (
+	// StopEndTurn is a normal model completion with no pending tool calls.
+	StopEndTurn StopReason = "end_turn"
+	// StopToolUse means the model stopped to request one or more tools.
+	StopToolUse StopReason = "tool_use"
+	// StopTokenLimit means generation reached a provider or configured token
+	// limit. Any output is partial and must not be treated as a final answer.
+	StopTokenLimit StopReason = "token_limit"
+	// StopContentFilter covers provider filtering and model refusals.
+	StopContentFilter StopReason = "content_filter"
+	// StopCancelled means generation was cancelled before normal completion.
+	StopCancelled StopReason = "cancelled"
+	// StopIncomplete means the provider transport ended without a complete
+	// response (or the provider explicitly reported a resumable partial turn).
+	StopIncomplete StopReason = "incomplete"
+	// StopUnknown means the provider supplied a reason its adapter does not
+	// recognize. The raw value remains available for diagnostics.
+	StopUnknown StopReason = "unknown"
+
+	// StopMaxSteps means the agent step budget was exhausted with tools pending.
+	StopMaxSteps StopReason = "max_steps"
+	// StopError means the run aborted on another provider, tool, or hook error.
+	StopError StopReason = "error"
+)
+
+// StopNormal is an alias for StopEndTurn, provided for callers that prefer the
+// provider-neutral "normal completion" terminology.
+const StopNormal = StopEndTurn
+
+var (
+	// ErrTokenLimit is matched by a CompletionError caused by StopTokenLimit.
+	ErrTokenLimit = errors.New("provider response reached its token limit")
+	// ErrContentFiltered is matched by a CompletionError caused by provider
+	// filtering or refusal.
+	ErrContentFiltered = errors.New("provider response was filtered or refused")
+	// ErrIncompleteResponse is matched by a CompletionError for an incomplete
+	// provider response or transport.
+	ErrIncompleteResponse = errors.New("provider response was incomplete")
+	// ErrUnknownStopReason is matched when an adapter receives an unrecognized
+	// provider completion reason.
+	ErrUnknownStopReason = errors.New("unknown provider stop reason")
+)
+
+// CompletionError reports a provider turn that produced a partial or unusable
+// answer. Run and RunStream return it together with a populated RunResult, so
+// callers can retain Output, FinalMessage, Messages, and Usage while deciding
+// whether to continue, retry, or surface the partial answer.
+//
+// Use errors.As to inspect Reason and RawReason, or errors.Is with
+// ErrTokenLimit, ErrContentFiltered, ErrIncompleteResponse,
+// ErrUnknownStopReason, or context.Canceled.
+type CompletionError struct {
+	Reason    StopReason
+	RawReason string
+	Cause     error
+}
+
+func (e *CompletionError) Error() string {
+	detail := fmt.Sprintf("provider completion stopped: %s", e.Reason)
+	if e.RawReason != "" {
+		detail += fmt.Sprintf(" (provider reason %q)", e.RawReason)
+	}
+	if e.Cause != nil {
+		detail += ": " + e.Cause.Error()
+	}
+	return detail
+}
+
+func (e *CompletionError) Unwrap() error { return e.Cause }
+
+// Is lets callers distinguish completion failures without discarding the
+// provider-specific RawReason carried by CompletionError.
+func (e *CompletionError) Is(target error) bool {
+	switch target {
+	case ErrTokenLimit:
+		return e.Reason == StopTokenLimit
+	case ErrContentFiltered:
+		return e.Reason == StopContentFilter
+	case ErrIncompleteResponse:
+		return e.Reason == StopIncomplete
+	case ErrUnknownStopReason:
+		return e.Reason == StopUnknown
+	case context.Canceled:
+		return e.Reason == StopCancelled
+	}
+	return errors.Is(e.Cause, target)
+}
 
 type Usage struct {
 	InputTokens         int
@@ -134,9 +229,14 @@ type Tool interface {
 
 // StreamChunk is the provider-facing wire fragment of a streaming response: a
 // batch of block deltas plus optional finish reason and usage. A
-// [StreamProvider] emits these; [consumeStream] assembles them into a [Message].
+// [StreamProvider] emits these; [consumeStream] assembles them into a [Response].
 type StreamChunk struct {
-	Deltas       []BlockDelta
+	Deltas        []BlockDelta
+	StopReason    StopReason
+	RawStopReason string
+	// FinishReason is the legacy raw-reason field. Provider adapters populate
+	// it for compatibility as well as RawStopReason; new providers should use
+	// StopReason and RawStopReason.
 	FinishReason string
 	Usage        *Usage
 	Err          error
