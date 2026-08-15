@@ -7,8 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
-
-	"golang.org/x/sync/errgroup"
+	"sync"
 
 	"github.com/emotional-data8482/automata/tracing"
 )
@@ -330,24 +329,57 @@ func (l *Loop) run(ctx context.Context, task, mode string, cfg runConfig, invoke
 		// Snapshot messages for the approver — captures history up to and
 		// including the assistant message that requested these tool calls.
 		approverMessages := l.messages
-		g, gctx := errgroup.WithContext(ctx)
+
+		// Every call in a started batch must receive exactly one transcript
+		// result. The first fatal failure cancels the shared batch context, but we
+		// still wait for every goroutine and fill every result slot before
+		// returning. Each goroutine owns one slot, so appending the slice afterward
+		// preserves model order regardless of completion order.
+		batchCtx, cancelBatch := context.WithCancelCause(ctx)
+		var wg sync.WaitGroup
+		var fatalOnce sync.Once
+		var fatalErr error
 		for i, call := range toolUses {
-			g.Go(func() error {
-				out, isErr, err := l.executeTool(gctx, call, approverMessages)
-				if err != nil {
-					return err
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+
+				out, isErr, err := l.executeTool(batchCtx, call, approverMessages)
+				if err == nil {
+					results[i] = ToolResultMessage(call.ID, out, isErr)
+					return
 				}
-				results[i] = ToolResultMessage(call.ID, out, isErr)
-				return nil
-			})
+
+				firstFatal := false
+				fatalOnce.Do(func() {
+					firstFatal = true
+					fatalErr = err
+					cancelBatch(err)
+				})
+
+				// A non-context error is an actual failure of this call even if a
+				// sibling happened to fail first. A context error after another call
+				// aborted the batch is a synthetic cancellation result.
+				content := "aborted: " + err.Error()
+				if !firstFatal && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
+					content = canceledToolResult(context.Cause(batchCtx))
+				}
+				results[i] = ToolResultMessage(call.ID, content, true)
+				l.emit(StreamEvent{
+					Kind: StreamToolResult, ToolCall: call, Result: content,
+					IsError: true, Err: err,
+				})
+			}()
 		}
-		if err := g.Wait(); err != nil {
-			span.RecordError(err)
-			span.SetStatus(err)
-			result.Messages = l.snapshot()
-			return result, err
-		}
+		wg.Wait()
+		cancelBatch(nil)
 		l.messages = append(l.messages, results...)
+		if fatalErr != nil {
+			span.RecordError(fatalErr)
+			span.SetStatus(fatalErr)
+			result.Messages = l.snapshot()
+			return result, fatalErr
+		}
 	}
 
 	err := fmt.Errorf("%w (%d)", ErrMaxStepsExceeded, a.maxSteps)
@@ -356,6 +388,13 @@ func (l *Loop) run(ctx context.Context, task, mode string, cfg runConfig, invoke
 	result.StopReason = StopMaxSteps
 	result.Messages = l.snapshot()
 	return result, err
+}
+
+func canceledToolResult(cause error) string {
+	if cause == nil {
+		return "canceled: tool batch aborted"
+	}
+	return "canceled: tool batch aborted: " + cause.Error()
 }
 
 // normalizeResponseStop validates the provider-neutral reason and supplies a
@@ -414,7 +453,13 @@ func (l *Loop) snapshot() []Message {
 // result is the string fed back to the model; isError marks a recoverable tool
 // failure (unknown tool, denial, or a tool error) that the model can adapt to;
 // fatalErr is non-nil only for run-aborting conditions (approver error, context
-// cancellation) and stops the whole run.
+// cancellation) and stops the whole run after the batch records an outcome for
+// every sibling call.
+//
+// Cancellation is cooperative. A tool may finish a side effect while batch
+// cancellation races its return. If it returns success, that actual result is
+// recorded; if it returns a context error, the transcript records cancellation.
+// Neither outcome implies that an external side effect was rolled back.
 func (l *Loop) executeTool(ctx context.Context, call ToolUseBlock, messages []Message) (string, bool, error) {
 	a := l.agent
 	tool, ok := l.toolsByName[call.Name]
