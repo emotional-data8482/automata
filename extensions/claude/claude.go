@@ -222,7 +222,35 @@ func (p *Provider) Invoke(ctx context.Context, req core.Request) (core.Response,
 	if err != nil {
 		return core.Response{}, fmt.Errorf("anthropic invoke: %w", wrapAPIError(err))
 	}
-	return core.Response{Message: convertResponse(resp), StopReason: string(resp.StopReason)}, nil
+	rawStopReason := string(resp.StopReason)
+	return core.Response{
+		Message:       convertResponse(resp),
+		StopReason:    mapStopReason(rawStopReason),
+		RawStopReason: rawStopReason,
+	}, nil
+}
+
+// mapStopReason translates Anthropic stop_reason values into core's
+// provider-neutral stop vocabulary. pause_turn is a resumable, incomplete turn;
+// refusal is grouped with content filtering. Unknown values remain failures and
+// are retained verbatim in Response.RawStopReason.
+func mapStopReason(raw string) core.StopReason {
+	switch raw {
+	case "end_turn", "stop_sequence":
+		return core.StopEndTurn
+	case "tool_use":
+		return core.StopToolUse
+	case "max_tokens", "model_context_window_exceeded":
+		return core.StopTokenLimit
+	case "refusal":
+		return core.StopContentFilter
+	case "cancelled", "canceled":
+		return core.StopCancelled
+	case "pause_turn", "incomplete":
+		return core.StopIncomplete
+	default:
+		return core.StopUnknown
+	}
 }
 
 func (p *Provider) InvokeStream(ctx context.Context, req core.Request) (<-chan core.StreamChunk, error) {
@@ -330,7 +358,10 @@ func (p *Provider) InvokeStream(ctx context.Context, req core.Request) (<-chan c
 			case anthropic.MessageDeltaEvent:
 				chunk := core.StreamChunk{}
 				if ev.Delta.StopReason != "" {
-					chunk.FinishReason = string(ev.Delta.StopReason)
+					rawStopReason := string(ev.Delta.StopReason)
+					chunk.StopReason = mapStopReason(rawStopReason)
+					chunk.RawStopReason = rawStopReason
+					chunk.FinishReason = rawStopReason
 				}
 				if ev.Usage.OutputTokens > 0 || ev.Usage.InputTokens > 0 ||
 					ev.Usage.CacheCreationInputTokens > 0 || ev.Usage.CacheReadInputTokens > 0 {

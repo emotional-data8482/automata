@@ -1,16 +1,82 @@
 package claude
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	"github.com/anthropics/anthropic-sdk-go"
+	"github.com/anthropics/anthropic-sdk-go/option"
 
+	"github.com/emotional-data8482/automata/core"
 	"github.com/emotional-data8482/automata/retry"
 )
+
+func TestMapStopReason(t *testing.T) {
+	tests := []struct {
+		raw  string
+		want core.StopReason
+	}{
+		{"end_turn", core.StopEndTurn},
+		{"stop_sequence", core.StopEndTurn},
+		{"tool_use", core.StopToolUse},
+		{"max_tokens", core.StopTokenLimit},
+		{"refusal", core.StopContentFilter},
+		{"pause_turn", core.StopIncomplete},
+		{"cancelled", core.StopCancelled},
+		{"something_new", core.StopUnknown},
+	}
+	for _, tt := range tests {
+		if got := mapStopReason(tt.raw); got != tt.want {
+			t.Errorf("mapStopReason(%q) = %q, want %q", tt.raw, got, tt.want)
+		}
+	}
+}
+
+func TestMaxTokensReturnsTypedPartialResult(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{
+			"id":"msg_1",
+			"type":"message",
+			"role":"assistant",
+			"model":"claude-test",
+			"content":[{"type":"text","text":"cut off"}],
+			"stop_reason":"max_tokens",
+			"stop_sequence":null,
+			"usage":{"input_tokens":4,"output_tokens":2}
+		}`)
+	}))
+	defer srv.Close()
+
+	p := &Provider{
+		model:     "claude-test",
+		maxTokens: 128,
+		client: anthropic.NewClient(
+			option.WithAPIKey("test-key"),
+			option.WithBaseURL(srv.URL),
+			option.WithMaxRetries(0),
+		),
+	}
+	res, err := core.New(p).Run(context.Background(), "go")
+	if !errors.Is(err, core.ErrTokenLimit) {
+		t.Fatalf("err = %v, want core.ErrTokenLimit", err)
+	}
+	var completionErr *core.CompletionError
+	if !errors.As(err, &completionErr) {
+		t.Fatalf("err type = %T, want *core.CompletionError", err)
+	}
+	if completionErr.Reason != core.StopTokenLimit || completionErr.RawReason != "max_tokens" {
+		t.Errorf("CompletionError = %+v, want token_limit / max_tokens", completionErr)
+	}
+	if res.Output != "cut off" || res.StopReason != core.StopTokenLimit || res.RawStopReason != "max_tokens" {
+		t.Errorf("partial result = %+v, want preserved cut-off output and reasons", res)
+	}
+}
 
 func TestAPIError_Retryable(t *testing.T) {
 	cases := []struct {
