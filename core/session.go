@@ -13,7 +13,12 @@ import (
 //
 // The transcript survives failures: if a run errors mid-way (provider
 // failure, [ErrMaxStepsExceeded], cancellation), everything up to the failure
-// is recorded, so the run can be audited and the conversation continued.
+// is recorded, so the run can be audited and the conversation continued. When
+// a parallel tool batch aborts, every requested call is committed with either
+// its actual result or a synthetic aborted/canceled error result before the
+// fatal error is returned. Cancellation is cooperative: a tool may complete an
+// external side effect while cancellation races its return, and a synthetic
+// canceled result does not imply that side effect was rolled back.
 //
 // Persistence is plain data: [Message] marshals to JSON, so store
 // session.Messages() anywhere and rebuild with [Agent.ResumeSession]:
