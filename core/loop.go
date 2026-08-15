@@ -87,18 +87,6 @@ func newLoop(a *Agent, history []Message) *Loop {
 // non-streaming retry differently (see terminalStreamError).
 type invokeFn func(ctx context.Context, log *slog.Logger, req Request) (Response, error)
 
-// StopReason explains why a run ended.
-type StopReason string
-
-const (
-	// StopEndTurn: the model returned a final answer with no tool calls.
-	StopEndTurn StopReason = "end_turn"
-	// StopMaxSteps: the step budget was exhausted with tools still pending.
-	StopMaxSteps StopReason = "max_steps"
-	// StopError: the run aborted on a provider, tool, or hook error.
-	StopError StopReason = "error"
-)
-
 // RunResult is the outcome of a run. It is always populated as far as the run
 // progressed — including when the run returns an error — so callers can inspect
 // partial output, the transcript, usage, and steps even on failure.
@@ -118,6 +106,10 @@ type RunResult struct {
 	Steps int
 	// StopReason explains why the run ended.
 	StopReason StopReason
+	// RawStopReason is the provider's verbatim reason for the terminal provider
+	// turn. It is useful when StopReason is StopUnknown and for distinguishing
+	// provider spellings such as OpenAI "length" and Anthropic "max_tokens".
+	RawStopReason string
 
 	// terminalToolInput holds the raw JSON arguments of a terminal-tool call
 	// (see runConfig.terminalTool). Unexported: only [RunTyped] reads it.
@@ -239,6 +231,9 @@ func (l *Loop) run(ctx context.Context, task, mode string, cfg runConfig, invoke
 			invokeSpan.End()
 			log.ErrorContext(ctx, "provider invocation failed", "step", step, "err", err)
 			result.Steps = step
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				result.StopReason = StopCancelled
+			}
 			result.Messages = l.snapshot()
 			return result, fmt.Errorf("api call failed at step %d: %w", step, err)
 		}
@@ -262,6 +257,30 @@ func (l *Loop) run(ctx context.Context, task, mode string, cfg runConfig, invoke
 		result.FinalMessage = msg
 
 		toolUses := msg.ToolUses()
+		stopReason, rawStopReason := normalizeResponseStop(response, toolUses)
+		result.RawStopReason = rawStopReason
+
+		// These provider outcomes are never successful final answers, even when
+		// the provider returned nonempty text. Preserve that partial text and the
+		// full transcript, then return a typed error that carries both neutral and
+		// raw reasons.
+		switch stopReason {
+		case StopTokenLimit, StopContentFilter, StopCancelled, StopIncomplete, StopUnknown:
+			return l.failCompletion(ctx, span, log, &result, stopReason, rawStopReason, response.completionErr)
+		}
+
+		// A provider reason and its message shape must agree. Executing calls from
+		// a response marked complete, or accepting a tool-use stop with no call,
+		// risks committing an incomplete provider turn.
+		if stopReason == StopEndTurn && len(toolUses) > 0 {
+			cause := errors.New("provider reported normal completion with pending tool calls")
+			return l.failCompletion(ctx, span, log, &result, StopIncomplete, rawStopReason, cause)
+		}
+		if stopReason == StopToolUse && len(toolUses) == 0 {
+			cause := errors.New("provider reported tool use without a tool call")
+			return l.failCompletion(ctx, span, log, &result, StopIncomplete, rawStopReason, cause)
+		}
+
 		if len(toolUses) == 0 {
 			// No tool calls: the model is done. Return its text. A message with
 			// neither text nor tool calls (e.g. thinking only) is an empty
@@ -337,6 +356,53 @@ func (l *Loop) run(ctx context.Context, task, mode string, cfg runConfig, invoke
 	result.StopReason = StopMaxSteps
 	result.Messages = l.snapshot()
 	return result, err
+}
+
+// normalizeResponseStop validates the provider-neutral reason and supplies a
+// compatibility inference only when an older custom provider supplied no
+// reason at all. A nonempty unrecognized value is preserved as raw diagnostic
+// data and becomes StopUnknown.
+func normalizeResponseStop(response Response, toolUses []ToolUseBlock) (StopReason, string) {
+	reason := response.StopReason
+	raw := response.RawStopReason
+
+	if reason == "" {
+		if raw != "" {
+			return StopUnknown, raw
+		}
+		if len(toolUses) > 0 {
+			return StopToolUse, ""
+		}
+		return StopEndTurn, ""
+	}
+
+	switch reason {
+	case StopEndTurn, StopToolUse, StopTokenLimit, StopContentFilter,
+		StopCancelled, StopIncomplete, StopUnknown:
+		return reason, raw
+	default:
+		if raw == "" {
+			raw = string(reason)
+		}
+		return StopUnknown, raw
+	}
+}
+
+// failCompletion finalizes a partial result and constructs the typed error used
+// for token limits, filtering/refusal, cancellation, incomplete transport, and
+// unknown provider reasons.
+func (l *Loop) failCompletion(ctx context.Context, span tracing.Span, log *slog.Logger, result *RunResult, reason StopReason, raw string, cause error) (RunResult, error) {
+	result.Output = result.FinalMessage.Text()
+	result.StopReason = reason
+	result.RawStopReason = raw
+	result.Messages = l.snapshot()
+	err := &CompletionError{Reason: reason, RawReason: raw, Cause: cause}
+	span.RecordError(err)
+	span.SetStatus(err)
+	span.SetAttributes(tracing.Int("steps", result.Steps))
+	log.WarnContext(ctx, "provider completion was not final",
+		"reason", reason, "raw_reason", raw, "steps", result.Steps)
+	return *result, err
 }
 
 // snapshot returns a copy of the loop's current transcript for a RunResult.
