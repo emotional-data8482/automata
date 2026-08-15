@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"reflect"
 	"strings"
 	"testing"
@@ -53,6 +54,11 @@ func streamMessage(ch chan<- StreamChunk, m Message) {
 	if m.Usage != nil {
 		ch <- StreamChunk{Usage: m.Usage}
 	}
+	reason := StopEndTurn
+	if len(m.ToolUses()) > 0 {
+		reason = StopToolUse
+	}
+	ch <- StreamChunk{StopReason: reason}
 }
 
 // scriptedStreamProvider replays a fixed sequence of StreamChunks for each turn,
@@ -77,8 +83,25 @@ func (p *scriptedStreamProvider) InvokeStream(context.Context, Request) (<-chan 
 	ch := make(chan StreamChunk)
 	go func() {
 		defer close(ch)
+		hasStop := false
+		hasToolUse := false
 		for _, c := range chunks {
+			if c.StopReason != "" || c.RawStopReason != "" || c.FinishReason != "" {
+				hasStop = true
+			}
+			for _, d := range c.Deltas {
+				if d.Type == "tool_use" {
+					hasToolUse = true
+				}
+			}
 			ch <- c
+		}
+		if !hasStop {
+			reason := StopEndTurn
+			if hasToolUse {
+				reason = StopToolUse
+			}
+			ch <- StreamChunk{StopReason: reason}
 		}
 	}()
 	return ch, nil
@@ -365,6 +388,28 @@ func TestRunStreamEmitsUsage(t *testing.T) {
 	}
 	if usage == nil || usage.InputTokens != 12 || usage.OutputTokens != 7 {
 		t.Errorf("usage = %+v, want {InputTokens:12 OutputTokens:7}", usage)
+	}
+}
+
+func TestRunStreamTransportFailurePreservesPartialResult(t *testing.T) {
+	provider := &scriptedStreamProvider{turns: [][]StreamChunk{{
+		{Deltas: []BlockDelta{{Index: 0, Type: "text"}}},
+		{Deltas: []BlockDelta{{Index: 0, Text: "partial stream"}}},
+		{Err: io.ErrUnexpectedEOF},
+	}}}
+
+	res, err := New(provider).RunStream(context.Background(), "go", nil)
+	if !errors.Is(err, ErrIncompleteResponse) || !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("err = %v, want incomplete response wrapping unexpected EOF", err)
+	}
+	if res.Output != "partial stream" || res.FinalMessage.Text() != "partial stream" {
+		t.Errorf("partial output/message = %q / %q", res.Output, res.FinalMessage.Text())
+	}
+	if res.StopReason != StopIncomplete {
+		t.Errorf("StopReason = %q, want %q", res.StopReason, StopIncomplete)
+	}
+	if len(res.Messages) == 0 || res.Messages[len(res.Messages)-1].Text() != "partial stream" {
+		t.Errorf("partial transcript = %+v, want final partial assistant message", res.Messages)
 	}
 }
 
