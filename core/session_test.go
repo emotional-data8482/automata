@@ -92,6 +92,70 @@ func TestSessionTranscriptSurvivesError(t *testing.T) {
 	}
 }
 
+// TestSessionResumesAfterParallelToolAbort proves a fatal tool in a parallel
+// batch commits a structurally complete transcript. A second run with a fresh
+// context can send that history back to the provider and continue normally.
+func TestSessionResumesAfterParallelToolAbort(t *testing.T) {
+	blockedStarted := make(chan struct{})
+	provider := &capturingProvider{turns: []Message{
+		AssistantMessage(
+			toolUse("a1", "abort", `{}`),
+			toolUse("b1", "blocked", `{}`),
+		),
+		asstText("resumed"),
+	}}
+	agent := New(provider)
+	agent.RegisterTool(Func("abort", "aborts the batch", func(_ context.Context, _ struct{}) (string, error) {
+		<-blockedStarted
+		return "", context.Canceled
+	}))
+	agent.RegisterTool(Func("blocked", "waits for its sibling", func(ctx context.Context, _ struct{}) (string, error) {
+		close(blockedStarted)
+		<-ctx.Done()
+		return "", ctx.Err()
+	}))
+
+	session := agent.NewSession()
+	first, err := session.Run(context.Background(), "start")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("first Run err = %v, want context.Canceled", err)
+	}
+	firstResults := transcriptToolResults(first.Messages)
+	if len(firstResults) != 2 || firstResults[0].ToolUseID != "a1" || firstResults[1].ToolUseID != "b1" {
+		t.Fatalf("first run results = %+v, want ordered results for a1 and b1", firstResults)
+	}
+	for _, result := range firstResults {
+		if !result.IsError {
+			t.Errorf("result for %q IsError=false, want true", result.ToolUseID)
+		}
+	}
+
+	second, err := session.Run(context.Background(), "continue")
+	if err != nil || second.Output != "resumed" {
+		t.Fatalf("resumed Run = %q, %v", second.Output, err)
+	}
+	if len(provider.received) != 2 {
+		t.Fatalf("provider received %d requests, want 2", len(provider.received))
+	}
+
+	// The resumed request contains one result for every prior assistant call,
+	// followed by the new user turn. Providers can therefore accept the history.
+	resumedHistory := provider.received[1]
+	results := transcriptToolResults(resumedHistory)
+	if len(results) != 2 || results[0].ToolUseID != "a1" || results[1].ToolUseID != "b1" {
+		t.Errorf("resumed history results = %+v, want ordered a1/b1 results", results)
+	}
+	wantRoles := []string{"user", "assistant", "tool", "tool", "user"}
+	if got := roles(resumedHistory); strings.Join(got, ",") != strings.Join(wantRoles, ",") {
+		t.Errorf("resumed history roles = %v, want %v", got, wantRoles)
+	}
+
+	committed := session.Messages()
+	if got := roles(committed); len(got) != 6 || got[len(got)-1] != "assistant" {
+		t.Errorf("committed resumed transcript roles = %v, want six entries ending in assistant", got)
+	}
+}
+
 // TestSessionResumeRoundTrip persists a transcript through JSON and resumes it
 // on a fresh Session: the next run sees the full history, and the system
 // prompt is not duplicated.
