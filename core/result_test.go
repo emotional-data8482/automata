@@ -14,6 +14,12 @@ type optionsProvider struct {
 	seen  []CallOptions
 }
 
+type fixedResponseProvider struct{ response Response }
+
+func (p fixedResponseProvider) Invoke(context.Context, Request) (Response, error) {
+	return p.response, nil
+}
+
 func (p *optionsProvider) Invoke(_ context.Context, req Request) (Response, error) {
 	p.seen = append(p.seen, req.Options)
 	if p.calls >= len(p.turns) {
@@ -21,7 +27,11 @@ func (p *optionsProvider) Invoke(_ context.Context, req Request) (Response, erro
 	}
 	m := p.turns[p.calls]
 	p.calls++
-	return Response{Message: m, StopReason: "end_turn"}, nil
+	reason := StopEndTurn
+	if len(m.ToolUses()) > 0 {
+		reason = StopToolUse
+	}
+	return Response{Message: m, StopReason: reason}, nil
 }
 
 func floatPtr(f float64) *float64 { return &f }
@@ -90,6 +100,84 @@ func TestRunResultMaxStepsReturnsPartials(t *testing.T) {
 	// Partial transcript survives: task, assistant tool call, tool result.
 	if got := roles(res.Messages); len(got) != 3 {
 		t.Errorf("partial transcript roles = %v, want 3 entries", got)
+	}
+}
+
+func TestCompletionFailuresReturnPartialResults(t *testing.T) {
+	tests := []struct {
+		name       string
+		reason     StopReason
+		raw        string
+		text       string
+		wantIs     error
+		wantOutput string
+	}{
+		{
+			name:       "token limit",
+			reason:     StopTokenLimit,
+			raw:        "length",
+			text:       "partial answer",
+			wantIs:     ErrTokenLimit,
+			wantOutput: "partial answer",
+		},
+		{
+			name:   "filtered empty response",
+			reason: StopContentFilter,
+			raw:    "content_filter",
+			wantIs: ErrContentFiltered,
+		},
+		{
+			name:       "unknown provider reason",
+			reason:     StopUnknown,
+			raw:        "future_reason",
+			text:       "not known to be final",
+			wantIs:     ErrUnknownStopReason,
+			wantOutput: "not known to be final",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			provider := fixedResponseProvider{response: Response{
+				Message:       asstText(tt.text),
+				StopReason:    tt.reason,
+				RawStopReason: tt.raw,
+			}}
+			res, err := New(provider).Run(context.Background(), "go")
+			if !errors.Is(err, tt.wantIs) {
+				t.Fatalf("err = %v, want errors.Is(_, %v)", err, tt.wantIs)
+			}
+			var completionErr *CompletionError
+			if !errors.As(err, &completionErr) {
+				t.Fatalf("err type = %T, want *CompletionError", err)
+			}
+			if completionErr.Reason != tt.reason || completionErr.RawReason != tt.raw {
+				t.Errorf("CompletionError = %+v, want reason %q / raw %q", completionErr, tt.reason, tt.raw)
+			}
+			if res.Output != tt.wantOutput {
+				t.Errorf("Output = %q, want %q", res.Output, tt.wantOutput)
+			}
+			if res.StopReason != tt.reason || res.RawStopReason != tt.raw {
+				t.Errorf("result reasons = %q / %q, want %q / %q", res.StopReason, res.RawStopReason, tt.reason, tt.raw)
+			}
+			if res.Steps != 1 || len(res.Messages) == 0 || res.Messages[len(res.Messages)-1].Role != "assistant" {
+				t.Errorf("partial result lost progress: Steps=%d Messages=%+v", res.Steps, res.Messages)
+			}
+		})
+	}
+}
+
+func TestUnrecognizedResponseReasonDoesNotBecomeSuccess(t *testing.T) {
+	provider := fixedResponseProvider{response: Response{
+		Message:    asstText("looks complete"),
+		StopReason: StopReason("brand_new_reason"),
+	}}
+	res, err := New(provider).Run(context.Background(), "go")
+	if !errors.Is(err, ErrUnknownStopReason) {
+		t.Fatalf("err = %v, want ErrUnknownStopReason", err)
+	}
+	if res.StopReason != StopUnknown || res.RawStopReason != "brand_new_reason" {
+		t.Errorf("result reasons = %q / %q, want unknown / brand_new_reason", res.StopReason, res.RawStopReason)
 	}
 }
 
