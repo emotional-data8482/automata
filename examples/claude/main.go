@@ -15,8 +15,8 @@ import (
 	"os"
 	"time"
 
-	"github.com/emotional-data/automata/core"
-	"github.com/emotional-data/automata/extensions/claude"
+	"github.com/emotional-data8482/automata/core"
+	"github.com/emotional-data8482/automata/extensions/claude"
 )
 
 // currentTimeParams is the typed input for the current_time tool. The exported

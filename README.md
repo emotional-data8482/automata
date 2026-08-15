@@ -47,9 +47,9 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/emotional-data/automata/core"
-	"github.com/emotional-data/automata/extensions/claude"
-	"github.com/emotional-data/automata/tools"
+	"github.com/emotional-data8482/automata/core"
+	"github.com/emotional-data8482/automata/extensions/claude"
+	"github.com/emotional-data8482/automata/tools"
 )
 
 type weatherArgs struct {

@@ -16,8 +16,8 @@ import (
 	"os"
 	"time"
 
-	"github.com/emotional-data/automata/core"
-	"github.com/emotional-data/automata/extensions/openai"
+	"github.com/emotional-data8482/automata/core"
+	"github.com/emotional-data8482/automata/extensions/openai"
 )
 
 type timeArgs struct {

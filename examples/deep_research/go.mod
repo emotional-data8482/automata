@@ -1,4 +1,4 @@
-module github.com/emotional-data/automata/examples/deep_research
+module github.com/emotional-data8482/automata/examples/deep_research
 
 go 1.26.2
 
@@ -6,10 +6,10 @@ require (
 	github.com/charmbracelet/bubbles v0.20.0
 	github.com/charmbracelet/bubbletea v1.2.4
 	github.com/charmbracelet/lipgloss v1.0.0
-	github.com/emotional-data/automata v0.1.0
-	github.com/emotional-data/automata/extensions/claude v0.1.0
-	github.com/emotional-data/automata/extensions/tavily v0.1.0
-	github.com/emotional-data/automata/tools v0.1.0
+	github.com/emotional-data8482/automata v0.2.1
+	github.com/emotional-data8482/automata/extensions/claude v0.2.1
+	github.com/emotional-data8482/automata/extensions/tavily v0.2.1
+	github.com/emotional-data8482/automata/tools v0.2.1
 	github.com/joho/godotenv v1.5.1
 )
 
@@ -38,8 +38,8 @@ require (
 )
 
 replace (
-	github.com/emotional-data/automata => ../..
-	github.com/emotional-data/automata/extensions/claude => ../../extensions/claude
-	github.com/emotional-data/automata/extensions/tavily => ../../extensions/tavily
-	github.com/emotional-data/automata/tools => ../../tools
+	github.com/emotional-data8482/automata => ../..
+	github.com/emotional-data8482/automata/extensions/claude => ../../extensions/claude
+	github.com/emotional-data8482/automata/extensions/tavily => ../../extensions/tavily
+	github.com/emotional-data8482/automata/tools => ../../tools
 )

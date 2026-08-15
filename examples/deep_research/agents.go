@@ -8,10 +8,10 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/emotional-data/automata/core"
-	"github.com/emotional-data/automata/extensions/claude"
-	"github.com/emotional-data/automata/extensions/tavily"
-	"github.com/emotional-data/automata/tools"
+	"github.com/emotional-data8482/automata/core"
+	"github.com/emotional-data8482/automata/extensions/claude"
+	"github.com/emotional-data8482/automata/extensions/tavily"
+	"github.com/emotional-data8482/automata/tools"
 )
 
 // researchParams is the assignment schema the orchestrator fills when calling

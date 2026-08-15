@@ -26,7 +26,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/joho/godotenv"
 
-	"github.com/emotional-data/automata/core"
+	"github.com/emotional-data8482/automata/core"
 )
 
 type appConfig struct {
