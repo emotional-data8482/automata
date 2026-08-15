@@ -76,20 +76,26 @@ func (a *Agent) runStream(ctx context.Context, l *Loop, task string, onEvent fun
 
 	return l.run(ctx, task, "stream", cfg, func(ctx context.Context, log *slog.Logger, req Request) (Response, error) {
 		var emitted bool
+		var partial Response
 		streamEmit := func(kind StreamEventKind, delta string) {
 			emitted = true
 			l.emit(StreamEvent{Kind: kind, Text: delta})
 		}
 		resp, err := retry.Do(ctx, a.retryCfg, func() (Response, error) {
-			m, finish, cerr := consumeStream(ctx, sp, req, streamEmit, log)
-			if cerr != nil && emitted {
+			streamResp, cerr := consumeStream(ctx, sp, req, streamEmit, log)
+			if cerr != nil && (emitted || responseHasPartial(streamResp) || errors.Is(cerr, ErrIncompleteResponse)) {
+				streamResp.completionErr = cerr
+				partial = streamResp
 				return Response{}, &terminalStreamError{err: cerr}
 			}
-			return Response{Message: m, StopReason: finish}, cerr
+			return streamResp, cerr
 		})
 		if err != nil {
-			if t, ok := errors.AsType[*terminalStreamError](err); ok {
-				err = t.err
+			if _, ok := errors.AsType[*terminalStreamError](err); ok {
+				// Partial content has already been delivered to the callback, so a
+				// retry would duplicate or diverge from it. Hand the partial response
+				// to the loop; its neutral stop reason becomes a CompletionError.
+				return partial, nil
 			}
 		}
 		return resp, err
@@ -97,18 +103,19 @@ func (a *Agent) runStream(ctx context.Context, l *Loop, task string, onEvent fun
 }
 
 // consumeStream reads a provider's StreamChunks, assembling the block deltas
-// into the final assistant [Message] and the provider's finish reason. onDelta
-// receives each text or thinking delta as it arrives (with the matching event
-// kind) so the caller can forward it live.
-func consumeStream(ctx context.Context, sp StreamProvider, req Request, onDelta func(StreamEventKind, string), log *slog.Logger) (Message, string, error) {
+// into a Response with both the neutral and raw stop reasons. onDelta receives
+// each text or thinking delta as it arrives (with the matching event kind) so
+// the caller can forward it live.
+func consumeStream(ctx context.Context, sp StreamProvider, req Request, onDelta func(StreamEventKind, string), log *slog.Logger) (Response, error) {
 	ch, err := sp.InvokeStream(ctx, req)
 	if err != nil {
-		return Message{}, "", err
+		return Response{}, err
 	}
 
 	var partials []partialBlock
 	var usage *Usage
-	var finishReason string
+	var stopReason StopReason
+	var rawStopReason string
 
 	for {
 		select {
@@ -117,18 +124,58 @@ func consumeStream(ctx context.Context, sp StreamProvider, req Request, onDelta 
 			// once it notices cancellation. Drain defensively in case a chunk is
 			// already in flight.
 			go drain(ch)
-			return Message{}, "", ctx.Err()
+			return Response{
+				Message:       buildAssistantMessage(partials, usage),
+				StopReason:    StopCancelled,
+				RawStopReason: rawStopReason,
+			}, ctx.Err()
 		case chunk, ok := <-ch:
 			if !ok {
-				return buildAssistantMessage(partials, usage), finishReason, nil
+				resp := Response{
+					Message:       buildAssistantMessage(partials, usage),
+					StopReason:    stopReason,
+					RawStopReason: rawStopReason,
+				}
+				if stopReason == "" {
+					resp.StopReason = StopIncomplete
+					return resp, ErrIncompleteResponse
+				}
+				return resp, nil
 			}
 			if chunk.Err != nil {
 				// Abandon the stream — producer may still have unsent chunks.
 				go drain(ch)
-				return Message{}, "", chunk.Err
+				reason := StopIncomplete
+				if errors.Is(chunk.Err, context.Canceled) || errors.Is(chunk.Err, context.DeadlineExceeded) {
+					reason = StopCancelled
+				}
+				return Response{
+					Message:       buildAssistantMessage(partials, usage),
+					StopReason:    reason,
+					RawStopReason: rawStopReason,
+				}, chunk.Err
 			}
-			if chunk.FinishReason != "" {
-				finishReason = chunk.FinishReason
+			chunkRawReason := chunk.RawStopReason
+			if chunkRawReason == "" {
+				chunkRawReason = chunk.FinishReason
+			}
+			if chunkRawReason != "" {
+				rawStopReason = chunkRawReason
+			}
+			if chunk.StopReason != "" {
+				stopReason = chunk.StopReason
+			} else if chunkRawReason != "" {
+				// Legacy custom stream providers may have placed a neutral value in
+				// FinishReason. Accept neutral spellings, but never guess that an
+				// unrecognized provider-specific value means success.
+				legacy := StopReason(chunkRawReason)
+				switch legacy {
+				case StopEndTurn, StopToolUse, StopTokenLimit, StopContentFilter,
+					StopCancelled, StopIncomplete, StopUnknown:
+					stopReason = legacy
+				default:
+					stopReason = StopUnknown
+				}
 			}
 			for _, d := range chunk.Deltas {
 				for len(partials) <= d.Index {
@@ -169,6 +216,10 @@ func consumeStream(ctx context.Context, sp StreamProvider, req Request, onDelta 
 			}
 		}
 	}
+}
+
+func responseHasPartial(resp Response) bool {
+	return len(resp.Message.Blocks) > 0 || resp.Message.Usage != nil
 }
 
 func drain(ch <-chan StreamChunk) {
