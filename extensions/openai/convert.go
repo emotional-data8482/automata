@@ -13,6 +13,7 @@ import (
 type wireMessage struct {
 	Role       string         `json:"role"`
 	Content    any            `json:"content,omitempty"` // string, or []contentPart for images
+	Refusal    string         `json:"refusal,omitempty"`
 	ToolCalls  []wireToolCall `json:"tool_calls,omitempty"`
 	ToolCallID string         `json:"tool_call_id,omitempty"`
 }
@@ -162,6 +163,9 @@ func convertResponse(msg wireMessage) core.Message {
 	var blocks core.Blocks
 	if s, ok := msg.Content.(string); ok && s != "" {
 		blocks = append(blocks, core.TextBlock{Text: s})
+	}
+	if msg.Refusal != "" {
+		blocks = append(blocks, core.TextBlock{Text: msg.Refusal})
 	}
 	for _, tc := range msg.ToolCalls {
 		args := tc.Function.Arguments

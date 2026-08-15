@@ -212,7 +212,37 @@ func (p *Provider) Invoke(ctx context.Context, req core.Request) (core.Response,
 	choice := parsed.Choices[0]
 	msg := convertResponse(choice.Message)
 	msg.Usage = parsed.Usage.toCore()
-	return core.Response{Message: msg, StopReason: choice.FinishReason}, nil
+	stopReason := mapFinishReason(choice.FinishReason)
+	if choice.Message.Refusal != "" {
+		stopReason = core.StopContentFilter
+	}
+	return core.Response{
+		Message:       msg,
+		StopReason:    stopReason,
+		RawStopReason: choice.FinishReason,
+	}, nil
+}
+
+// mapFinishReason translates OpenAI Chat Completions finish_reason values into
+// core's provider-neutral stop vocabulary. Unknown values are deliberately not
+// treated as successful completions; Response.RawStopReason retains them.
+func mapFinishReason(raw string) core.StopReason {
+	switch raw {
+	case "stop":
+		return core.StopEndTurn
+	case "tool_calls", "function_call":
+		return core.StopToolUse
+	case "length":
+		return core.StopTokenLimit
+	case "content_filter", "refusal":
+		return core.StopContentFilter
+	case "cancelled", "canceled":
+		return core.StopCancelled
+	case "incomplete":
+		return core.StopIncomplete
+	default:
+		return core.StopUnknown
+	}
 }
 
 type streamChunkWire struct {
@@ -304,7 +334,11 @@ func handleSSELine(line string, send func(core.StreamChunk) bool) bool {
 	}
 	if len(wire.Choices) > 0 {
 		choice := wire.Choices[0]
-		chunk.FinishReason = choice.FinishReason
+		if choice.FinishReason != "" {
+			chunk.StopReason = mapFinishReason(choice.FinishReason)
+			chunk.RawStopReason = choice.FinishReason
+			chunk.FinishReason = choice.FinishReason
+		}
 		if choice.Delta.Content != "" {
 			// Text is content-block index 0.
 			chunk.Deltas = append(chunk.Deltas, core.BlockDelta{

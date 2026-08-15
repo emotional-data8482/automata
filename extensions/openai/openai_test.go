@@ -3,6 +3,7 @@ package openai
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -57,8 +58,8 @@ func TestInvokeRequestShape(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Invoke: %v", err)
 	}
-	if resp.Message.Text() != "hi" || resp.StopReason != "stop" {
-		t.Errorf("response = %+v, want text 'hi' / stop", resp)
+	if resp.Message.Text() != "hi" || resp.StopReason != core.StopEndTurn || resp.RawStopReason != "stop" {
+		t.Errorf("response = %+v, want text 'hi' / end_turn / raw stop", resp)
 	}
 	if resp.Message.Usage == nil || resp.Message.Usage.InputTokens != 5 {
 		t.Errorf("usage = %+v, want InputTokens 5", resp.Message.Usage)
@@ -89,6 +90,49 @@ func TestInvokeRequestShape(t *testing.T) {
 	tools := gotBody["tools"].([]any)
 	if len(tools) != 1 {
 		t.Errorf("sent %d tools, want 1", len(tools))
+	}
+}
+
+func TestMapFinishReason(t *testing.T) {
+	tests := []struct {
+		raw  string
+		want core.StopReason
+	}{
+		{"stop", core.StopEndTurn},
+		{"tool_calls", core.StopToolUse},
+		{"function_call", core.StopToolUse},
+		{"length", core.StopTokenLimit},
+		{"content_filter", core.StopContentFilter},
+		{"cancelled", core.StopCancelled},
+		{"incomplete", core.StopIncomplete},
+		{"something_new", core.StopUnknown},
+	}
+	for _, tt := range tests {
+		if got := mapFinishReason(tt.raw); got != tt.want {
+			t.Errorf("mapFinishReason(%q) = %q, want %q", tt.raw, got, tt.want)
+		}
+	}
+}
+
+func TestLengthReturnsTypedPartialResult(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"cut off"},"finish_reason":"length"}]}`)
+	}))
+	defer srv.Close()
+
+	res, err := core.New(New("m", srv.URL)).Run(context.Background(), "go")
+	if !errors.Is(err, core.ErrTokenLimit) {
+		t.Fatalf("err = %v, want core.ErrTokenLimit", err)
+	}
+	var completionErr *core.CompletionError
+	if !errors.As(err, &completionErr) {
+		t.Fatalf("err type = %T, want *core.CompletionError", err)
+	}
+	if completionErr.Reason != core.StopTokenLimit || completionErr.RawReason != "length" {
+		t.Errorf("CompletionError = %+v, want token_limit / length", completionErr)
+	}
+	if res.Output != "cut off" || res.StopReason != core.StopTokenLimit || res.RawStopReason != "length" {
+		t.Errorf("partial result = %+v, want preserved cut-off output and reasons", res)
 	}
 }
 
