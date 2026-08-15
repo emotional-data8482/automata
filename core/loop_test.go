@@ -119,3 +119,105 @@ func TestUnknownToolIsRecoverable(t *testing.T) {
 		t.Errorf("sibling tool result = %q, want %q", results["e1"], "echoed:hi")
 	}
 }
+
+// TestParallelToolBatchRecordsEveryOutcome verifies that a fatal approver
+// failure does not leave the assistant's parallel tool-call batch unmatched.
+// Completed and recoverably failed siblings keep their actual results, the
+// fatal call gets an aborted result, and the interrupted sibling gets a
+// synthetic canceled result. Transcript order follows model order rather than
+// completion order.
+func TestParallelToolBatchRecordsEveryOutcome(t *testing.T) {
+	approvalErr := errors.New("approval exploded")
+	done := make(chan struct{})
+	recovered := make(chan struct{})
+	blockedStarted := make(chan struct{})
+	var fatalExecuted atomic.Bool
+
+	provider := &capturingProvider{turns: []Message{
+		AssistantMessage(
+			toolUse("b1", "blocked", `{}`),
+			toolUse("f1", "fatal", `{}`),
+			toolUse("d1", "done", `{}`),
+			toolUse("r1", "recover", `{}`),
+		),
+	}}
+	agent := New(provider).WithApprover(ApproverFunc(func(_ context.Context, call ToolUseBlock, _ []Message) (Decision, error) {
+		if call.ID != "f1" {
+			return Decision{Outcome: Allow}, nil
+		}
+		// Do not fail the batch until the other three calls have reached known
+		// states: two completed and one is blocked awaiting cancellation.
+		<-done
+		<-recovered
+		<-blockedStarted
+		return Decision{}, approvalErr
+	}))
+	agent.RegisterTool(Func("blocked", "waits for cancellation", func(ctx context.Context, _ struct{}) (string, error) {
+		close(blockedStarted)
+		<-ctx.Done()
+		return "", ctx.Err()
+	}))
+	agent.RegisterTool(Func("fatal", "approval fails", func(_ context.Context, _ struct{}) (string, error) {
+		fatalExecuted.Store(true)
+		return "", errors.New("fatal tool should not execute")
+	}))
+	agent.RegisterTool(Func("done", "completes normally", func(_ context.Context, _ struct{}) (string, error) {
+		close(done)
+		return "completed", nil
+	}))
+	agent.RegisterTool(Func("recover", "returns a recoverable error", func(_ context.Context, _ struct{}) (string, error) {
+		close(recovered)
+		return "", errors.New("recoverable failure")
+	}))
+
+	res, err := agent.Run(context.Background(), "go")
+	if !errors.Is(err, approvalErr) {
+		t.Fatalf("err = %v, want approval error", err)
+	}
+	if fatalExecuted.Load() {
+		t.Error("fatal tool executed despite approver failure")
+	}
+
+	results := transcriptToolResults(res.Messages)
+	if len(results) != 4 {
+		t.Fatalf("got %d tool results, want 4: %+v", len(results), results)
+	}
+	wantIDs := []string{"b1", "f1", "d1", "r1"}
+	for i, want := range wantIDs {
+		if results[i].ToolUseID != want {
+			t.Errorf("result %d ID = %q, want %q (model order)", i, results[i].ToolUseID, want)
+		}
+	}
+
+	byID := make(map[string]ToolResultBlock, len(results))
+	for _, result := range results {
+		byID[result.ToolUseID] = result
+	}
+	if got := (Message{Blocks: byID["d1"].Content}).Text(); got != "completed" || byID["d1"].IsError {
+		t.Errorf("completed result = %q, IsError=%v", got, byID["d1"].IsError)
+	}
+	if got := (Message{Blocks: byID["r1"].Content}).Text(); got != "recoverable failure" || !byID["r1"].IsError {
+		t.Errorf("recoverable result = %q, IsError=%v", got, byID["r1"].IsError)
+	}
+	if got := (Message{Blocks: byID["f1"].Content}).Text(); got != "aborted: approval exploded" || !byID["f1"].IsError {
+		t.Errorf("fatal result = %q, IsError=%v", got, byID["f1"].IsError)
+	}
+	if got := (Message{Blocks: byID["b1"].Content}).Text(); got != "canceled: tool batch aborted: approval exploded" || !byID["b1"].IsError {
+		t.Errorf("canceled result = %q, IsError=%v", got, byID["b1"].IsError)
+	}
+}
+
+func transcriptToolResults(messages []Message) []ToolResultBlock {
+	var results []ToolResultBlock
+	for _, message := range messages {
+		if message.Role != "tool" {
+			continue
+		}
+		for _, block := range message.Blocks {
+			if result, ok := block.(ToolResultBlock); ok {
+				results = append(results, result)
+			}
+		}
+	}
+	return results
+}
