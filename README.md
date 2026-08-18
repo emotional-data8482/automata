@@ -111,6 +111,30 @@ sess = agent.ResumeSession(transcript)
 _ = draft
 ```
 
+Use a per-run post-run hook to checkpoint the transcript after the session has
+committed it. Hooks also run for failed and canceled runs, receiving the partial
+`RunResult` and the original run error:
+
+```go
+checkpoint := core.WithPostRunHook(func(ctx context.Context, res core.RunResult, runErr error) error {
+	blob, err := json.Marshal(res.Messages)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile("session.json", blob, 0o600)
+})
+
+res, err := sess.Run(ctx, "Plan the next bounded cycle", checkpoint)
+```
+
+The hook context retains the run context's values but is detached from its
+cancellation and deadline so cancellation checkpoints can still complete. A
+storage implementation should apply its own timeout. If persistence fails, its
+error is returned (joined with the run error when both fail) without discarding
+the `RunResult`. This is a completed-run boundary checkpoint, not resumable
+execution inside an active provider turn or tool call; action-level idempotency
+should protect external side effects.
+
 ## Typed results
 
 `core.RunTyped[T]` returns the agent's final answer decoded into a Go struct.
@@ -127,6 +151,26 @@ type Person struct {
 p, res, err := core.RunTyped[Person](ctx, agent, "Who is Ada Lovelace?")
 // p.Name == "Ada Lovelace"; res carries usage/steps/transcript.
 ```
+
+For a persistent coordinator, use `RunSessionTyped` to keep the conversation
+across typed decisions and JSON persistence:
+
+```go
+sess := agent.NewSession()
+first, _, err := core.RunSessionTyped[Person](ctx, sess, "Choose the first action", checkpoint)
+
+blob, _ := json.Marshal(sess.Messages())
+var transcript []core.Message
+_ = json.Unmarshal(blob, &transcript)
+sess = agent.ResumeSession(transcript)
+
+next, res, err := core.RunSessionTyped[Person](ctx, sess, "Choose the next action", checkpoint)
+_, _, _, _ = first, next, res, err
+```
+
+If typed output needs the forced structured-output fallback, that fallback is a
+second bounded session run. Post-run hooks fire after both completed runs, so
+the prose attempt is checkpointed before the forced run begins.
 
 ## Multi-agent: sub-agents are just tools
 
