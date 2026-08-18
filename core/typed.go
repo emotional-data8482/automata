@@ -6,24 +6,35 @@ import (
 	"fmt"
 )
 
-// structuredOutputToolName is the name of the hidden tool [RunTyped] injects to
-// collect the typed result.
+// structuredOutputToolName is the name of the hidden tool [RunTyped] and
+// [RunSessionTyped] inject to collect the typed result.
 const structuredOutputToolName = "structured_output"
 
-// RunTyped runs the agent and decodes its final answer into T. It works by
-// injecting a hidden "structured_output" tool whose JSON schema is derived from
-// T (via the same reflection as [Func]); when the model calls that tool, the
-// run ends and its arguments are decoded into T.
+// RunTyped runs the agent in a fresh [Session] and decodes its final answer into
+// T. It is the one-shot counterpart to [RunSessionTyped].
+func RunTyped[T any](ctx context.Context, a *Agent, task string, opts ...RunOption) (T, RunResult, error) {
+	return RunSessionTyped[T](ctx, a.NewSession(), task, opts...)
+}
+
+// RunSessionTyped continues session and decodes the agent's final answer into
+// T. It works by injecting a hidden "structured_output" tool whose JSON schema
+// is derived from T (via the same reflection as [Func]); when the model calls
+// that tool, the run ends and its arguments are decoded into T.
 //
-// If the model instead ends with a plain-text answer, RunTyped issues one more
-// turn that forces the structured_output tool (tool_choice), so a value is
-// always produced or a decode error is returned. Extended thinking is disabled
-// on that forced turn because providers (Anthropic) forbid combining forced
-// tool choice with thinking.
+// If the model instead ends with a plain-text answer, RunSessionTyped issues one
+// more run on the same session that forces the structured_output tool
+// (tool_choice), so a value is always produced or a decode error is returned.
+// Extended thinking is disabled on that forced run because providers
+// (Anthropic) forbid combining forced tool choice with thinking.
 //
 // The [RunResult] is returned alongside T (populated as far as the run got,
 // even on error) so callers still see usage, steps, and the transcript.
-func RunTyped[T any](ctx context.Context, a *Agent, task string, opts ...RunOption) (T, RunResult, error) {
+// [PostRunHook]s fire after each underlying run, so the forced fallback path
+// creates one checkpoint for the prose run and another for the forced run.
+func RunSessionTyped[T any](ctx context.Context, session *Session, task string, opts ...RunOption) (T, RunResult, error) {
+	session.runMu.Lock()
+	defer session.runMu.Unlock()
+
 	var zero T
 
 	tool := Func(structuredOutputToolName,
@@ -36,11 +47,7 @@ func RunTyped[T any](ctx context.Context, a *Agent, task string, opts ...RunOpti
 		c.terminalTool = structuredOutputToolName
 	}
 
-	// Drive the whole exchange through one Session so the forced fallback turn
-	// continues the same conversation.
-	sess := a.NewSession()
-
-	res, err := sess.Run(ctx, task, append([]RunOption{inject}, opts...)...)
+	res, err := session.run(ctx, task, append([]RunOption{inject}, opts...)...)
 	if err != nil {
 		return zero, res, err
 	}
@@ -59,7 +66,7 @@ func RunTyped[T any](ctx context.Context, a *Agent, task string, opts ...RunOpti
 	forced := append([]RunOption{inject}, opts...)
 	forced = append(forced, force)
 
-	res, err = sess.Run(ctx,
+	res, err = session.run(ctx,
 		"Now return the final answer by calling the structured_output tool.",
 		forced...)
 	if err != nil {
