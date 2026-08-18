@@ -7,8 +7,6 @@ require (
 	github.com/emotional-data8482/automata/extensions/openai v0.2.1
 )
 
-require golang.org/x/sync v0.20.0 // indirect
-
 replace (
 	github.com/emotional-data8482/automata => ../..
 	github.com/emotional-data8482/automata/extensions/openai => ../../extensions/openai
