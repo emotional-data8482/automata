@@ -111,7 +111,8 @@ type RunResult struct {
 	RawStopReason string
 
 	// terminalToolInput holds the raw JSON arguments of a terminal-tool call
-	// (see runConfig.terminalTool). Unexported: only [RunTyped] reads it.
+	// (see runConfig.terminalTool). Unexported: only [RunTyped] and
+	// [RunSessionTyped] read it.
 	terminalToolInput json.RawMessage
 }
 
@@ -121,15 +122,19 @@ type runConfig struct {
 	// options is the merged CallOptions sent on every provider turn.
 	options CallOptions
 	// extraTools are tools added for this run only (not on the Agent). Used by
-	// [RunTyped] to inject its structured-output tool.
+	// typed runs to inject their structured-output tool.
 	extraTools []Tool
 	// terminalTool, when non-empty, names a tool whose call ends the run without
-	// executing it; the call's Input is recorded in the result. Used by
-	// [RunTyped]. Empty for ordinary runs.
+	// executing it; the call's Input is recorded in the result. Used by typed
+	// runs; empty for ordinary runs.
 	terminalTool string
+	// postRunHooks observe the fully populated result after the owning run API
+	// has finalized its state. They are added with [WithPostRunHook].
+	postRunHooks []PostRunHook
 }
 
-// RunOption customizes a single run. See [WithCallOptions].
+// RunOption customizes a single run. See [WithCallOptions] and
+// [WithPostRunHook].
 type RunOption func(*runConfig)
 
 // WithCallOptions overrides the agent's default [CallOptions] for one run. The
@@ -142,6 +147,7 @@ func (l *Loop) run(ctx context.Context, task, mode string, cfg runConfig, invoke
 	a := l.agent
 	result := RunResult{StopReason: StopError}
 	if a.maxSteps <= 0 {
+		result.Messages = l.snapshot()
 		return result, fmt.Errorf("%w; use WithMaxSteps to configure", ErrInvalidMaxSteps)
 	}
 
