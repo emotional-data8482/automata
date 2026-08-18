@@ -2,6 +2,8 @@ package core
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -119,6 +121,169 @@ func TestRunTypedCoexistsWithRealTools(t *testing.T) {
 	}
 	if got.Name != "Ada" {
 		t.Errorf("decoded = %+v, want name Ada", got)
+	}
+}
+
+// TestRunSessionTypedContinuesConversation verifies typed decisions can be
+// produced repeatedly without discarding the coordinator's prior turns.
+func TestRunSessionTypedContinuesConversation(t *testing.T) {
+	provider := &capturingProvider{turns: []Message{
+		asstTool("s1", structuredOutputToolName, `{"name":"Ada","age":36}`),
+		asstTool("s2", structuredOutputToolName, `{"name":"Grace","age":37}`),
+	}}
+	agent := New(provider).WithSystemPrompt("Remember prior decisions.")
+	session := agent.NewSession()
+
+	first, _, err := RunSessionTyped[personResult](context.Background(), session, "first")
+	if err != nil {
+		t.Fatalf("first RunSessionTyped: %v", err)
+	}
+	second, _, err := RunSessionTyped[personResult](context.Background(), session, "second")
+	if err != nil {
+		t.Fatalf("second RunSessionTyped: %v", err)
+	}
+	if first.Name != "Ada" || second.Name != "Grace" {
+		t.Fatalf("typed results = %+v / %+v, want Ada / Grace", first, second)
+	}
+
+	if len(provider.received) != 2 {
+		t.Fatalf("provider saw %d requests, want 2", len(provider.received))
+	}
+	wantRoles := []string{"system", "user", "assistant", "tool", "user"}
+	if got := roles(provider.received[1]); strings.Join(got, ",") != strings.Join(wantRoles, ",") {
+		t.Errorf("second request roles = %v, want %v", got, wantRoles)
+	}
+	priorCalls := provider.received[1][2].ToolUses()
+	if len(priorCalls) != 1 || priorCalls[0].Name != structuredOutputToolName {
+		t.Errorf("second request lost prior structured output call: %+v", priorCalls)
+	}
+	priorResults := transcriptToolResults(provider.received[1])
+	if len(priorResults) != 1 || priorResults[0].ToolUseID != "s1" || priorResults[0].IsError {
+		t.Errorf("second request prior tool results = %+v, want successful s1", priorResults)
+	}
+}
+
+// TestRunSessionTypedResumeJSONRoundTrip proves a persisted typed conversation
+// can be resumed and used for another typed decision without reseeding the
+// system prompt.
+func TestRunSessionTypedResumeJSONRoundTrip(t *testing.T) {
+	provider := &capturingProvider{turns: []Message{
+		asstTool("s1", structuredOutputToolName, `{"name":"Ada","age":36}`),
+		asstTool("s2", structuredOutputToolName, `{"name":"Grace","age":37}`),
+	}}
+	agent := New(provider).WithSystemPrompt("sys")
+	session := agent.NewSession()
+	if _, _, err := RunSessionTyped[personResult](context.Background(), session, "first"); err != nil {
+		t.Fatalf("first RunSessionTyped: %v", err)
+	}
+
+	blob, err := json.Marshal(session.Messages())
+	if err != nil {
+		t.Fatalf("marshal transcript: %v", err)
+	}
+	var transcript []Message
+	if err := json.Unmarshal(blob, &transcript); err != nil {
+		t.Fatalf("unmarshal transcript: %v", err)
+	}
+
+	resumed := agent.ResumeSession(transcript)
+	got, _, err := RunSessionTyped[personResult](context.Background(), resumed, "second")
+	if err != nil {
+		t.Fatalf("resumed RunSessionTyped: %v", err)
+	}
+	if got.Name != "Grace" || got.Age != 37 {
+		t.Errorf("resumed typed result = %+v, want Grace/37", got)
+	}
+
+	systems := 0
+	for _, message := range provider.received[1] {
+		if message.Role == "system" {
+			systems++
+		}
+	}
+	if systems != 1 {
+		t.Errorf("resumed typed request saw %d system messages, want 1", systems)
+	}
+}
+
+// TestRunSessionTypedFallbackCheckpointsEachRun pins the checkpoint cadence:
+// the prose attempt is committed first, followed by the forced typed run.
+func TestRunSessionTypedFallbackCheckpointsEachRun(t *testing.T) {
+	provider := &forcingProvider{replies: []Message{
+		asstText("Ada is 36 years old."),
+		asstTool("s2", structuredOutputToolName, `{"name":"Ada","age":36}`),
+	}}
+	session := New(provider).NewSession()
+	var transcriptLengths []int
+	hook := WithPostRunHook(func(_ context.Context, result RunResult, runErr error) error {
+		if runErr != nil {
+			t.Errorf("hook runErr = %v, want nil", runErr)
+		}
+		transcriptLengths = append(transcriptLengths, len(result.Messages))
+		return nil
+	})
+
+	got, _, err := RunSessionTyped[personResult](context.Background(), session, "who?", hook)
+	if err != nil {
+		t.Fatalf("RunSessionTyped: %v", err)
+	}
+	if got.Name != "Ada" || got.Age != 36 {
+		t.Errorf("decoded = %+v, want Ada/36", got)
+	}
+	if len(transcriptLengths) != 2 || transcriptLengths[0] != 2 || transcriptLengths[1] != 5 {
+		t.Errorf("checkpoint transcript lengths = %v, want [2 5]", transcriptLengths)
+	}
+}
+
+func TestRunSessionTypedStopsWhenFirstCheckpointFails(t *testing.T) {
+	checkpointErr := errors.New("checkpoint failed")
+	provider := &forcingProvider{replies: []Message{
+		asstText("Ada is 36 years old."),
+		asstTool("s2", structuredOutputToolName, `{"name":"Ada","age":36}`),
+	}}
+	session := New(provider).NewSession()
+
+	_, result, err := RunSessionTyped[personResult](context.Background(), session, "who?",
+		WithPostRunHook(func(context.Context, RunResult, error) error {
+			return checkpointErr
+		}),
+	)
+	if !errors.Is(err, checkpointErr) {
+		t.Fatalf("err = %v, want checkpoint failure", err)
+	}
+	if provider.calls != 1 {
+		t.Errorf("provider calls = %d, want 1 (forced fallback must not start)", provider.calls)
+	}
+	if result.Output != "Ada is 36 years old." || len(session.Messages()) != 2 {
+		t.Errorf("first run result/session = %+v / %+v", result, session.Messages())
+	}
+}
+
+func TestRunSessionTypedMaxStepsReturnsPartialResult(t *testing.T) {
+	provider := &optionsProvider{turns: []Message{
+		withUsage(asstTool("c1", "lookup", `{}`), &Usage{InputTokens: 4, OutputTokens: 2}),
+	}}
+	agent := New(provider).WithMaxSteps(1)
+	agent.RegisterTool(Func("lookup", "looks up", func(context.Context, struct{}) (string, error) {
+		return "found", nil
+	}))
+	session := agent.NewSession()
+
+	_, result, err := RunSessionTyped[personResult](context.Background(), session, "go")
+	if !errors.Is(err, ErrMaxStepsExceeded) {
+		t.Fatalf("err = %v, want ErrMaxStepsExceeded", err)
+	}
+	if result.StopReason != StopMaxSteps || result.Steps != 1 {
+		t.Errorf("partial result stop/steps = %q/%d, want max_steps/1", result.StopReason, result.Steps)
+	}
+	if result.Usage != (Usage{InputTokens: 4, OutputTokens: 2}) {
+		t.Errorf("partial usage = %+v, want {4 2}", result.Usage)
+	}
+	if got := roles(result.Messages); len(got) != 3 {
+		t.Errorf("partial transcript roles = %v, want user/assistant/tool", got)
+	}
+	if got := roles(session.Messages()); strings.Join(got, ",") != strings.Join(roles(result.Messages), ",") {
+		t.Errorf("committed transcript roles = %v, want %v", got, roles(result.Messages))
 	}
 }
 
