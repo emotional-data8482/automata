@@ -32,10 +32,11 @@ import (
 // Note that [Message.Meta] is excluded from JSON (it is transport-scoped) and
 // does not round-trip.
 //
-// Concurrency: a Session is safe for concurrent use. Runs are serialized —
-// a Run/RunStream call blocks until the previous one finishes — and Messages
-// may be called from any goroutine (it reflects the transcript as of the last
-// completed run; for live progress, use RunStream's events).
+// Concurrency: a Session is safe for concurrent use. Runs are serialized — a
+// Run, RunStream, or [RunSessionTyped] call blocks until the previous operation
+// finishes — and Messages may be called from any goroutine (it reflects the
+// transcript as of the last completed run; for live progress, use RunStream's
+// events).
 type Session struct {
 	agent *Agent
 
@@ -70,11 +71,18 @@ func (a *Agent) ResumeSession(transcript []Message) *Session {
 func (s *Session) Run(ctx context.Context, task string, opts ...RunOption) (RunResult, error) {
 	s.runMu.Lock()
 	defer s.runMu.Unlock()
+	return s.run(ctx, task, opts...)
+}
 
+// run continues the session while its caller holds runMu. Keeping the locking
+// boundary separate lets compound operations such as RunSessionTyped serialize
+// both their initial run and forced fallback as one conversation operation.
+func (s *Session) run(ctx context.Context, task string, opts ...RunOption) (RunResult, error) {
+	cfg := s.agent.newRunConfig(opts)
 	l := newLoop(s.agent, s.Messages())
-	out, err := s.agent.runSync(ctx, l, task, opts...)
+	out, err := s.agent.runSync(ctx, l, task, cfg)
 	s.commit(l.messages)
-	return out, err
+	return finishRun(ctx, cfg, out, err)
 }
 
 // RunStream continues the conversation like [Session.Run] while delivering
@@ -83,11 +91,15 @@ func (s *Session) Run(ctx context.Context, task string, opts ...RunOption) (RunR
 func (s *Session) RunStream(ctx context.Context, task string, onEvent func(StreamEvent), opts ...RunOption) (RunResult, error) {
 	s.runMu.Lock()
 	defer s.runMu.Unlock()
+	return s.runStream(ctx, task, onEvent, opts...)
+}
 
+func (s *Session) runStream(ctx context.Context, task string, onEvent func(StreamEvent), opts ...RunOption) (RunResult, error) {
+	cfg := s.agent.newRunConfig(opts)
 	l := newLoop(s.agent, s.Messages())
-	out, err := s.agent.runStream(ctx, l, task, onEvent, opts...)
+	out, err := s.agent.runStream(ctx, l, task, onEvent, cfg)
 	s.commit(l.messages)
-	return out, err
+	return finishRun(ctx, cfg, out, err)
 }
 
 // Messages returns a snapshot of the transcript as of the last completed run.
