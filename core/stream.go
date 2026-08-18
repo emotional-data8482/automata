@@ -36,16 +36,17 @@ type partialBlock struct {
 // concurrently), but RunStream serializes the calls, so the callback need not be
 // safe for concurrent use.
 func (a *Agent) RunStream(ctx context.Context, task string, onEvent func(StreamEvent), opts ...RunOption) (RunResult, error) {
-	return a.runStream(ctx, newLoop(a, nil), task, onEvent, opts...)
+	cfg := a.newRunConfig(opts)
+	result, err := a.runStream(ctx, newLoop(a, nil), task, onEvent, cfg)
+	return finishRun(ctx, cfg, result, err)
 }
 
 // runStream drives a pre-built loop through the streaming path. Split from
 // RunStream so a [Session] can supply a loop seeded with its transcript.
-func (a *Agent) runStream(ctx context.Context, l *Loop, task string, onEvent func(StreamEvent), opts ...RunOption) (RunResult, error) {
+func (a *Agent) runStream(ctx context.Context, l *Loop, task string, onEvent func(StreamEvent), cfg runConfig) (RunResult, error) {
 	if onEvent == nil {
 		onEvent = func(StreamEvent) {}
 	}
-	cfg := a.newRunConfig(opts)
 
 	sp, streamOK := a.provider.(StreamProvider)
 

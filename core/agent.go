@@ -138,17 +138,19 @@ func (a *Agent) RegisterFunc(name, description string, fn func(context.Context) 
 	}))
 }
 
-// Run executes the agent on task and returns the [RunResult]. Options override
-// the agent's default [CallOptions] for this run only. The result is populated
-// as far as the run got, even on error.
+// Run executes the agent on task and returns the [RunResult]. Options customize
+// this run only; [WithCallOptions] overrides the agent's default call options,
+// while [WithPostRunHook] observes the completed result. The result is
+// populated as far as the run got, even on error.
 func (a *Agent) Run(ctx context.Context, task string, opts ...RunOption) (RunResult, error) {
-	return a.runSync(ctx, newLoop(a, nil), task, opts...)
+	cfg := a.newRunConfig(opts)
+	result, err := a.runSync(ctx, newLoop(a, nil), task, cfg)
+	return finishRun(ctx, cfg, result, err)
 }
 
 // runSync drives a pre-built loop through the non-streaming path. Split from
 // Run so a [Session] can supply a loop seeded with its transcript.
-func (a *Agent) runSync(ctx context.Context, l *Loop, task string, opts ...RunOption) (RunResult, error) {
-	cfg := a.newRunConfig(opts)
+func (a *Agent) runSync(ctx context.Context, l *Loop, task string, cfg runConfig) (RunResult, error) {
 	return l.run(ctx, task, "sync", cfg, func(ctx context.Context, _ *slog.Logger, req Request) (Response, error) {
 		return retry.Do(ctx, a.retryCfg, func() (Response, error) {
 			return a.provider.Invoke(ctx, req)
