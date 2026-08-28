@@ -210,12 +210,26 @@ func AssistantMessage(blocks ...Block) Message {
 // ToolResultMessage builds a tool-result turn answering the call toolUseID.
 // content is the string fed back to the model; isError marks the tool as
 // failed, which providers with a native error flag map onto.
+//
+// This is the text-only convenience form; it delegates to
+// [ToolResultBlockMessage]. Use that constructor directly to attach images or
+// other mixed content to a tool result.
 func ToolResultMessage(toolUseID, content string, isError bool) Message {
+	return ToolResultBlockMessage(toolUseID, Blocks{TextBlock{Text: content}}, isError)
+}
+
+// ToolResultBlockMessage builds a tool-result turn whose [ToolResultBlock]
+// content is the given blocks (typically [TextBlock]s and [ImageBlock]s),
+// answering the call toolUseID. isError marks the tool as failed, which
+// providers with a native error flag map onto. Blocks are stored in the order
+// given, so a provider adapter that supports them (e.g. Anthropic) preserves
+// mixed text/image content in order.
+func ToolResultBlockMessage(toolUseID string, blocks Blocks, isError bool) Message {
 	return Message{
 		Role: "tool",
 		Blocks: Blocks{ToolResultBlock{
 			ToolUseID: toolUseID,
-			Content:   Blocks{TextBlock{Text: content}},
+			Content:   blocks,
 			IsError:   isError,
 		}},
 	}
@@ -225,6 +239,88 @@ type Tool interface {
 	Name() string
 	Schema() json.RawMessage
 	Execute(ctx context.Context, args string) (string, error)
+}
+
+// ResultTool is the opt-in rich-result extension of [Tool]. A tool may
+// implement it in addition to Tool; the run loop prefers ExecuteResult when
+// present, so the tool can return block-based content ([TextBlock]s,
+// [ImageBlock]s, …) instead of only a string. Tools that implement only Tool
+// are unaffected: their Execute string is wrapped with [TextResult].
+//
+// The same error semantics as Tool.Execute apply: a non-context error is a
+// recoverable tool failure (converted to an error tool result the model can
+// adapt to), while [context.Canceled] and [context.DeadlineExceeded] abort the
+// run.
+type ResultTool interface {
+	Tool
+	ExecuteResult(ctx context.Context, args string) (ToolResult, error)
+}
+
+// ToolResult is the execution-layer return value of a rich-result tool
+// (see [ResultTool]). It is not a transcript type: the run loop converts it
+// into a [ToolResultBlock] inside a role:"tool" [Message]. Blocks order is
+// preserved in the transcript, and Text() stays the compatibility view that
+// streaming consumers and text-only providers see.
+//
+// A zero ToolResult is normalized to a single empty [TextBlock] before it is
+// recorded, so providers never receive empty tool_result content.
+type ToolResult struct {
+	Blocks  Blocks
+	IsError bool
+}
+
+// Text returns the concatenated text of all [TextBlock]s in the result.
+// Non-text blocks (images, …) contribute nothing — providers that cannot
+// render them see only the text view (or a documented placeholder).
+func (r ToolResult) Text() string {
+	return Message{Blocks: r.Blocks}.Text()
+}
+
+// TextResult builds a plain-text [ToolResult].
+func TextResult(text string) ToolResult {
+	return ToolResult{Blocks: Blocks{TextBlock{Text: text}}}
+}
+
+// BlockResult builds a [ToolResult] from the given blocks, preserving order.
+// If no blocks are supplied, the result is normalized to a single empty
+// [TextBlock].
+func BlockResult(blocks ...Block) ToolResult {
+	if len(blocks) == 0 {
+		blocks = Blocks{TextBlock{}}
+	}
+	return ToolResult{Blocks: blocks}
+}
+
+// ErrorResult builds an error [ToolResult]: IsError is set and text is the
+// error message fed back to the model, which can recover from the failure.
+func ErrorResult(text string) ToolResult {
+	r := TextResult(text)
+	r.IsError = true
+	return r
+}
+
+// ImageResult builds a [ToolResult] carrying an inline base64-encoded image.
+// mediaType is the IANA image type ("image/png", "image/jpeg", …). Keep image
+// payloads small: they are base64-encoded into the transcript and, for
+// providers that support image tool results, sent to the provider verbatim.
+func ImageResult(mediaType string, data []byte) ToolResult {
+	return BlockResult(ImageBlock{MediaType: mediaType, Data: data})
+}
+
+// URLImageResult builds a [ToolResult] referencing an image by URL. Providers
+// decide whether to fetch URLs; see the provider docs for what is supported.
+func URLImageResult(url string) ToolResult {
+	return BlockResult(ImageBlock{URL: url})
+}
+
+// normalizeResult guarantees a recorded [ToolResult] carries at least one
+// block, so a handler that returns a zero ToolResult still produces well-formed
+// tool_result content (a single empty text block).
+func normalizeResult(r ToolResult) ToolResult {
+	if len(r.Blocks) == 0 {
+		r.Blocks = Blocks{TextBlock{}}
+	}
+	return r
 }
 
 // StreamChunk is the provider-facing wire fragment of a streaming response: a
@@ -305,7 +401,13 @@ type StreamEvent struct {
 	Text         string       // StreamText / StreamThinking: the content delta
 	ToolCall     ToolUseBlock // StreamToolCall / StreamToolResult: the call
 	Result       string       // StreamToolResult: the string returned to the model
-	IsError      bool         // StreamToolResult: true if the tool failed
-	Usage        *Usage       // StreamUsage: the completed turn's token usage
-	Err          error        // StreamToolResult: non-nil if the tool returned an error
+	// ResultBlocks holds the rich result blocks behind Result for a
+	// StreamToolResult (see [ResultTool]). For string tools it is a single
+	// [TextBlock]; for image-only rich results Result is "" — consumers that
+	// need the content should read ResultBlocks. Shared with the transcript, so
+	// treat it as read-only.
+	ResultBlocks Blocks // StreamToolResult: the rich result blocks behind Result
+	IsError      bool   // StreamToolResult: true if the tool failed
+	Usage        *Usage // StreamUsage: the completed turn's token usage
+	Err          error  // StreamToolResult: non-nil if the tool returned an error
 }
