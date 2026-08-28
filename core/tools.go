@@ -47,6 +47,58 @@ func Func[P any](name, description string, handler func(context.Context, P) (str
 	return &funcTool[P]{name: name, schema: schema, handler: handler}
 }
 
+// funcResultTool is the rich-result counterpart of funcTool: it implements
+// both [Tool] (so it registers anywhere a Tool does, flattening rich results
+// to text) and [ResultTool] (so the run loop executes it richly).
+type funcResultTool[P any] struct {
+	name    string
+	schema  json.RawMessage
+	handler func(context.Context, P) (ToolResult, error)
+}
+
+func (t *funcResultTool[P]) Name() string            { return t.name }
+func (t *funcResultTool[P]) Schema() json.RawMessage { return t.schema }
+
+func (t *funcResultTool[P]) ExecuteResult(ctx context.Context, args string) (ToolResult, error) {
+	var params P
+	if args != "" && args != "null" && args != "{}" {
+		if err := json.Unmarshal([]byte(args), &params); err != nil {
+			return ToolResult{}, fmt.Errorf("invalid args: %w", err)
+		}
+	}
+	return t.handler(ctx, params)
+}
+
+// Execute satisfies [Tool] for registration paths and consumers that only know
+// the string API. It delegates to ExecuteResult and flattens the result with
+// [ToolResult.Text].
+func (t *funcResultTool[P]) Execute(ctx context.Context, args string) (string, error) {
+	res, err := t.ExecuteResult(ctx, args)
+	if err != nil {
+		return "", err
+	}
+	return res.Text(), nil
+}
+
+// FuncResult is [Func] for tools that return rich content: the same typed
+// schema generation applies to P, but the handler returns a [ToolResult] —
+// built with [TextResult], [BlockResult], [ImageResult], [URLImageResult], or
+// [ErrorResult] — which the run loop records as block-based
+// [ToolResultBlock] content in the transcript. The returned value satisfies
+// [Tool], so it registers via [Agent.RegisterTool] and [Agent.WithTools] like
+// any other tool; the run loop detects the richer interface and preserves the
+// blocks.
+//
+// Tool error semantics match [Func]: non-context errors from the handler (or
+// from arg decoding, reported as "invalid args: …") become error tool results
+// the model can recover from; [context.Canceled] and
+// [context.DeadlineExceeded] abort the run.
+func FuncResult[P any](name, description string, handler func(context.Context, P) (ToolResult, error)) Tool {
+	var zero P
+	schema := buildSchema(name, description, reflect.TypeOf(zero))
+	return &funcResultTool[P]{name: name, schema: schema, handler: handler}
+}
+
 // retryTool wraps a [Tool] so its Execute is retried under cfg. See
 // [WithToolRetry].
 type retryTool struct {
@@ -60,6 +112,27 @@ func (t *retryTool) Execute(ctx context.Context, args string) (string, error) {
 	})
 }
 
+// retryResultTool additionally forwards [ResultTool] so wrapping a rich-result
+// tool does not strip its block-carrying ExecuteResult (the run loop would
+// otherwise silently fall back to the flattening Execute).
+type retryResultTool struct {
+	Tool
+	result ResultTool
+	cfg    retry.Config
+}
+
+func (t *retryResultTool) Execute(ctx context.Context, args string) (string, error) {
+	return retry.Do(ctx, t.cfg, func() (string, error) {
+		return t.Tool.Execute(ctx, args)
+	})
+}
+
+func (t *retryResultTool) ExecuteResult(ctx context.Context, args string) (ToolResult, error) {
+	return retry.Do(ctx, t.cfg, func() (ToolResult, error) {
+		return t.result.ExecuteResult(ctx, args)
+	})
+}
+
 // WithToolRetry wraps t so its Execute is retried under cfg, using the same
 // [retry] policy the agent applies to provider calls. The run loop does not
 // retry tools on its own (a retry there would replay a whole sub-agent run), so
@@ -70,7 +143,13 @@ func (t *retryTool) Execute(ctx context.Context, args string) (string, error) {
 // Do not wrap an [AsTool] sub-agent with this: sub-agents already retry at
 // their provider layer, and retrying the Execute would re-run the entire
 // sub-agent, re-emitting its stream events and double-counting its usage.
+//
+// If t implements [ResultTool], the wrapper forwards ExecuteResult so rich
+// tool results survive the wrap.
 func WithToolRetry(t Tool, cfg retry.Config) Tool {
+	if rt, ok := t.(ResultTool); ok {
+		return &retryResultTool{Tool: t, result: rt, cfg: cfg}
+	}
 	return &retryTool{Tool: t, cfg: cfg}
 }
 
