@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/emotional-data8482/automata/core"
 )
@@ -56,6 +57,38 @@ func convertTools(tools []core.Tool) []wireTool {
 	return out
 }
 
+// toolResultText flattens a tool result's blocks into the text-only content a
+// Chat Completions tool message can represent. Text blocks concatenate in
+// order; non-text blocks (images, …) become a documented placeholder line so a
+// rich result never arrives at the model as an empty string:
+//
+//	[non-text tool result block: image/png]
+//
+// Chat Completions has no native tool-result image/structured content, so
+// degradation is by placeholder rather than a conversion error. Callers that
+// need the model to see images should use a provider with native support
+// (Anthropic) or route the image through a user message.
+func toolResultText(tr core.ToolResultBlock) string {
+	var b strings.Builder
+	for _, blk := range tr.Content {
+		switch t := blk.(type) {
+		case core.TextBlock:
+			b.WriteString(t.Text)
+		case core.ImageBlock:
+			kind := t.MediaType
+			if kind == "" {
+				kind = "image"
+			}
+			b.WriteString("[non-text tool result block: ")
+			b.WriteString(kind)
+			b.WriteString("]")
+		default:
+			b.WriteString("[non-text tool result block omitted]")
+		}
+	}
+	return b.String()
+}
+
 // convertMessages maps core's block messages to OpenAI wire messages. Thinking
 // and provider-raw blocks are dropped on send (Chat Completions has no input for
 // them). Tool results map 1:1 to role:"tool" messages; IsError is rendered as an
@@ -98,7 +131,7 @@ func convertMessages(msgs []core.Message) ([]wireMessage, error) {
 				if !ok {
 					return nil, fmt.Errorf("tool message at index %d has non-tool_result block %T", i, blk)
 				}
-				content := core.Message{Blocks: tr.Content}.Text()
+				content := toolResultText(tr)
 				if tr.IsError {
 					content = "error: " + content
 				}
