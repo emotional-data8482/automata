@@ -339,27 +339,32 @@ func (l *Loop) run(ctx context.Context, task, mode string, cfg runConfig, invoke
 		// Every call in a started batch must receive exactly one transcript
 		// result. The first fatal failure cancels the shared batch context, but we
 		// still wait for every goroutine and fill every result slot before
-		// returning. Each goroutine owns one slot, so appending the slice afterward
-		// preserves model order regardless of completion order.
+		// returning. Goroutines report (index, message) on a buffered channel and
+		// the main goroutine assembles the slots, so transcript order follows model
+		// order regardless of completion order.
+		type toolOutcome struct {
+			idx   int
+			msg   Message
+			fatal error
+		}
+		outcomes := make(chan toolOutcome, len(toolUses))
 		batchCtx, cancelBatch := context.WithCancelCause(ctx)
 		var wg sync.WaitGroup
 		var fatalOnce sync.Once
-		var fatalErr error
 		for i, call := range toolUses {
 			wg.Add(1)
-			go func() {
+			go func(i int, call ToolUseBlock) {
 				defer wg.Done()
 
-				out, isErr, err := l.executeTool(batchCtx, call, approverMessages)
+				result, err := l.executeTool(batchCtx, call, approverMessages)
 				if err == nil {
-					results[i] = ToolResultMessage(call.ID, out, isErr)
+					outcomes <- toolOutcome{idx: i, msg: ToolResultBlockMessage(call.ID, result.Blocks, result.IsError)}
 					return
 				}
 
 				firstFatal := false
 				fatalOnce.Do(func() {
 					firstFatal = true
-					fatalErr = err
 					cancelBatch(err)
 				})
 
@@ -370,14 +375,23 @@ func (l *Loop) run(ctx context.Context, task, mode string, cfg runConfig, invoke
 				if !firstFatal && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
 					content = canceledToolResult(context.Cause(batchCtx))
 				}
-				results[i] = ToolResultMessage(call.ID, content, true)
+				blocks := Blocks{TextBlock{Text: content}}
 				l.emit(StreamEvent{
 					Kind: StreamToolResult, ToolCall: call, Result: content,
-					IsError: true, Err: err,
+					ResultBlocks: blocks, IsError: true, Err: err,
 				})
-			}()
+				outcomes <- toolOutcome{idx: i, msg: ToolResultBlockMessage(call.ID, blocks, true), fatal: err}
+			}(i, call)
 		}
 		wg.Wait()
+		close(outcomes)
+		var fatalErr error
+		for oc := range outcomes {
+			results[oc.idx] = oc.msg
+			if oc.fatal != nil && fatalErr == nil {
+				fatalErr = oc.fatal
+			}
+		}
 		cancelBatch(nil)
 		l.messages = append(l.messages, results...)
 		if fatalErr != nil {
@@ -455,18 +469,23 @@ func (l *Loop) snapshot() []Message {
 	return append([]Message(nil), l.messages...)
 }
 
-// executeTool runs one tool call and returns (result, isError, fatalErr).
-// result is the string fed back to the model; isError marks a recoverable tool
-// failure (unknown tool, denial, or a tool error) that the model can adapt to;
-// fatalErr is non-nil only for run-aborting conditions (approver error, context
-// cancellation) and stops the whole run after the batch records an outcome for
-// every sibling call.
+// executeTool runs one tool call and returns (result, fatalErr). result is the
+// [ToolResult] fed back to the model — the text view of its blocks is what
+// string consumers and text-only providers see; IsError marks a recoverable
+// tool failure (unknown tool, denial, or a tool error) that the model can adapt
+// to. fatalErr is non-nil only for run-aborting conditions (approver error,
+// context cancellation) and stops the whole run after the batch records an
+// outcome for every sibling call.
 //
 // Cancellation is cooperative. A tool may finish a side effect while batch
 // cancellation races its return. If it returns success, that actual result is
 // recorded; if it returns a context error, the transcript records cancellation.
 // Neither outcome implies that an external side effect was rolled back.
-func (l *Loop) executeTool(ctx context.Context, call ToolUseBlock, messages []Message) (string, bool, error) {
+//
+// This is also the pre-append choke point: a future per-result truncation or
+// summarization limiter (see planning/roadmap.md) runs here, after executeTool
+// returns and before the result becomes a transcript message.
+func (l *Loop) executeTool(ctx context.Context, call ToolUseBlock, messages []Message) (ToolResult, error) {
 	a := l.agent
 	tool, ok := l.toolsByName[call.Name]
 	if !ok {
@@ -479,8 +498,9 @@ func (l *Loop) executeTool(ctx context.Context, call ToolUseBlock, messages []Me
 		err := fmt.Errorf("%w: %q (available tools: %s)", ErrToolNotFound, call.Name, strings.Join(names, ", "))
 		l.log.WarnContext(ctx, "tool not found", "tool", call.Name)
 		notFound := err.Error()
-		l.emit(StreamEvent{Kind: StreamToolResult, ToolCall: call, Result: notFound, IsError: true, Err: err})
-		return notFound, true, nil
+		blocks := Blocks{TextBlock{Text: notFound}}
+		l.emit(StreamEvent{Kind: StreamToolResult, ToolCall: call, Result: notFound, ResultBlocks: blocks, IsError: true, Err: err})
+		return ErrorResult(notFound), nil
 	}
 
 	// When this run is streaming, hand the sink to the tool via context so a
@@ -503,7 +523,7 @@ func (l *Loop) executeTool(ctx context.Context, call ToolUseBlock, messages []Me
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(err)
-		return "", false, err
+		return ToolResult{}, err
 	}
 	switch decision.Outcome {
 	case Deny:
@@ -513,8 +533,9 @@ func (l *Loop) executeTool(ctx context.Context, call ToolUseBlock, messages []Me
 		}
 		log.DebugContext(ctx, "tool call denied", "tool", call.Name, "reason", reason)
 		denied := "denied: " + reason
-		l.emit(StreamEvent{Kind: StreamToolResult, ToolCall: call, Result: denied, IsError: true})
-		return denied, true, nil
+		blocks := Blocks{TextBlock{Text: denied}}
+		l.emit(StreamEvent{Kind: StreamToolResult, ToolCall: call, Result: denied, ResultBlocks: blocks, IsError: true})
+		return ErrorResult(denied), nil
 	case Modify:
 		log.DebugContext(ctx, "tool call modified", "tool", call.Name)
 		call.Input = decision.Args
@@ -527,24 +548,48 @@ func (l *Loop) executeTool(ctx context.Context, call ToolUseBlock, messages []Me
 	// layer, and re-running its Execute would replay a whole sub-run — including
 	// re-emitting every stream event and double-counting usage it already
 	// forwarded. Plain tools that want retries can opt in with [WithToolRetry].
-	result, err := tool.Execute(ctx, args)
-	if err != nil {
-		span.RecordError(err)
-		span.SetStatus(err)
-		log.WarnContext(ctx, "tool execution error", "tool", call.Name, "err", err)
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			return "", false, err
+	//
+	// Rich-result tools (see [ResultTool]) are preferred: their block content is
+	// carried through verbatim; string tools are wrapped with [TextResult].
+	var result ToolResult
+	if rt, ok := tool.(ResultTool); ok {
+		res, err := rt.ExecuteResult(ctx, args)
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(err)
+			log.WarnContext(ctx, "tool execution error", "tool", call.Name, "err", err)
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return ToolResult{}, err
+			}
+			toolErr := err.Error()
+			blocks := Blocks{TextBlock{Text: toolErr}}
+			l.emit(StreamEvent{Kind: StreamToolResult, ToolCall: call, Result: toolErr, ResultBlocks: blocks, IsError: true, Err: err})
+			return ErrorResult(toolErr), nil
 		}
-		// Recoverable tool error: the message carries the raw error text and the
-		// IsError flag. The provider decides how to present it (Anthropic sets a
-		// native is_error; OpenAI prefixes "error:"), so core does not prefix.
-		toolErr := err.Error()
-		l.emit(StreamEvent{Kind: StreamToolResult, ToolCall: call, Result: toolErr, IsError: true, Err: err})
-		return toolErr, true, nil
+		result = normalizeResult(res)
+	} else {
+		out, err := tool.Execute(ctx, args)
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(err)
+			log.WarnContext(ctx, "tool execution error", "tool", call.Name, "err", err)
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return ToolResult{}, err
+			}
+			// Recoverable tool error: the message carries the raw error text and the
+			// IsError flag. The provider decides how to present it (Anthropic sets a
+			// native is_error; OpenAI prefixes "error:"), so core does not prefix.
+			toolErr := err.Error()
+			blocks := Blocks{TextBlock{Text: toolErr}}
+			l.emit(StreamEvent{Kind: StreamToolResult, ToolCall: call, Result: toolErr, ResultBlocks: blocks, IsError: true, Err: err})
+			return ErrorResult(toolErr), nil
+		}
+		result = TextResult(out)
 	}
-	log.DebugContext(ctx, "tool result", "tool", call.Name, "result", result)
-	l.emit(StreamEvent{Kind: StreamToolResult, ToolCall: call, Result: result})
-	return result, false, nil
+	text := result.Text()
+	log.DebugContext(ctx, "tool result", "tool", call.Name, "result", text)
+	l.emit(StreamEvent{Kind: StreamToolResult, ToolCall: call, Result: text, ResultBlocks: result.Blocks, IsError: result.IsError})
+	return result, nil
 }
 
 func spanLogger(span tracing.Span, log *slog.Logger) *slog.Logger {
