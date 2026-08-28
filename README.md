@@ -25,7 +25,7 @@ agents run inside a web server, not a notebook.
 ## Layout
 
 | Module / package | What it is |
-|---|---|
+| --- | --- |
 | `core` | Agent, Loop, Session, Tool, Provider, streaming, hooks, approval |
 | `tools` (module) | First-party tools: `HTTPFetch`, `ReadFile`/`WriteFile` (sandboxed), `Shell` (allow-listed), `WebSearch` |
 | `extensions/claude` (module) | Anthropic provider (`core.StreamProvider`); thinking, images, prompt caching |
@@ -43,38 +43,38 @@ so importing `core` never pulls a vendor SDK into your build.
 package main
 
 import (
-	"context"
-	"fmt"
-	"os"
+ "context"
+ "fmt"
+ "os"
 
-	"github.com/emotional-data8482/automata/core"
-	"github.com/emotional-data8482/automata/extensions/claude"
-	"github.com/emotional-data8482/automata/tools"
+ "github.com/emotional-data8482/automata/core"
+ "github.com/emotional-data8482/automata/extensions/claude"
+ "github.com/emotional-data8482/automata/tools"
 )
 
 type weatherArgs struct {
-	City string `json:"city" desc:"city to look up"`
+ City string `json:"city" desc:"city to look up"`
 }
 
 func main() {
-	agent := core.New(claude.New("claude-sonnet-4-6", os.Getenv("ANTHROPIC_API_KEY"))).
-		WithSystemPrompt("You are a concise assistant.")
+ agent := core.New(claude.New("claude-sonnet-4-6", os.Getenv("ANTHROPIC_API_KEY"))).
+  WithSystemPrompt("You are a concise assistant.")
 
-	// A typed tool: the JSON schema is derived from the struct fields.
-	agent.RegisterTool(core.Func("weather", "Get the weather for a city",
-		func(ctx context.Context, a weatherArgs) (string, error) {
-			return "sunny in " + a.City, nil
-		}))
+ // A typed tool: the JSON schema is derived from the struct fields.
+ agent.RegisterTool(core.Func("weather", "Get the weather for a city",
+  func(ctx context.Context, a weatherArgs) (string, error) {
+   return "sunny in " + a.City, nil
+  }))
 
-	// A first-party tool: fetch a page as readable text.
-	agent.RegisterTool(tools.HTTPFetch())
+ // A first-party tool: fetch a page as readable text.
+ agent.RegisterTool(tools.HTTPFetch())
 
-	res, err := agent.Run(context.Background(), "What's the weather in Paris?")
-	if err != nil {
-		panic(err)
-	}
-	fmt.Println(res.Output)
-	fmt.Printf("(%d steps, %d output tokens)\n", res.Steps, res.Usage.OutputTokens)
+ res, err := agent.Run(context.Background(), "What's the weather in Paris?")
+ if err != nil {
+  panic(err)
+ }
+ fmt.Println(res.Output)
+ fmt.Printf("(%d steps, %d output tokens)\n", res.Steps, res.Usage.OutputTokens)
 }
 ```
 
@@ -117,11 +117,11 @@ committed it. Hooks also run for failed and canceled runs, receiving the partial
 
 ```go
 checkpoint := core.WithPostRunHook(func(ctx context.Context, res core.RunResult, runErr error) error {
-	blob, err := json.Marshal(res.Messages)
-	if err != nil {
-		return err
-	}
-	return os.WriteFile("session.json", blob, 0o600)
+ blob, err := json.Marshal(res.Messages)
+ if err != nil {
+  return err
+ }
+ return os.WriteFile("session.json", blob, 0o600)
 })
 
 res, err := sess.Run(ctx, "Plan the next bounded cycle", checkpoint)
@@ -144,8 +144,8 @@ tool on one more turn. The agent's regular tools still work alongside it.
 
 ```go
 type Person struct {
-	Name string `json:"name"`
-	Age  int    `json:"age" desc:"age in years"`
+ Name string `json:"name"`
+ Age  int    `json:"age" desc:"age in years"`
 }
 
 p, res, err := core.RunTyped[Person](ctx, agent, "Who is Ada Lovelace?")
@@ -172,6 +172,49 @@ If typed output needs the forced structured-output fallback, that fallback is a
 second bounded session run. Post-run hooks fire after both completed runs, so
 the prose attempt is checkpointed before the forced run begins.
 
+## Rich tool results
+
+Tools can return block-based content — mixed text and images — instead of only
+a string. `core.FuncResult[P]` is `core.Func` for rich outputs: the same typed
+schema generation, but the handler returns a `core.ToolResult`, which the run
+loop records as block-based `ToolResultBlock` content in the transcript:
+
+```go
+type shotArgs struct {
+    Target string `json:"target" desc:"what to capture"`
+}
+
+agent.RegisterTool(core.FuncResult("screenshot", "Capture an image",
+    func(ctx context.Context, a shotArgs) (core.ToolResult, error) {
+        png, err := capture(ctx, a.Target)
+        if err != nil {
+            return core.ToolResult{}, err // recoverable: the model sees the error
+        }
+        return core.BlockResult(
+            core.TextBlock{Text: "captured " + a.Target},
+            core.ImageBlock{MediaType: "image/png", Data: png},
+        ), nil
+    }))
+```
+
+Result constructors: `TextResult`, `BlockResult`, `ErrorResult`, `ImageResult`
+(inline base64), and `URLImageResult` (by reference). Existing string tools
+(`Tool`, `Func`, `AsTool`, `WithToolRetry`) are unaffected and keep working —
+`FuncResult` returns a `Tool` and registers through the same paths, and a tool
+may implement the optional `core.ResultTool` interface (`ExecuteResult`) to opt
+in while keeping `Execute` for text-only consumers.
+
+Streaming consumers keep reading `StreamEvent.Result` (the text view); richer
+consumers can inspect `StreamEvent.ResultBlocks`, mirrored on
+`ToolCallView.ResultBlocks` in `StreamAccumulator` views.
+
+Provider support differs: Anthropic passes text and image tool-result content
+natively (order preserved); OpenAI Chat Completions is text-only, so non-text
+blocks degrade to a documented placeholder (`[non-text tool result block:
+image/png]`) rather than being dropped. Keep rich results small — image data
+lands in the transcript base64-encoded and, where supported, is sent to the
+provider verbatim.
+
 ## Multi-agent: sub-agents are just tools
 
 An `Agent` becomes a tool on another agent with `core.AsTool` — the type
@@ -179,7 +222,7 @@ parameter defines the JSON schema the orchestrator's model fills in:
 
 ```go
 orch.RegisterTool(core.AsTool[researchParams](researcher, "researcher",
-	"Delegate a focused research assignment."))
+ "Delegate a focused research assignment."))
 ```
 
 `AsTool` forwards the raw JSON arguments as the sub-agent's task. When you'd
@@ -188,11 +231,11 @@ boilerplate in its prompt), use `AsToolFunc` with a renderer:
 
 ```go
 orch.RegisterTool(core.AsToolFunc[researchParams](researcher, "researcher",
-	"Delegate a focused research assignment.",
-	func(p researchParams) string {
-		return fmt.Sprintf("Research: %s\nQuestions:\n- %s",
-			p.Topic, strings.Join(p.Questions, "\n- "))
-	}))
+ "Delegate a focused research assignment.",
+ func(p researchParams) string {
+  return fmt.Sprintf("Research: %s\nQuestions:\n- %s",
+   p.Topic, strings.Join(p.Questions, "\n- "))
+ }))
 ```
 
 ## Watch every agent work
@@ -204,11 +247,11 @@ deltas into per-agent state so rendering is a snapshot, not bookkeeping:
 ```go
 var acc core.StreamAccumulator
 res, err := orch.RunStream(ctx, topic, func(ev core.StreamEvent) {
-	acc.Add(ev)
-	for _, v := range acc.Views() { // top-level first, then sub-agents
-		fmt.Printf("[%s] %d tool calls, %d tokens\n",
-			v.Agent, len(v.ToolCalls), v.Usage.OutputTokens)
-	}
+ acc.Add(ev)
+ for _, v := range acc.Views() { // top-level first, then sub-agents
+  fmt.Printf("[%s] %d tool calls, %d tokens\n",
+   v.Agent, len(v.ToolCalls), v.Usage.OutputTokens)
+ }
 })
 _ = res // RunStream returns the same RunResult as Run
 ```
@@ -243,6 +286,14 @@ researcher.RegisterTool(tools.WebSearch(tavily.New(os.Getenv("TAVILY_API_KEY")))
   ```sh
   go run ./examples/deep_research "the impact of GLP-1 drugs on US healthcare costs"
   ```
+
+## Agent skill
+
+This repository includes an [Agent Skills](https://agentskills.io) guide for
+building Automata applications at
+[`.agents/skills/automata-go/`](.agents/skills/automata-go/SKILL.md). Agents that
+discover project skills can load it directly. To use it globally in other
+projects, copy that directory to `~/.agents/skills/automata-go/`.
 
 ## Roadmap
 
