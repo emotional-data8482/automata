@@ -178,3 +178,88 @@ func TestConvertMessagesCoalescesToolResults(t *testing.T) {
 		t.Fatalf("got %d messages, want 3 (tool results coalesced)", len(msgs))
 	}
 }
+
+// TestConvertMessagesToolResultRichText pins that a text-only rich tool result
+// (multiple text blocks) converts to the simple tool_result form with the text
+// concatenated in order and is_error mapped onto the native flag.
+func TestConvertMessagesToolResultRichText(t *testing.T) {
+	_, msgs, err := convertMessages([]core.Message{
+		core.ToolResultBlockMessage("t1", core.Blocks{
+			core.TextBlock{Text: "part one. "},
+			core.TextBlock{Text: "part two"},
+		}, false),
+	})
+	if err != nil {
+		t.Fatalf("convertMessages: %v", err)
+	}
+	blob, _ := json.Marshal(msgs)
+	s := string(blob)
+	if !strings.Contains(s, `"tool_use_id":"t1"`) || !strings.Contains(s, "part one. part two") {
+		t.Errorf("rich text tool result not converted in order\n got: %s", s)
+	}
+}
+
+// TestConvertMessagesToolResultImageOnly pins that an image-only rich tool
+// result builds the richer tool_result param with an image content block.
+func TestConvertMessagesToolResultImageOnly(t *testing.T) {
+	_, msgs, err := convertMessages([]core.Message{
+		core.ToolResultBlockMessage("t1", core.Blocks{
+			core.ImageBlock{MediaType: "image/png", Data: []byte{0x89, 0x50}},
+		}, false),
+	})
+	if err != nil {
+		t.Fatalf("convertMessages: %v", err)
+	}
+	blob, _ := json.Marshal(msgs)
+	s := string(blob)
+	if !strings.Contains(s, `"type":"image"`) || !strings.Contains(s, "base64") || !strings.Contains(s, "image/png") {
+		t.Errorf("image-only tool result not converted\n got: %s", s)
+	}
+}
+
+// TestConvertMessagesToolResultMixed pins that mixed text/image rich results
+// preserve block order inside the tool_result content array.
+func TestConvertMessagesToolResultMixed(t *testing.T) {
+	_, msgs, err := convertMessages([]core.Message{
+		core.ToolResultBlockMessage("t1", core.Blocks{
+			core.TextBlock{Text: "screenshot:"},
+			core.ImageBlock{MediaType: "image/png", Data: []byte{0x89, 0x50}},
+		}, false),
+	})
+	if err != nil {
+		t.Fatalf("convertMessages: %v", err)
+	}
+	blob, _ := json.Marshal(msgs)
+	s := string(blob)
+	// Content array order: the text block must come before the image block.
+	textIdx := strings.Index(s, "screenshot:")
+	imgIdx := strings.Index(s, `"type":"image"`)
+	if textIdx == -1 || imgIdx == -1 {
+		t.Fatalf("missing content blocks\n got: %s", s)
+	}
+	if textIdx > imgIdx {
+		t.Errorf("content order not preserved (text after image)\n got: %s", s)
+	}
+}
+
+// TestConvertMessagesToolResultMixedError pins that IsError is mapped onto the
+// native is_error flag for a mixed-content tool result.
+func TestConvertMessagesToolResultMixedError(t *testing.T) {
+	_, msgs, err := convertMessages([]core.Message{
+		core.ToolResultBlockMessage("t1", core.Blocks{
+			core.TextBlock{Text: "failed:"},
+			core.ImageBlock{MediaType: "image/png", Data: []byte{0x89, 0x50}},
+		}, true),
+	})
+	if err != nil {
+		t.Fatalf("convertMessages: %v", err)
+	}
+	blob, _ := json.Marshal(msgs)
+	s := string(blob)
+	if !strings.Contains(s, `"is_error":true`) {
+		t.Errorf("mixed error tool result missing is_error:true\n got: %s", s)
+	}
+	if !strings.Contains(s, "failed:") || !strings.Contains(s, `"type":"image"`) {
+		t.Errorf("mixed error tool result lost content\n got: %s", s)
+	}
+}
