@@ -4,12 +4,16 @@ import "sync"
 
 // ToolCallView is the accumulator's record of one tool call: the call as the
 // model requested it, and — once the StreamToolResult arrives — its outcome.
+// Result is the text-only view fed back to the model (compatibility field);
+// ResultBlocks carries the rich result blocks behind it (see [ResultTool]) and
+// is empty only if the consumer attached before any result event.
 type ToolCallView struct {
-	Call    ToolUseBlock
-	Result  string // the string fed back to the model
-	IsError bool   // true if the tool failed
-	Err     error  // non-nil if the tool returned an error
-	Done    bool   // true once the result has arrived
+	Call         ToolUseBlock
+	Result       string // the string fed back to the model
+	ResultBlocks Blocks // the rich result blocks behind Result
+	IsError      bool   // true if the tool failed
+	Err          error  // non-nil if the tool returned an error
+	Done         bool   // true once the result has arrived
 }
 
 // AgentView is a per-invocation snapshot of an in-progress (or finished)
@@ -104,6 +108,7 @@ func (a *StreamAccumulator) Add(ev StreamEvent) {
 			tc := &st.toolCalls[i]
 			if !tc.Done && tc.Call.ID == ev.ToolCall.ID {
 				tc.Result = ev.Result
+				tc.ResultBlocks = ev.ResultBlocks
 				tc.IsError = ev.IsError
 				tc.Err = ev.Err
 				tc.Done = true
@@ -113,7 +118,7 @@ func (a *StreamAccumulator) Add(ev StreamEvent) {
 		// No announced call (e.g. the consumer attached mid-run): record the
 		// result as an already-done call rather than dropping it.
 		st.toolCalls = append(st.toolCalls, ToolCallView{
-			Call: ev.ToolCall, Result: ev.Result, IsError: ev.IsError, Err: ev.Err, Done: true,
+			Call: ev.ToolCall, Result: ev.Result, ResultBlocks: ev.ResultBlocks, IsError: ev.IsError, Err: ev.Err, Done: true,
 		})
 	case StreamUsage:
 		st.usage.Add(ev.Usage)
