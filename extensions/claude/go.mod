@@ -4,7 +4,7 @@ go 1.26.2
 
 require (
 	github.com/anthropics/anthropic-sdk-go v1.21.0
-	github.com/emotional-data8482/automata v0.3.0
+	github.com/emotional-data8482/automata v0.3.1
 )
 
 require (
