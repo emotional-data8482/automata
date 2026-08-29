@@ -37,6 +37,28 @@ agents run inside a web server, not a notebook.
 Extensions and examples are separate Go modules tied together by `go.work`,
 so importing `core` never pulls a vendor SDK into your build.
 
+### Releases
+
+The root module, `tools`, and every extension are tagged independently
+(Go multi-module tagging: `v0.4.0`, `tools/v0.4.0`, `extensions/openai/v0.4.0`,
+…). One command does the whole dance:
+
+```sh
+scripts/release.sh minor --push # or: v0.4.0 / patch / major
+```
+
+It bumps every submodule's `automata` require line, builds and tests the full
+workspace, commits, tags root + all published modules, and pushes. Because
+`go mod tidy` in a submodule can only resolve the new core version after its
+tag is on the remote, the script then refreshes the submodules' `go.sum` files
+in a small follow-up commit and verifies each module still builds against the
+published pins (`GOWORK=off`). Run it without `--push` to stop after tagging
+for review. Note the deliberate module conventions: published modules
+(`tools`, `extensions/*`) carry no `replace` directives — in-repo development
+resolves through `go.work`, and `replace` in a dependency is ignored
+downstream, so they must require real tagged versions — while `examples/*`
+keep `replace` directives as dev conveniences and are never tagged.
+
 ## Quickstart
 
 ```go
@@ -86,6 +108,40 @@ transcript and usage. Per-call provider options (temperature, max tokens, stop
 sequences, tool choice, thinking budget) are set with
 `agent.WithDefaultCallOptions(...)` or per run with
 `agent.Run(ctx, task, core.WithCallOptions(...))`.
+
+## Bounded tool execution
+
+Use `ToolPolicy` to enforce deadlines, call budgets, rate limits, and bounded
+parallelism outside model prompts:
+
+```go
+agent.WithToolPolicy(core.ToolPolicy{
+ Timeout:     10 * time.Second,
+ MaxCalls:    50,
+ MaxParallel: 4,
+ PerTool: map[string]core.ToolLimits{
+  "http_fetch": {Timeout: 3 * time.Second, MaxCalls: 10, RateLimiter: limiter},
+ },
+})
+
+// A per-run policy replaces the agent default.
+res, err := agent.Run(ctx, task,
+ core.WithToolPolicy(core.ToolPolicy{MaxCalls: 10, MaxParallel: 2}))
+```
+
+Policy-created tool timeouts are recoverable error results; cancellation of the
+parent run remains fatal. Call budgets reserve known requests in model order
+before approval, overflow calls receive explicit transcript results, and total
+budgets are shared atomically through nested `AsTool` runs. Tools and limiters
+must honor context cancellation—Go cannot forcibly stop a function that ignores
+its context. The zero policy preserves existing behavior.
+
+Call reservations happen before `Approver`; approved calls then apply timeout,
+rate-limit wait, and execution (including any internal `WithToolRetry` attempts).
+A child may add stricter local limits, while timeouts/rate limiters/parallelism
+otherwise remain agent-local. See the
+[tool-execution project notes](planning/projects/tool-execution-safety/README.md)
+for the complete accounting and composition decisions.
 
 ## Sessions and transcripts
 
@@ -139,8 +195,9 @@ should protect external side effects.
 
 `core.RunTyped[T]` returns the agent's final answer decoded into a Go struct.
 It injects a hidden tool whose JSON schema is derived from `T` and ends the run
-when the model calls it; if the model answers in prose instead, it forces the
-tool on one more turn. The agent's regular tools still work alongside it.
+when the model calls it; if the model answers in prose instead, it first tries
+to parse an embedded payload, and only forces the tool on one more turn as a
+last resort. The agent's regular tools still work alongside it.
 
 ```go
 type Person struct {
@@ -168,9 +225,52 @@ next, res, err := core.RunSessionTyped[Person](ctx, sess, "Choose the next actio
 _, _, _, _ = first, next, res, err
 ```
 
-If typed output needs the forced structured-output fallback, that fallback is a
-second bounded session run. Post-run hooks fire after both completed runs, so
-the prose attempt is checkpointed before the forced run begins.
+### Validation guarantee
+
+The returned value is validated against the same schema the model was shown
+before it is returned: required fields (exported fields without `omitempty`)
+are present, types match (`int` fields get integral numbers, and so on), and
+nested structs, slices, and string-keyed maps are checked recursively. Unknown
+JSON fields are ignored, matching `json.Unmarshal`. A payload that fails
+validation is never returned as a zero-filled `T` — this is a deliberate
+behavior change: models that previously "succeeded" while omitting fields now
+produce a typed error after correction.
+
+When validation fails, the violations are fed back to the model as a new user
+turn on the same session and it is asked to call the tool again. The default
+budget is one correction turn; `core.WithMaxCorrectionTurns(n)` changes it (0
+disables correction). When attempts are exhausted — or the final forced turn
+still produces an invalid payload — the run returns an error matching
+`core.ErrInvalidStructuredOutput` via `errors.Is`, with the per-field
+violations available via `errors.As(*core.InvalidStructuredOutputError)`. The
+`RunResult` is still populated as far as the run got.
+
+The full sequence per typed call is bounded: 1 (initial) + correction budget +
+1 (forced fallback) provider turns at worst. Prose answers that already
+contain valid JSON (a fenced ```json block or a bare object) are parsed and
+validated with no extra provider turn. Post-run hooks fire after each
+underlying run (initial, every correction, the forced fallback), so
+checkpoint-based persistence sees each committed transcript.
+
+### Provider-native structured output
+
+By default the hidden tool is the provider-neutral mechanism. Pass
+`core.WithNativeStructuredOutput()` to opt into provider-native schema
+enforcement when the provider supports it — the OpenAI Chat Completions
+extension maps the schema onto `response_format: json_schema` (strict variant
+when the schema has no free-form objects), and the Claude extension maps it
+onto `output_config.format`. Providers without native support silently use the
+hidden-tool path, so the option is safe to set unconditionally. Native
+responses are parsed from the reply text and validated by the same validator;
+an unusable native payload falls back to the hidden-tool path once.
+
+### Tool name
+
+The hidden tool is named `automata_structured_output` (namespaced so a user
+tool called `structured_output` cannot collide with it). Registering a tool
+with that exact name makes typed runs fail fast with an explicit error. The
+name appears in persisted transcripts (as plain history — resumed sessions are
+unaffected by the 0.3-era rename from `structured_output`).
 
 ## Rich tool results
 
