@@ -37,6 +37,11 @@ type Decision struct {
 // arbitrarily (e.g. waiting for a human to respond); ctx cancellation is the
 // caller's mechanism for aborting a long-running approval.
 //
+// A configured [ToolPolicy] reserves known calls in model order before this
+// gate. Calls rejected for budget exhaustion never reach Approve; allowed,
+// modified, denied, and errored approval attempts all retain their reservation.
+// Timeout and rate-limit controls begin only after approval succeeds.
+//
 // Returning an error aborts the run entirely, the same way a context error
 // from a tool does. Prefer returning Deny with a Reason for recoverable cases.
 type Approver interface {
