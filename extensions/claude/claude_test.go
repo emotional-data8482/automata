@@ -2,11 +2,13 @@ package claude
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/anthropics/anthropic-sdk-go"
@@ -160,5 +162,76 @@ func TestWrapAPIError_SatisfiesRetryable(t *testing.T) {
 	}
 	if !r.Retryable() {
 		t.Error("expected Retryable() == true for 429")
+	}
+}
+
+// TestNativeStructuredOutputRequestShape pins the output_config mapping: a
+// CallOptions.OutputSchema travels as output_config.format with the
+// json_schema type, and is absent without the option.
+func TestNativeStructuredOutputRequestShape(t *testing.T) {
+	var gotBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &gotBody)
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{
+			"id":"msg_1","type":"message","role":"assistant","model":"claude-test",
+			"content":[{"type":"text","text":"{\"name\":\"Ada\",\"age\":36}"}],
+			"stop_reason":"end_turn","stop_sequence":null,
+			"usage":{"input_tokens":4,"output_tokens":2}
+		}`)
+	}))
+	defer srv.Close()
+
+	p := &Provider{
+		model:     "claude-test",
+		maxTokens: 128,
+		client: anthropic.NewClient(
+			option.WithAPIKey("test-key"),
+			option.WithBaseURL(srv.URL),
+		),
+	}
+	schema := `{"type":"object","properties":{"name":{"type":"string"},"age":{"type":"integer"}},"required":["name","age"]}`
+	req := core.Request{
+		Messages: []core.Message{core.UserMessage("go")},
+		Options:  core.CallOptions{OutputSchema: json.RawMessage(schema)},
+	}
+	if _, err := p.Invoke(context.Background(), req); err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	oc, ok := gotBody["output_config"].(map[string]any)
+	if !ok {
+		t.Fatalf("output_config missing: %v", gotBody)
+	}
+	format, ok := oc["format"].(map[string]any)
+	if !ok {
+		t.Fatalf("output_config.format missing: %v", oc)
+	}
+	if format["type"] != "json_schema" {
+		t.Errorf("format.type = %v, want json_schema", format["type"])
+	}
+	sent, _ := json.Marshal(format["schema"])
+	if !strings.Contains(string(sent), "\"age\"") || !strings.Contains(string(sent), "\"name\"") {
+		t.Errorf("format.schema = %s, missing fields", sent)
+	}
+
+	// Without OutputSchema, no output_config is sent.
+	gotBody = nil
+	req.Options = core.CallOptions{}
+	if _, err := p.Invoke(context.Background(), req); err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	if _, ok := gotBody["output_config"]; ok {
+		t.Errorf("output_config sent without OutputSchema: %v", gotBody)
+	}
+}
+
+// TestProviderImplementsStructuredOutputCapability pins the capability surface
+// core's typed run probes.
+func TestProviderImplementsStructuredOutputCapability(t *testing.T) {
+	var p core.Provider = &Provider{model: "claude-test"}
+	so, ok := p.(core.StructuredOutputProvider)
+	if !ok || !so.SupportsNativeStructuredOutput() {
+		t.Fatalf("claude.Provider should implement core.StructuredOutputProvider with support")
 	}
 }

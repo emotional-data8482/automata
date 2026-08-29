@@ -2,6 +2,7 @@ package claude
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 
@@ -54,6 +55,15 @@ func wrapAPIError(err error) error {
 }
 
 var _ core.StreamProvider = (*Provider)(nil)
+var _ core.StructuredOutputProvider = (*Provider)(nil)
+
+// SupportsNativeStructuredOutput reports that the Messages API can enforce a
+// JSON schema via output_config.format (structured outputs; see
+// [core.CallOptions.OutputSchema]). Capability is per provider, not per model:
+// models without structured-outputs support surface that as an invocation
+// error, and typed runs on such models should stay on the default hidden-tool
+// path.
+func (p *Provider) SupportsNativeStructuredOutput() bool { return true }
 
 // DefaultMaxTokens is used when the Provider is constructed without calling
 // WithMaxTokens. The Anthropic API requires max_tokens on every request; 16k
@@ -188,7 +198,11 @@ func setBlockCacheControl(b *anthropic.ContentBlockParamUnion) bool {
 }
 
 // applyCallOptions maps the provider-agnostic [core.CallOptions] onto Anthropic
-// request params. Options the API cannot honor are ignored.
+// request params. Options the API cannot honor are ignored. OutputSchema maps
+// onto output_config.format (native structured outputs); the schema travels
+// as-is — Anthropic does not have an OpenAI-style strict-mode flag, and the
+// omitempty-optional fields the advertised schema legitimately contains are
+// accepted. The response payload is still validated in core.
 func applyCallOptions(params *anthropic.MessageNewParams, o core.CallOptions) {
 	if o.Temperature != nil {
 		params.Temperature = anthropic.Float(*o.Temperature)
@@ -208,6 +222,14 @@ func applyCallOptions(params *anthropic.MessageNewParams, o core.CallOptions) {
 		case core.ToolChoiceTool:
 			params.ToolChoice = anthropic.ToolChoiceUnionParam{
 				OfTool: &anthropic.ToolChoiceToolParam{Name: o.ToolChoice.Name},
+			}
+		}
+	}
+	if len(o.OutputSchema) > 0 {
+		var schema map[string]any
+		if err := json.Unmarshal(o.OutputSchema, &schema); err == nil {
+			params.OutputConfig = anthropic.OutputConfigParam{
+				Format: anthropic.JSONOutputFormatParam{Schema: schema},
 			}
 		}
 	}
