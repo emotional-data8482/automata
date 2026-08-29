@@ -249,8 +249,10 @@ type Tool interface {
 //
 // The same error semantics as Tool.Execute apply: a non-context error is a
 // recoverable tool failure (converted to an error tool result the model can
-// adapt to), while [context.Canceled] and [context.DeadlineExceeded] abort the
-// run.
+// adapt to), while [context.Canceled] and [context.DeadlineExceeded] from the
+// parent run abort it. A deadline created by [ToolPolicy.Timeout] is
+// distinguished from parent cancellation and becomes a recoverable
+// [ErrToolTimeout] result.
 type ResultTool interface {
 	Tool
 	ExecuteResult(ctx context.Context, args string) (ToolResult, error)
@@ -372,7 +374,7 @@ const (
 	StreamToolCall
 	// StreamToolResult reports a finished tool call. ToolCall identifies the
 	// call; Result holds the string fed back to the model, IsError marks a tool
-	// failure, and Err is non-nil if the tool returned an error.
+	// or policy failure, and Err carries an execution/policy error when present.
 	StreamToolResult
 	// StreamUsage reports the token usage for a completed provider turn. Usage
 	// holds the assembled per-turn counts; it fires once per turn, after that
@@ -409,5 +411,5 @@ type StreamEvent struct {
 	ResultBlocks Blocks // StreamToolResult: the rich result blocks behind Result
 	IsError      bool   // StreamToolResult: true if the tool failed
 	Usage        *Usage // StreamUsage: the completed turn's token usage
-	Err          error  // StreamToolResult: non-nil if the tool returned an error
+	Err          error  // StreamToolResult: execution/policy error, when present
 }
