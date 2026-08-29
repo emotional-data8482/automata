@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"encoding/json"
 )
 
 // Request is a single provider invocation: the conversation so far, the tools
@@ -31,6 +32,11 @@ type CallOptions struct {
 	// ThinkingBudget, when > 0, enables extended thinking with this token
 	// budget on providers that support it.
 	ThinkingBudget int
+	// OutputSchema, when non-nil, asks providers with native structured-output
+	// support to enforce this JSON schema on the response (see
+	// [StructuredOutputProvider] and [WithNativeStructuredOutput]). Providers
+	// without support ignore it, like any other option they cannot honor.
+	OutputSchema json.RawMessage
 }
 
 // merge returns a copy of o with any field set on override taking precedence.
@@ -51,6 +57,9 @@ func (o CallOptions) merge(override CallOptions) CallOptions {
 	}
 	if override.ThinkingBudget != 0 {
 		out.ThinkingBudget = override.ThinkingBudget
+	}
+	if override.OutputSchema != nil {
+		out.OutputSchema = override.OutputSchema
 	}
 	return out
 }
@@ -105,4 +114,24 @@ type Provider interface {
 type StreamProvider interface {
 	Provider
 	InvokeStream(ctx context.Context, req Request) (<-chan StreamChunk, error)
+}
+
+// StructuredOutputProvider is an optional interface a Provider implements to
+// advertise native, schema-enforced structured output. When a typed run opts
+// in with [WithNativeStructuredOutput] and the run's provider implements this
+// interface, [RunTyped]/[RunSessionTyped] send the schema derived from T via
+// [CallOptions.OutputSchema] instead of injecting the hidden structured-output
+// tool, and the provider's response text is parsed and validated like any
+// other structured payload. The hidden-tool path remains the default and the
+// fallback; providers only implementing [Provider] are unaffected.
+//
+// Support is advertised per provider, not per model: if a specific model
+// rejects schema enforcement, the provider surfaces that as an invocation
+// error.
+type StructuredOutputProvider interface {
+	Provider
+
+	// SupportsNativeStructuredOutput reports whether the provider honors
+	// [CallOptions.OutputSchema] by enforcing the schema on its responses.
+	SupportsNativeStructuredOutput() bool
 }
