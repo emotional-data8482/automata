@@ -31,6 +31,7 @@ type Agent struct {
 	log                *slog.Logger
 	approver           Approver
 	defaultCallOptions CallOptions
+	toolPolicy         ToolPolicy
 
 	preSendHooks []PreSendHook
 }
@@ -83,6 +84,15 @@ func (a *Agent) WithRetry(cfg retry.Config) *Agent {
 // default is [AllowAll], which permits every call unconditionally.
 func (a *Agent) WithApprover(ap Approver) *Agent {
 	a.approver = ap
+	return a
+}
+
+// WithToolPolicy sets the default deterministic limits for local tool work.
+// The zero policy preserves the historical unbounded behavior. The policy is
+// copied; configure the agent before starting any runs. Use the package-level
+// [WithToolPolicy] RunOption to replace it for one run.
+func (a *Agent) WithToolPolicy(policy ToolPolicy) *Agent {
+	a.toolPolicy = policy.clone()
 	return a
 }
 
@@ -159,9 +169,9 @@ func (a *Agent) runSync(ctx context.Context, l *Loop, task string, cfg runConfig
 }
 
 // newRunConfig resolves the effective run configuration: the agent's default
-// CallOptions with each RunOption applied in order.
+// CallOptions and ToolPolicy with each RunOption applied in order.
 func (a *Agent) newRunConfig(opts []RunOption) runConfig {
-	cfg := runConfig{options: a.defaultCallOptions}
+	cfg := runConfig{options: a.defaultCallOptions, toolPolicy: a.toolPolicy.clone()}
 	for _, opt := range opts {
 		opt(&cfg)
 	}
@@ -238,7 +248,11 @@ func (t *agentTool) Execute(ctx context.Context, args string) (string, error) {
 // JSON, use [AsToolFunc].
 //
 // Each invocation runs the wrapped agent independently — sub-agent runs do not
-// share conversation state with each other or with the orchestrator.
+// share conversation state with each other or with the orchestrator. A parent
+// run's MaxCalls budget is propagated through ctx and shared atomically with
+// nested tool calls; the child may also enforce a stricter local ToolPolicy.
+// Timeouts, rate limiters, and parallelism remain local to each configured
+// agent, except that a timeout on this AsTool call bounds the complete child run.
 func AsTool[P any](a *Agent, name, description string) Tool {
 	var zero P
 	return &agentTool{
