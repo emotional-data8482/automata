@@ -22,12 +22,14 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 
 	"github.com/emotional-data8482/automata/core"
 )
 
 var _ core.StreamProvider = (*Provider)(nil)
+var _ core.StructuredOutputProvider = (*Provider)(nil)
 
 type Provider struct {
 	model       string
@@ -62,6 +64,13 @@ func (p *Provider) WithStreamUsage() *Provider {
 	return p
 }
 
+// SupportsNativeStructuredOutput reports that Chat Completions can enforce a
+// JSON schema via response_format when [core.CallOptions.OutputSchema] is set.
+// Capability is per provider, not per model: OpenAI-compatible backends that
+// reject response_format surface that as an invocation error, and typed runs
+// on such backends should stay on the default hidden-tool path.
+func (p *Provider) SupportsNativeStructuredOutput() bool { return true }
+
 // APIError wraps a non-2xx HTTP response and implements retry.Retryable so
 // automata's retry layer recovers from 429s and 5xx.
 type APIError struct {
@@ -75,15 +84,29 @@ func (e *APIError) Error() string {
 func (e *APIError) Retryable() bool { return e.StatusCode == 429 || e.StatusCode >= 500 }
 
 type chatRequest struct {
-	Model         string         `json:"model"`
-	Messages      []wireMessage  `json:"messages"`
-	Tools         []wireTool     `json:"tools,omitempty"`
-	Temperature   *float64       `json:"temperature,omitempty"`
-	MaxTokens     int            `json:"max_tokens,omitempty"`
-	Stop          []string       `json:"stop,omitempty"`
-	ToolChoice    any            `json:"tool_choice,omitempty"`
-	Stream        bool           `json:"stream,omitempty"`
-	StreamOptions *streamOptions `json:"stream_options,omitempty"`
+	Model          string          `json:"model"`
+	Messages       []wireMessage   `json:"messages"`
+	Tools          []wireTool      `json:"tools,omitempty"`
+	Temperature    *float64        `json:"temperature,omitempty"`
+	MaxTokens      int             `json:"max_tokens,omitempty"`
+	Stop           []string        `json:"stop,omitempty"`
+	ToolChoice     any             `json:"tool_choice,omitempty"`
+	ResponseFormat *responseFormat `json:"response_format,omitempty"`
+	Stream         bool            `json:"stream,omitempty"`
+	StreamOptions  *streamOptions  `json:"stream_options,omitempty"`
+}
+
+// responseFormat mirrors response_format for JSON-schema mode (see
+// jsonSchemaResponseFormat).
+type responseFormat struct {
+	Type       string           `json:"type"`
+	JSONSchema *jsonSchemaField `json:"json_schema,omitempty"`
+}
+
+type jsonSchemaField struct {
+	Name   string `json:"name"`
+	Strict bool   `json:"strict"`
+	Schema any    `json:"schema"`
 }
 
 type streamOptions struct {
@@ -130,7 +153,8 @@ func (p *Provider) buildRequest(req core.Request, stream bool) (chatRequest, err
 }
 
 // applyCallOptions maps core.CallOptions onto the request. ThinkingBudget is
-// ignored (Chat Completions has no equivalent).
+// ignored (Chat Completions has no equivalent). OutputSchema becomes a
+// response_format json_schema object (see jsonSchemaResponseFormat).
 func applyCallOptions(body *chatRequest, o core.CallOptions) {
 	body.Temperature = o.Temperature
 	body.MaxTokens = o.MaxTokens
@@ -149,6 +173,104 @@ func applyCallOptions(body *chatRequest, o core.CallOptions) {
 				"function": map[string]string{"name": o.ToolChoice.Name},
 			}
 		}
+	}
+	if len(o.OutputSchema) > 0 {
+		body.ResponseFormat = jsonSchemaResponseFormat(o.OutputSchema)
+	}
+}
+
+// jsonSchemaResponseFormat converts the advertised schema (the same object the
+// hidden tool's parameters use) into an OpenAI response_format json_schema
+// object.
+//
+// OpenAI strict mode requires additionalProperties:false on every object and
+// every property listed in required, and rejects free-form subtrees. The
+// schema is therefore scanned: when every object constrains its shape (no
+// map-typed or untyped interface{}/json.RawMessage fields), a strict variant —
+// all properties required, additionalProperties:false — is sent; otherwise
+// strict is disabled and the schema travels as a best-effort hint. Either way
+// the run still validates the response payload in core.
+func jsonSchemaResponseFormat(raw json.RawMessage) *responseFormat {
+	var root map[string]any
+	if err := json.Unmarshal(raw, &root); err != nil {
+		return nil
+	}
+	strict := true
+	root = strictifySchema(root, &strict)
+	return &responseFormat{
+		Type:       "json_schema",
+		JSONSchema: &jsonSchemaField{Name: "response", Strict: strict, Schema: root},
+	}
+}
+
+// strictifySchema deep-copies schema into OpenAI strict-mode shape and reports
+// (through *strict) whether the result is strictly representable.
+func strictifySchema(s map[string]any, strict *bool) map[string]any {
+	out := make(map[string]any, len(s)+1)
+	isObject := false
+	if t, ok := s["type"].(string); ok && t == "object" {
+		isObject = true
+	}
+	for k, v := range s {
+		if k == "properties" {
+			// "properties" is a map of schemas, not a schema itself: strictify
+			// each property individually and require all of them.
+			props, ok := v.(map[string]any)
+			if !ok {
+				out[k] = v
+				continue
+			}
+			strictProps := make(map[string]any, len(props))
+			names := make([]string, 0, len(props))
+			for name, prop := range props {
+				strictProps[name] = strictifyValue(prop, strict)
+				names = append(names, name)
+			}
+			out[k] = strictProps
+			if isObject {
+				sort.Strings(names)
+				out["required"] = names
+			}
+			continue
+		}
+		if k == "required" && isObject {
+			// Replaced by the all-properties list generated above; the input's
+			// optional-field omissions are meaningless in strict mode.
+			continue
+		}
+		out[k] = strictifyValue(v, strict)
+	}
+	if !isObject {
+		if _, ok := out["type"]; !ok {
+			*strict = false // untyped subtree (interface{} / json.RawMessage field)
+		}
+		return out
+	}
+	switch ap := s["additionalProperties"].(type) {
+	case nil:
+		out["additionalProperties"] = false
+	case bool:
+		if ap {
+			*strict = false // open object (cannot be closed without data loss)
+		}
+	default:
+		*strict = false // free-form object (map-typed field)
+	}
+	return out
+}
+
+func strictifyValue(v any, strict *bool) any {
+	switch t := v.(type) {
+	case map[string]any:
+		return strictifySchema(t, strict)
+	case []any:
+		out := make([]any, len(t))
+		for i, e := range t {
+			out[i] = strictifyValue(e, strict)
+		}
+		return out
+	default:
+		return v
 	}
 }
 

@@ -351,3 +351,110 @@ func TestStreamEndToEndThroughLoop(t *testing.T) {
 		t.Errorf("output = %q, want done", res.Output)
 	}
 }
+
+// TestNativeStructuredOutputRequestShape pins the response_format mapping:
+// OutputSchema becomes a json_schema response_format with a strict variant of
+// the schema (all properties required, additionalProperties:false), and
+// free-form subtrees (map-typed fields) disable strict mode instead of
+// producing a schema the API would reject.
+func TestNativeStructuredOutputRequestShape(t *testing.T) {
+	tests := []struct {
+		name        string
+		schema      string
+		wantStrict  bool
+		wantContain []string
+	}{
+		{
+			name:       "constrained schema goes strict",
+			schema:     `{"type":"object","properties":{"name":{"type":"string"},"age":{"type":"integer"}},"required":["name"]}`,
+			wantStrict: true,
+			wantContain: []string{
+				`"strict":true`,
+				`"additionalProperties":false`,
+				`"required":["age","name"]`,
+			},
+		},
+		{
+			name:       "map-typed field disables strict",
+			schema:     `{"type":"object","properties":{"meta":{"type":"object","additionalProperties":{"type":"string"}}},"required":["meta"]}`,
+			wantStrict: false,
+			wantContain: []string{
+				`"strict":false`,
+				`"type":"json_schema"`,
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var gotBody map[string]any
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				raw, _ := io.ReadAll(r.Body)
+				_ = json.Unmarshal(raw, &gotBody)
+				w.Header().Set("Content-Type", "application/json")
+				io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"{}"},"finish_reason":"stop"}]}`)
+			}))
+			defer srv.Close()
+
+			p := New("gpt-test", srv.URL)
+			_, err := p.Invoke(context.Background(), core.Request{
+				Messages: []core.Message{core.UserMessage("go")},
+				Options:  core.CallOptions{OutputSchema: json.RawMessage(tt.schema)},
+			})
+			if err != nil {
+				t.Fatalf("Invoke: %v", err)
+			}
+			rf, ok := gotBody["response_format"].(map[string]any)
+			if !ok {
+				t.Fatalf("response_format missing: %v", gotBody)
+			}
+			if rf["type"] != "json_schema" {
+				t.Errorf("response_format.type = %v, want json_schema", rf["type"])
+			}
+			js, ok := rf["json_schema"].(map[string]any)
+			if !ok {
+				t.Fatalf("json_schema missing: %v", rf)
+			}
+			if got := js["strict"]; got != tt.wantStrict {
+				t.Errorf("strict = %v, want %v", got, tt.wantStrict)
+			}
+			raw, _ := json.Marshal(rf)
+			for _, sub := range tt.wantContain {
+				if !strings.Contains(string(raw), sub) {
+					t.Errorf("json_schema = %s, missing %s", raw, sub)
+				}
+			}
+		})
+	}
+}
+
+// TestNoOutputSchemaMeansNoResponseFormat pins the default path is untouched.
+func TestNoOutputSchemaMeansNoResponseFormat(t *testing.T) {
+	var gotBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &gotBody)
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]}`)
+	}))
+	defer srv.Close()
+
+	p := New("gpt-test", srv.URL)
+	if _, err := p.Invoke(context.Background(), core.Request{
+		Messages: []core.Message{core.UserMessage("go")},
+	}); err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	if _, ok := gotBody["response_format"]; ok {
+		t.Errorf("response_format sent without OutputSchema: %v", gotBody)
+	}
+}
+
+// TestProviderImplementsStructuredOutputCapability pins the capability surface
+// core's typed run probes.
+func TestProviderImplementsStructuredOutputCapability(t *testing.T) {
+	var p core.Provider = New("m", "http://localhost")
+	so, ok := p.(core.StructuredOutputProvider)
+	if !ok || !so.SupportsNativeStructuredOutput() {
+		t.Fatalf("openai.Provider should implement core.StructuredOutputProvider with support")
+	}
+}
