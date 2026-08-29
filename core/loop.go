@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
-	"sync"
+	"time"
 
 	"github.com/emotional-data8482/automata/tracing"
 )
@@ -121,6 +121,9 @@ type RunResult struct {
 type runConfig struct {
 	// options is the merged CallOptions sent on every provider turn.
 	options CallOptions
+	// toolPolicy contains the run-scoped local execution controls. A RunOption
+	// replaces the Agent default before execution state is allocated.
+	toolPolicy ToolPolicy
 	// extraTools are tools added for this run only (not on the Agent). Used by
 	// typed runs to inject their structured-output tool.
 	extraTools []Tool
@@ -133,9 +136,17 @@ type runConfig struct {
 	postRunHooks []PostRunHook
 }
 
-// RunOption customizes a single run. See [WithCallOptions] and
-// [WithPostRunHook].
+// RunOption customizes a single run. See [WithCallOptions], [WithToolPolicy],
+// and [WithPostRunHook].
 type RunOption func(*runConfig)
+
+// WithToolPolicy replaces the Agent's default [ToolPolicy] for one run. Unlike
+// CallOptions, execution policies are replaced as a unit rather than merged;
+// this makes clearing an agent default possible with ToolPolicy{}.
+func WithToolPolicy(policy ToolPolicy) RunOption {
+	snapshot := policy.clone()
+	return func(c *runConfig) { c.toolPolicy = snapshot.clone() }
+}
 
 // WithCallOptions overrides the agent's default [CallOptions] for one run. The
 // override is merged over the agent defaults field-by-field.
@@ -151,10 +162,21 @@ func (l *Loop) run(ctx context.Context, task, mode string, cfg runConfig, invoke
 		return result, fmt.Errorf("%w; use WithMaxSteps to configure", ErrInvalidMaxSteps)
 	}
 
+	var policy *toolPolicyState
+	var policyErr error
+	ctx, policy, policyErr = newToolPolicyState(ctx, cfg.toolPolicy)
+	if policyErr != nil {
+		result.Messages = l.snapshot()
+		return result, policyErr
+	}
+
 	ctx, span := a.tracer.Start(ctx, "agent.run",
 		tracing.String("task", task),
 		tracing.Int("max_steps", a.maxSteps),
 		tracing.String("mode", mode),
+		tracing.String("tool_policy.timeout", policy.policy.Timeout.String()),
+		tracing.Int("tool_policy.max_calls", policy.policy.MaxCalls),
+		tracing.Int("tool_policy.max_parallel", policy.policy.MaxParallel),
 	)
 	defer span.End()
 
@@ -310,20 +332,38 @@ func (l *Loop) run(ctx context.Context, task, mode string, cfg runConfig, invoke
 		}
 
 		// Terminal tool (RunTyped): if the model invoked it, capture its raw
-		// arguments and end the run without executing anything. A synthetic
-		// success result keeps the transcript well-formed.
+		// arguments and end the run without executing anything. Every sibling call
+		// still receives a synthetic result so the transcript stays well-formed.
 		if cfg.terminalTool != "" {
+			terminalFound := false
 			for _, call := range toolUses {
-				if call.Name != cfg.terminalTool {
+				if call.Name != cfg.terminalTool || terminalFound {
 					continue
 				}
 				input := call.Input
 				if len(input) == 0 {
 					input = json.RawMessage("{}")
 				}
-				l.messages = append(l.messages, ToolResultMessage(call.ID, "ok", false))
-				l.emit(StreamEvent{Kind: StreamToolResult, ToolCall: call, Result: "ok"})
 				result.terminalToolInput = input
+				terminalFound = true
+			}
+			if terminalFound {
+				results := make([]Message, len(toolUses))
+				for i, call := range toolUses {
+					content := "ok"
+					isError := false
+					if call.Name != cfg.terminalTool {
+						content = fmt.Sprintf("not executed: run completed by terminal tool %q", cfg.terminalTool)
+						isError = true
+					}
+					blocks := Blocks{TextBlock{Text: content}}
+					results[i] = ToolResultBlockMessage(call.ID, blocks, isError)
+					l.emit(StreamEvent{
+						Kind: StreamToolResult, ToolCall: call, Result: content,
+						ResultBlocks: blocks, IsError: isError,
+					})
+				}
+				l.messages = append(l.messages, results...)
 				result.StopReason = StopEndTurn
 				result.Messages = l.snapshot()
 				log.InfoContext(ctx, "run complete via terminal tool", "tool", cfg.terminalTool, "steps", result.Steps)
@@ -331,68 +371,10 @@ func (l *Loop) run(ctx context.Context, task, mode string, cfg runConfig, invoke
 			}
 		}
 
-		results := make([]Message, len(toolUses))
 		// Snapshot messages for the approver — captures history up to and
 		// including the assistant message that requested these tool calls.
 		approverMessages := l.messages
-
-		// Every call in a started batch must receive exactly one transcript
-		// result. The first fatal failure cancels the shared batch context, but we
-		// still wait for every goroutine and fill every result slot before
-		// returning. Goroutines report (index, message) on a buffered channel and
-		// the main goroutine assembles the slots, so transcript order follows model
-		// order regardless of completion order.
-		type toolOutcome struct {
-			idx   int
-			msg   Message
-			fatal error
-		}
-		outcomes := make(chan toolOutcome, len(toolUses))
-		batchCtx, cancelBatch := context.WithCancelCause(ctx)
-		var wg sync.WaitGroup
-		var fatalOnce sync.Once
-		for i, call := range toolUses {
-			wg.Add(1)
-			go func(i int, call ToolUseBlock) {
-				defer wg.Done()
-
-				result, err := l.executeTool(batchCtx, call, approverMessages)
-				if err == nil {
-					outcomes <- toolOutcome{idx: i, msg: ToolResultBlockMessage(call.ID, result.Blocks, result.IsError)}
-					return
-				}
-
-				firstFatal := false
-				fatalOnce.Do(func() {
-					firstFatal = true
-					cancelBatch(err)
-				})
-
-				// A non-context error is an actual failure of this call even if a
-				// sibling happened to fail first. A context error after another call
-				// aborted the batch is a synthetic cancellation result.
-				content := "aborted: " + err.Error()
-				if !firstFatal && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
-					content = canceledToolResult(context.Cause(batchCtx))
-				}
-				blocks := Blocks{TextBlock{Text: content}}
-				l.emit(StreamEvent{
-					Kind: StreamToolResult, ToolCall: call, Result: content,
-					ResultBlocks: blocks, IsError: true, Err: err,
-				})
-				outcomes <- toolOutcome{idx: i, msg: ToolResultBlockMessage(call.ID, blocks, true), fatal: err}
-			}(i, call)
-		}
-		wg.Wait()
-		close(outcomes)
-		var fatalErr error
-		for oc := range outcomes {
-			results[oc.idx] = oc.msg
-			if oc.fatal != nil && fatalErr == nil {
-				fatalErr = oc.fatal
-			}
-		}
-		cancelBatch(nil)
+		results, fatalErr := l.executeToolBatch(ctx, toolUses, approverMessages, policy)
 		l.messages = append(l.messages, results...)
 		if fatalErr != nil {
 			span.RecordError(fatalErr)
@@ -472,10 +454,11 @@ func (l *Loop) snapshot() []Message {
 // executeTool runs one tool call and returns (result, fatalErr). result is the
 // [ToolResult] fed back to the model — the text view of its blocks is what
 // string consumers and text-only providers see; IsError marks a recoverable
-// tool failure (unknown tool, denial, or a tool error) that the model can adapt
-// to. fatalErr is non-nil only for run-aborting conditions (approver error,
-// context cancellation) and stops the whole run after the batch records an
-// outcome for every sibling call.
+// tool failure (unknown tool, approval denial, policy timeout, limiter failure,
+// or a tool error) that the model can adapt to. Budget denials are planned by
+// executeToolBatch before this function is called. fatalErr is non-nil only for
+// run-aborting conditions (approver error or parent context cancellation) and
+// stops the whole run after the batch records an outcome for every sibling.
 //
 // Cancellation is cooperative. A tool may finish a side effect while batch
 // cancellation races its return. If it returns success, that actual result is
@@ -485,7 +468,13 @@ func (l *Loop) snapshot() []Message {
 // This is also the pre-append choke point: a future per-result truncation or
 // summarization limiter (see planning/roadmap.md) runs here, after executeTool
 // returns and before the result becomes a transcript message.
-func (l *Loop) executeTool(ctx context.Context, call ToolUseBlock, messages []Message) (ToolResult, error) {
+func (l *Loop) executeTool(
+	ctx context.Context,
+	call ToolUseBlock,
+	messages []Message,
+	policy *toolPolicyState,
+	budget toolBudgetUsage,
+) (ToolResult, error) {
 	a := l.agent
 	tool, ok := l.toolsByName[call.Name]
 	if !ok {
@@ -518,6 +507,15 @@ func (l *Loop) executeTool(ctx context.Context, call ToolUseBlock, messages []Me
 	defer span.End()
 
 	log := spanLogger(span, l.log)
+	limits := policy.policy.limitsFor(call.Name)
+	span.SetAttributes(
+		tracing.String("policy.timeout", limits.Timeout.String()),
+		tracing.Int("policy.budget_used", budget.used),
+		tracing.Int("policy.budget_max", budget.max),
+		tracing.Int("policy.tool_budget_used", budget.toolUsed),
+		tracing.Int("policy.tool_budget_max", budget.toolMax),
+		tracing.Bool("policy.rate_limited", limits.RateLimiter != nil),
+	)
 
 	decision, err := a.approver.Approve(ctx, call, messages)
 	if err != nil {
@@ -527,6 +525,7 @@ func (l *Loop) executeTool(ctx context.Context, call ToolUseBlock, messages []Me
 	}
 	switch decision.Outcome {
 	case Deny:
+		span.SetAttributes(tracing.String("policy.outcome", "approval_denied"))
 		reason := decision.Reason
 		if reason == "" {
 			reason = "denied"
@@ -541,55 +540,116 @@ func (l *Loop) executeTool(ctx context.Context, call ToolUseBlock, messages []Me
 		call.Input = decision.Args
 	}
 
+	execCtx := ctx
+	cancel := func() {}
+	if limits.Timeout > 0 {
+		execCtx, cancel = context.WithTimeout(ctx, limits.Timeout)
+	}
+	defer cancel()
+
+	if limits.RateLimiter != nil {
+		waitStarted := time.Now()
+		waitErr := limits.RateLimiter.Wait(execCtx)
+		span.SetAttributes(tracing.Float64("policy.rate_limit_wait_ms", float64(time.Since(waitStarted))/float64(time.Millisecond)))
+		if policyResult, fatal, handled := l.handleToolExecutionFailure(
+			ctx, execCtx, call, limits.Timeout, "rate_limit", waitErr, span, log,
+		); handled {
+			return policyResult, fatal
+		}
+		// A limiter that returned nil after parent cancellation must not allow the
+		// external operation to begin.
+		if err := ctx.Err(); err != nil {
+			return ToolResult{}, err
+		}
+	}
+
 	args := string(call.Input)
-	log.DebugContext(ctx, "executing tool", "tool", call.Name, "args", args)
+	log.DebugContext(execCtx, "executing tool", "tool", call.Name, "args", args)
 	// Tools own their own retry policy. The loop deliberately does NOT wrap
 	// Execute in retry.Do: an [AsTool] sub-agent already retries at its provider
 	// layer, and re-running its Execute would replay a whole sub-run — including
 	// re-emitting every stream event and double-counting usage it already
 	// forwarded. Plain tools that want retries can opt in with [WithToolRetry].
+	// One policy budget reservation covers all retries inside that wrapper.
 	//
 	// Rich-result tools (see [ResultTool]) are preferred: their block content is
 	// carried through verbatim; string tools are wrapped with [TextResult].
 	var result ToolResult
+	var executeErr error
 	if rt, ok := tool.(ResultTool); ok {
-		res, err := rt.ExecuteResult(ctx, args)
-		if err != nil {
-			span.RecordError(err)
-			span.SetStatus(err)
-			log.WarnContext(ctx, "tool execution error", "tool", call.Name, "err", err)
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				return ToolResult{}, err
-			}
-			toolErr := err.Error()
-			blocks := Blocks{TextBlock{Text: toolErr}}
-			l.emit(StreamEvent{Kind: StreamToolResult, ToolCall: call, Result: toolErr, ResultBlocks: blocks, IsError: true, Err: err})
-			return ErrorResult(toolErr), nil
-		}
-		result = normalizeResult(res)
+		result, executeErr = rt.ExecuteResult(execCtx, args)
+		result = normalizeResult(result)
 	} else {
-		out, err := tool.Execute(ctx, args)
-		if err != nil {
-			span.RecordError(err)
-			span.SetStatus(err)
-			log.WarnContext(ctx, "tool execution error", "tool", call.Name, "err", err)
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				return ToolResult{}, err
-			}
-			// Recoverable tool error: the message carries the raw error text and the
-			// IsError flag. The provider decides how to present it (Anthropic sets a
-			// native is_error; OpenAI prefixes "error:"), so core does not prefix.
-			toolErr := err.Error()
-			blocks := Blocks{TextBlock{Text: toolErr}}
-			l.emit(StreamEvent{Kind: StreamToolResult, ToolCall: call, Result: toolErr, ResultBlocks: blocks, IsError: true, Err: err})
-			return ErrorResult(toolErr), nil
-		}
+		var out string
+		out, executeErr = tool.Execute(execCtx, args)
 		result = TextResult(out)
 	}
+	if policyResult, fatal, handled := l.handleToolExecutionFailure(
+		ctx, execCtx, call, limits.Timeout, "tool", executeErr, span, log,
+	); handled {
+		return policyResult, fatal
+	}
+
+	span.SetAttributes(tracing.String("policy.outcome", "executed"))
 	text := result.Text()
-	log.DebugContext(ctx, "tool result", "tool", call.Name, "result", text)
+	log.DebugContext(execCtx, "tool result", "tool", call.Name, "result", text)
 	l.emit(StreamEvent{Kind: StreamToolResult, ToolCall: call, Result: text, ResultBlocks: result.Blocks, IsError: result.IsError})
 	return result, nil
+}
+
+// handleToolExecutionFailure distinguishes an Automata-created per-tool
+// deadline (recoverable) from cancellation of the parent run (fatal). It also
+// normalizes limiter and ordinary tool errors into auditable result events.
+func (l *Loop) handleToolExecutionFailure(
+	parentCtx context.Context,
+	execCtx context.Context,
+	call ToolUseBlock,
+	timeout time.Duration,
+	stage string,
+	execErr error,
+	span tracing.Span,
+	log *slog.Logger,
+) (ToolResult, error, bool) {
+	if timeout > 0 && parentCtx.Err() == nil && errors.Is(execCtx.Err(), context.DeadlineExceeded) {
+		err := fmt.Errorf("%w: tool %q exceeded %s deadline", ErrToolTimeout, call.Name, timeout)
+		content := fmt.Sprintf("timeout: tool %q exceeded %s deadline", call.Name, timeout)
+		span.SetAttributes(tracing.String("policy.outcome", "timeout"))
+		span.RecordError(err)
+		span.SetStatus(err)
+		log.WarnContext(parentCtx, "tool execution timed out", "tool", call.Name, "timeout", timeout)
+		blocks := Blocks{TextBlock{Text: content}}
+		l.emit(StreamEvent{
+			Kind: StreamToolResult, ToolCall: call, Result: content,
+			ResultBlocks: blocks, IsError: true, Err: err,
+		})
+		return ErrorResult(content), nil, true
+	}
+	if execErr == nil {
+		return ToolResult{}, nil, false
+	}
+
+	span.RecordError(execErr)
+	span.SetStatus(execErr)
+	log.WarnContext(parentCtx, "tool execution error", "tool", call.Name, "stage", stage, "err", execErr)
+	if errors.Is(execErr, context.Canceled) || errors.Is(execErr, context.DeadlineExceeded) {
+		return ToolResult{}, execErr, true
+	}
+
+	content := execErr.Error()
+	eventErr := execErr
+	outcome := "tool_error"
+	if stage == "rate_limit" {
+		content = "rate limit: " + content
+		eventErr = fmt.Errorf("rate limit wait: %w", execErr)
+		outcome = "rate_limit_error"
+	}
+	span.SetAttributes(tracing.String("policy.outcome", outcome))
+	blocks := Blocks{TextBlock{Text: content}}
+	l.emit(StreamEvent{
+		Kind: StreamToolResult, ToolCall: call, Result: content,
+		ResultBlocks: blocks, IsError: true, Err: eventErr,
+	})
+	return ErrorResult(content), nil, true
 }
 
 func spanLogger(span tracing.Span, log *slog.Logger) *slog.Logger {
