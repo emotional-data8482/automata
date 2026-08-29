@@ -134,6 +134,13 @@ type runConfig struct {
 	// postRunHooks observe the fully populated result after the owning run API
 	// has finalized its state. They are added with [WithPostRunHook].
 	postRunHooks []PostRunHook
+	// maxCorrectionTurns bounds model-mediated correction turns in typed runs
+	// (see [WithMaxCorrectionTurns]). nil means the default of 1.
+	maxCorrectionTurns *int
+	// nativeStructuredOutput opts a typed run into provider-native schema
+	// enforcement when the provider supports it (see
+	// [WithNativeStructuredOutput]).
+	nativeStructuredOutput bool
 }
 
 // RunOption customizes a single run. See [WithCallOptions], [WithToolPolicy],
