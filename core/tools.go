@@ -39,8 +39,10 @@ func (t *funcTool[P]) Execute(ctx context.Context, args string) (string, error) 
 // result. The model can then retry, choose a different tool, or surface the
 // error in its final response — a tool error never hard-fails the run. The
 // only exceptions are [context.Canceled] and [context.DeadlineExceeded],
-// which propagate up and abort the run; return one of those (or panic) to
-// stop the loop.
+// which normally propagate up and abort the run. A deadline created by
+// [ToolPolicy.Timeout] becomes a recoverable [ErrToolTimeout] result instead;
+// parent cancellation remains fatal. Panics are not a supported control-flow
+// mechanism.
 func Func[P any](name, description string, handler func(context.Context, P) (string, error)) Tool {
 	var zero P
 	schema := buildSchema(name, description, reflect.TypeOf(zero))
@@ -91,8 +93,9 @@ func (t *funcResultTool[P]) Execute(ctx context.Context, args string) (string, e
 //
 // Tool error semantics match [Func]: non-context errors from the handler (or
 // from arg decoding, reported as "invalid args: …") become error tool results
-// the model can recover from; [context.Canceled] and
-// [context.DeadlineExceeded] abort the run.
+// the model can recover from; parent [context.Canceled] and
+// [context.DeadlineExceeded] abort the run, while a [ToolPolicy.Timeout]
+// deadline becomes a recoverable [ErrToolTimeout] result.
 func FuncResult[P any](name, description string, handler func(context.Context, P) (ToolResult, error)) Tool {
 	var zero P
 	schema := buildSchema(name, description, reflect.TypeOf(zero))
