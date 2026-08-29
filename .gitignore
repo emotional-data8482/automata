@@ -45,3 +45,7 @@ docs/
 
 # Planning Docs
 planning/
+
+# Pi Config
+.pi/
+.pi-lens.json
