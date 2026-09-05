@@ -5,6 +5,7 @@ use (
 	./examples/claude
 	./examples/deep_research
 	./examples/openai
+	./examples/typed_agents
 	./extensions/claude
 	./extensions/openai
 	./extensions/tavily
