@@ -379,6 +379,15 @@ researcher.RegisterTool(tools.WebSearch(tavily.New(os.Getenv("TAVILY_API_KEY")))
 ## Examples
 
 - `examples/claude` — minimal tool-using agent.
+- `examples/typed_agents` — sub-agents registered as typed tools (`AsToolFunc`,
+  and `RunTyped` wrapped in a `Func` for a typed-in/typed-out child) driving a
+  `RunSessionTyped` triage session that checkpoints to JSON and resumes between
+  turns. Needs `ANTHROPIC_API_KEY`:
+
+  ```sh
+  go run ./examples/typed_agents
+  ```
+
 - `examples/deep_research` — orchestrator + researcher + writer with a live
   Bubble Tea TUI rendered entirely from a `StreamAccumulator`. Needs
   `ANTHROPIC_API_KEY` and `TAVILY_API_KEY`:
@@ -391,7 +400,7 @@ researcher.RegisterTool(tools.WebSearch(tavily.New(os.Getenv("TAVILY_API_KEY")))
 
 This repository includes an [Agent Skills](https://agentskills.io) guide for
 building Automata applications at
-[`.agents/skills/automata-go/`](.agents/skills/automata-go/SKILL.md). Agents that
+[`.codex/skills/automata-go/`](.codex/skills/automata-go/SKILL.md). Agents that
 discover project skills can load it directly. To use it globally in other
 projects, copy that directory to `~/.agents/skills/automata-go/`.
 
