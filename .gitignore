@@ -36,6 +36,7 @@ profile.cov
 examples/claude/claude
 examples/deep_research/deep_research
 examples/openai/openai
+examples/typed_agents/typed_agents
 
 # Example artifacts
 examples/deep_research/why-is-the-sky-blue.md
