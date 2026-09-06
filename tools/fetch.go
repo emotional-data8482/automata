@@ -33,7 +33,7 @@ type fetchParams struct {
 // with an [core.Approver] or front it with an egress proxy.
 func HTTPFetch() core.Tool {
 	client := &http.Client{Timeout: fetchTimeout}
-	return core.Func("http_fetch",
+	return domainTool("http_fetch",
 		"Fetch a web page over HTTP GET and return its readable text content. Works best on HTML, plain-text, and JSON URLs.",
 		func(ctx context.Context, p fetchParams) (string, error) {
 			u, err := url.Parse(strings.TrimSpace(p.URL))

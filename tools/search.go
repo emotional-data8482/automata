@@ -31,7 +31,7 @@ type webSearchParams struct {
 // formatted as a numbered list of title, URL and content snippet — sources the
 // model can cite directly.
 func WebSearch(s Searcher) core.Tool {
-	return core.Func("web_search",
+	return domainTool("web_search",
 		"Search the web for current information. Returns a list of source results, each with a title, URL, and content snippet.",
 		func(ctx context.Context, p webSearchParams) (string, error) {
 			query := strings.TrimSpace(p.Query)

@@ -797,7 +797,7 @@ func (p *toolCapturingProvider) Invoke(_ context.Context, req Request) (Response
 		p.toolNames = map[string]string{}
 	}
 	for _, tl := range req.Tools {
-		p.toolNames[tl.Name()] = string(tl.Schema())
+		p.toolNames[tl.Name] = string(tl.InputSchema)
 	}
 	p.calls++
 	return Response{Message: p.reply}, nil

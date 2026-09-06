@@ -13,11 +13,7 @@ import (
 // history maintained by the run loop.
 //
 // Returning a non-nil error aborts the run.
-type PreSendHook func(
-	ctx context.Context,
-	messages []Message,
-	tools []Tool,
-) ([]Message, []Tool, error)
+type PreSendHook func(context.Context, Request) (Request, error)
 
 // PostRunHook fires after a run has finished and its result is fully populated.
 // For a [Session], the canonical transcript is committed before the hook runs,

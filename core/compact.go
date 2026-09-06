@@ -49,7 +49,11 @@ const defaultCompactPrompt = "You are a conversation summarizer for an AI agent.
 // summarization call every turn.
 func Compactor(p Provider, cfg CompactorConfig) PreSendHook {
 	c := &compactor{p: p, cfg: cfg}
-	return c.hook
+	return func(ctx context.Context, req Request) (Request, error) {
+		messages, err := c.compact(ctx, req.Messages)
+		req.Messages = messages
+		return req, err
+	}
 }
 
 type compactor struct {
@@ -63,9 +67,9 @@ type compactor struct {
 	coveredHash     string // hash of those covered messages
 }
 
-func (c *compactor) hook(ctx context.Context, messages []Message, tools []Tool) ([]Message, []Tool, error) {
+func (c *compactor) compact(ctx context.Context, messages []Message) ([]Message, error) {
 	if c.cfg.TriggerTokens <= 0 || estimateTokens(messages) < c.cfg.TriggerTokens {
-		return messages, tools, nil
+		return messages, nil
 	}
 
 	keep := c.cfg.KeepRecent
@@ -84,7 +88,7 @@ func (c *compactor) hook(ctx context.Context, messages []Message, tools []Tool) 
 
 	cut := len(messages) - keep
 	if cut <= systemEnd {
-		return messages, tools, nil // nothing older than the recent window to summarize
+		return messages, nil // nothing older than the recent window to summarize
 	}
 	// Never cut between an assistant tool_use and its tool_result: advance the
 	// cut forward until the kept suffix begins on a non-tool message, which pulls
@@ -93,7 +97,7 @@ func (c *compactor) hook(ctx context.Context, messages []Message, tools []Tool) 
 		cut++
 	}
 	if cut >= len(messages) {
-		return messages, tools, nil // only tool results remain; nothing safe to keep
+		return messages, nil // only tool results remain; nothing safe to keep
 	}
 
 	prefixLen := cut - systemEnd
@@ -115,7 +119,7 @@ func (c *compactor) hook(ctx context.Context, messages []Message, tools []Tool) 
 	} else {
 		s, err := c.summarize(ctx, messages[systemEnd:cut])
 		if err != nil {
-			return nil, nil, fmt.Errorf("compactor summarize: %w", err)
+			return nil, fmt.Errorf("compactor summarize: %w", err)
 		}
 		summary, summarizedCount = s, prefixLen
 		c.mu.Lock()
@@ -151,7 +155,7 @@ func (c *compactor) hook(ctx context.Context, messages []Message, tools []Tool) 
 		out = append(out, UserMessage(summaryText))
 		out = append(out, rest...)
 	}
-	return out, tools, nil
+	return out, nil
 }
 
 func (c *compactor) summarize(ctx context.Context, prefix []Message) (string, error) {

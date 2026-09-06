@@ -164,7 +164,7 @@ func RunSessionTyped[T any](ctx context.Context, session *Session, task string, 
 	// indexes agent tools by name; the terminal tool is matched by name alone).
 	// Fail fast instead of guessing which registration wins.
 	for _, t := range session.agent.tools {
-		if t.Name() == structuredOutputToolName {
+		if t.Definition().Name == structuredOutputToolName {
 			return zero, RunResult{}, fmt.Errorf(
 				"typed run: registered tool %q collides with the hidden structured-output tool; rename it",
 				structuredOutputToolName)

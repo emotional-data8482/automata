@@ -42,7 +42,7 @@ var (
 type Loop struct {
 	agent       *Agent
 	messages    []Message
-	toolsByName map[string]Tool
+	toolsByName map[string]registeredTool
 	log         *slog.Logger
 	// emit receives run-level observations (text deltas, tool calls, tool
 	// results). It defaults to a no-op; RunStream installs a callback-backed
@@ -54,7 +54,8 @@ type Loop struct {
 	// the tool's context (see withEmitter) so sub-agent tools can stream their
 	// own events up into this run. A plain Run leaves it false, so sub-agents
 	// run non-streaming.
-	streaming bool
+	streaming   bool
+	diagnostics []RunDiagnostic
 }
 
 // newLoop creates a run-scoped Loop for the agent and indexes its tools for
@@ -68,10 +69,7 @@ func newLoop(a *Agent, history []Message) *Loop {
 	} else if a.systemPrompt != "" {
 		messages = []Message{SystemMessage(a.systemPrompt)}
 	}
-	toolsByName := make(map[string]Tool, len(a.tools))
-	for _, t := range a.tools {
-		toolsByName[t.Name()] = t
-	}
+	toolsByName := make(map[string]registeredTool)
 	return &Loop{
 		agent:       a,
 		messages:    messages,
@@ -90,6 +88,15 @@ type invokeFn func(ctx context.Context, log *slog.Logger, req Request) (Response
 // progressed — including when the run returns an error — so callers can inspect
 // partial output, the transcript, usage, and steps even on failure.
 type RunResult struct {
+	// The consolidated fields are defined here for migration. Public scope
+	// accounting and finalization are integrated in project Task 5.
+	RunID                 string
+	Status                RunStatus
+	Turns                 int
+	ProviderAttempts      int
+	ProviderStopReason    StopReason
+	RawProviderStopReason string
+	Diagnostics           []RunDiagnostic
 	// Output is the final assistant text (FinalMessage.Text()); "" if the run
 	// failed before producing a final message.
 	Output string
@@ -162,248 +169,12 @@ func WithCallOptions(o CallOptions) RunOption {
 }
 
 func (l *Loop) run(ctx context.Context, task, mode string, cfg runConfig, invoke invokeFn) (RunResult, error) {
-	a := l.agent
-	result := RunResult{StopReason: StopError}
-	if a.maxSteps <= 0 {
-		result.Messages = l.snapshot()
-		return result, fmt.Errorf("%w; use WithMaxSteps to configure", ErrInvalidMaxSteps)
-	}
-
-	var policy *toolPolicyState
-	var policyErr error
-	ctx, policy, policyErr = newToolPolicyState(ctx, cfg.toolPolicy)
-	if policyErr != nil {
-		result.Messages = l.snapshot()
-		return result, policyErr
-	}
-
-	ctx, span := a.tracer.Start(ctx, "agent.run",
-		tracing.String("task", task),
-		tracing.Int("max_steps", a.maxSteps),
-		tracing.String("mode", mode),
-		tracing.String("tool_policy.timeout", policy.policy.Timeout.String()),
-		tracing.Int("tool_policy.max_calls", policy.policy.MaxCalls),
-		tracing.Int("tool_policy.max_parallel", policy.policy.MaxParallel),
-	)
-	defer span.End()
-
-	log := spanLogger(span, l.log)
-	log.InfoContext(ctx, "starting run", "task", task, "max_steps", a.maxSteps, "mode", mode)
-
-	l.messages = append(l.messages, UserMessage(task))
-
-	tools := append([]Tool(nil), a.tools...)
-	tools = append(tools, cfg.extraTools...)
-
-	// Snapshot hooks at run start so concurrent reconfiguration cannot mutate
-	// the slice mid-run. Hooks run in registration order.
-	hooks := append([]PreSendHook(nil), a.preSendHooks...)
-
-	for step := 0; step < a.maxSteps; step++ {
-		log.DebugContext(ctx, "invoking provider", "step", step)
-
-		sendMsgs := l.messages
-		sendTools := tools
-		if len(hooks) > 0 {
-			// Hand hooks a copy so an in-capacity append from a hook can't
-			// scribble into the canonical messages backing array.
-			sendMsgs = append([]Message(nil), l.messages...)
-			hookCtx, hookSpan := a.tracer.Start(ctx, "agent.preSend",
-				tracing.Int("step", step),
-				tracing.Int("hook_count", len(hooks)),
-			)
-			var hookErr error
-			for i, hook := range hooks {
-				inMsgs, inTools := len(sendMsgs), len(sendTools)
-				_, perHookSpan := a.tracer.Start(hookCtx, "agent.preSend.hook",
-					tracing.Int("index", i),
-					tracing.Int("in_msgs", inMsgs),
-					tracing.Int("in_tools", inTools),
-				)
-				sendMsgs, sendTools, hookErr = hook(hookCtx, sendMsgs, sendTools)
-				if hookErr != nil {
-					perHookSpan.RecordError(hookErr)
-					perHookSpan.SetStatus(hookErr)
-					perHookSpan.End()
-					break
-				}
-				outMsgs, outTools := len(sendMsgs), len(sendTools)
-				perHookSpan.SetAttributes(
-					tracing.Int("out_msgs", outMsgs),
-					tracing.Int("out_tools", outTools),
-					tracing.Int("delta_msgs", outMsgs-inMsgs),
-					tracing.Int("delta_tools", outTools-inTools),
-				)
-				log.DebugContext(ctx, "pre-send hook applied",
-					"step", step, "index", i,
-					"in_msgs", inMsgs, "out_msgs", outMsgs,
-					"in_tools", inTools, "out_tools", outTools,
-				)
-				perHookSpan.End()
-			}
-			if hookErr != nil {
-				hookSpan.RecordError(hookErr)
-				hookSpan.SetStatus(hookErr)
-				hookSpan.End()
-				span.RecordError(hookErr)
-				span.SetStatus(hookErr)
-				log.ErrorContext(ctx, "pre-send hook failed", "step", step, "err", hookErr)
-				result.Steps = step
-				result.Messages = l.snapshot()
-				return result, fmt.Errorf("pre-send hook failed at step %d: %w", step, hookErr)
-			}
-			hookSpan.End()
-		}
-
-		invokeCtx, invokeSpan := a.tracer.Start(ctx, "provider.invoke",
-			tracing.Int("step", step),
-		)
-		response, err := invoke(invokeCtx, log, Request{Messages: sendMsgs, Tools: sendTools, Options: cfg.options})
-		if err != nil {
-			invokeSpan.RecordError(err)
-			invokeSpan.SetStatus(err)
-			invokeSpan.End()
-			log.ErrorContext(ctx, "provider invocation failed", "step", step, "err", err)
-			result.Steps = step
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				result.StopReason = StopCancelled
-			}
-			result.Messages = l.snapshot()
-			return result, fmt.Errorf("api call failed at step %d: %w", step, err)
-		}
-		msg := response.Message
-		if msg.Usage != nil {
-			invokeSpan.SetAttributes(
-				tracing.Int("input_tokens", msg.Usage.InputTokens),
-				tracing.Int("output_tokens", msg.Usage.OutputTokens),
-			)
-			log.DebugContext(ctx, "provider response", "step", step,
-				"input_tokens", msg.Usage.InputTokens,
-				"output_tokens", msg.Usage.OutputTokens,
-			)
-			result.Usage.Add(msg.Usage)
-			l.emit(StreamEvent{Kind: StreamUsage, Usage: msg.Usage})
-		}
-		invokeSpan.End()
-
-		l.messages = append(l.messages, msg)
-		result.Steps = step + 1
-		result.FinalMessage = msg
-
-		toolUses := msg.ToolUses()
-		stopReason, rawStopReason := normalizeResponseStop(response, toolUses)
-		result.RawStopReason = rawStopReason
-
-		// These provider outcomes are never successful final answers, even when
-		// the provider returned nonempty text. Preserve that partial text and the
-		// full transcript, then return a typed error that carries both neutral and
-		// raw reasons.
-		switch stopReason {
-		case StopTokenLimit, StopContentFilter, StopCancelled, StopIncomplete, StopUnknown:
-			return l.failCompletion(ctx, span, log, &result, stopReason, rawStopReason, response.completionErr)
-		}
-
-		// A provider reason and its message shape must agree. Executing calls from
-		// a response marked complete, or accepting a tool-use stop with no call,
-		// risks committing an incomplete provider turn.
-		if stopReason == StopEndTurn && len(toolUses) > 0 {
-			cause := errors.New("provider reported normal completion with pending tool calls")
-			return l.failCompletion(ctx, span, log, &result, StopIncomplete, rawStopReason, cause)
-		}
-		if stopReason == StopToolUse && len(toolUses) == 0 {
-			cause := errors.New("provider reported tool use without a tool call")
-			return l.failCompletion(ctx, span, log, &result, StopIncomplete, rawStopReason, cause)
-		}
-
-		if len(toolUses) == 0 {
-			// No tool calls: the model is done. Return its text. A message with
-			// neither text nor tool calls (e.g. thinking only) is an empty
-			// response — usually a provider bug or safety filter.
-			result.Messages = l.snapshot()
-			text := msg.Text()
-			if text == "" {
-				return result, ErrEmptyResponse
-			}
-			result.Output = text
-			result.StopReason = StopEndTurn
-			span.SetAttributes(tracing.Int("steps", result.Steps))
-			log.InfoContext(ctx, "run complete", "steps", result.Steps)
-			return result, nil
-		}
-
-		log.DebugContext(ctx, "executing tools", "step", step, "count", len(toolUses))
-		// Announce the batch before executing. Emitted serially here (not from
-		// the goroutines below) so call events stay ordered.
-		for _, call := range toolUses {
-			l.emit(StreamEvent{Kind: StreamToolCall, ToolCall: call})
-		}
-
-		// Terminal tool (RunTyped): if the model invoked it, capture its raw
-		// arguments and end the run without executing anything. Every sibling call
-		// still receives a synthetic result so the transcript stays well-formed.
-		if cfg.terminalTool != "" {
-			terminalFound := false
-			for _, call := range toolUses {
-				if call.Name != cfg.terminalTool || terminalFound {
-					continue
-				}
-				input := call.Input
-				if len(input) == 0 {
-					input = json.RawMessage("{}")
-				}
-				result.terminalToolInput = input
-				terminalFound = true
-			}
-			if terminalFound {
-				results := make([]Message, len(toolUses))
-				for i, call := range toolUses {
-					content := "ok"
-					isError := false
-					if call.Name != cfg.terminalTool {
-						content = fmt.Sprintf("not executed: run completed by terminal tool %q", cfg.terminalTool)
-						isError = true
-					}
-					blocks := Blocks{TextBlock{Text: content}}
-					results[i] = ToolResultBlockMessage(call.ID, blocks, isError)
-					l.emit(StreamEvent{
-						Kind: StreamToolResult, ToolCall: call, Result: content,
-						ResultBlocks: blocks, IsError: isError,
-					})
-				}
-				l.messages = append(l.messages, results...)
-				result.StopReason = StopEndTurn
-				result.Messages = l.snapshot()
-				log.InfoContext(ctx, "run complete via terminal tool", "tool", cfg.terminalTool, "steps", result.Steps)
-				return result, nil
-			}
-		}
-
-		// Snapshot messages for the approver — captures history up to and
-		// including the assistant message that requested these tool calls.
-		approverMessages := l.messages
-		results, fatalErr := l.executeToolBatch(ctx, toolUses, approverMessages, policy)
-		l.messages = append(l.messages, results...)
-		if fatalErr != nil {
-			span.RecordError(fatalErr)
-			span.SetStatus(fatalErr)
-			result.Messages = l.snapshot()
-			return result, fatalErr
-		}
-	}
-
-	err := fmt.Errorf("%w (%d)", ErrMaxStepsExceeded, a.maxSteps)
-	span.SetStatus(err)
-	log.WarnContext(ctx, "exceeded max steps", "max_steps", a.maxSteps)
-	result.StopReason = StopMaxSteps
-	result.Messages = l.snapshot()
-	return result, err
+	m := &loopMachine{loop: l, ctx: ctx, task: task, mode: mode, cfg: cfg, invoke: invoke, result: RunResult{StopReason: StopError}}
+	return m.drive()
 }
 
 func canceledToolResult(cause error) string {
-	if cause == nil {
-		return "canceled: tool batch aborted"
-	}
-	return "canceled: tool batch aborted: " + cause.Error()
+	return "canceled: tool batch aborted"
 }
 
 // normalizeResponseStop validates the provider-neutral reason and supplies a
@@ -434,23 +205,6 @@ func normalizeResponseStop(response Response, toolUses []ToolUseBlock) (StopReas
 		}
 		return StopUnknown, raw
 	}
-}
-
-// failCompletion finalizes a partial result and constructs the typed error used
-// for token limits, filtering/refusal, cancellation, incomplete transport, and
-// unknown provider reasons.
-func (l *Loop) failCompletion(ctx context.Context, span tracing.Span, log *slog.Logger, result *RunResult, reason StopReason, raw string, cause error) (RunResult, error) {
-	result.Output = result.FinalMessage.Text()
-	result.StopReason = reason
-	result.RawStopReason = raw
-	result.Messages = l.snapshot()
-	err := &CompletionError{Reason: reason, RawReason: raw, Cause: cause}
-	span.RecordError(err)
-	span.SetStatus(err)
-	span.SetAttributes(tracing.Int("steps", result.Steps))
-	log.WarnContext(ctx, "provider completion was not final",
-		"reason", reason, "raw_reason", raw, "steps", result.Steps)
-	return *result, err
 }
 
 // snapshot returns a copy of the loop's current transcript for a RunResult.
@@ -487,9 +241,9 @@ func (l *Loop) executeTool(
 	if !ok {
 		// A hallucinated tool name is model error, not program error: feed it
 		// back like any other tool failure so the model can pick a real tool.
-		names := make([]string, len(a.tools))
-		for i, t := range a.tools {
-			names[i] = t.Name()
+		names := make([]string, 0, len(l.toolsByName))
+		for name := range l.toolsByName {
+			names = append(names, name)
 		}
 		err := fmt.Errorf("%w: %q (available tools: %s)", ErrToolNotFound, call.Name, strings.Join(names, ", "))
 		l.log.WarnContext(ctx, "tool not found", "tool", call.Name)
@@ -499,6 +253,9 @@ func (l *Loop) executeTool(
 		return ErrorResult(notFound), nil
 	}
 
+	if err := validateToolArguments(tool.definition.InputSchema, call.Input); err != nil {
+		return l.invalidArguments(call, err), nil
+	}
 	// When this run is streaming, hand the sink to the tool via context so a
 	// sub-agent tool (see AsTool) can forward its own stream events upward, and
 	// stash this call's ID so the sub-agent can tag those events with it (see
@@ -544,7 +301,10 @@ func (l *Loop) executeTool(
 		return ErrorResult(denied), nil
 	case Modify:
 		log.DebugContext(ctx, "tool call modified", "tool", call.Name)
-		call.Input = decision.Args
+		call.Input = append(json.RawMessage(nil), decision.Args...)
+		if err := validateToolArguments(tool.definition.InputSchema, call.Input); err != nil {
+			return l.invalidArguments(call, err), nil
+		}
 	}
 
 	execCtx := ctx
@@ -581,16 +341,8 @@ func (l *Loop) executeTool(
 	//
 	// Rich-result tools (see [ResultTool]) are preferred: their block content is
 	// carried through verbatim; string tools are wrapped with [TextResult].
-	var result ToolResult
-	var executeErr error
-	if rt, ok := tool.(ResultTool); ok {
-		result, executeErr = rt.ExecuteResult(execCtx, args)
-		result = normalizeResult(result)
-	} else {
-		var out string
-		out, executeErr = tool.Execute(execCtx, args)
-		result = TextResult(out)
-	}
+	result, executeErr := tool.executor.Execute(execCtx, append(json.RawMessage(nil), call.Input...))
+	result = normalizeResult(result)
 	if policyResult, fatal, handled := l.handleToolExecutionFailure(
 		ctx, execCtx, call, limits.Timeout, "tool", executeErr, span, log,
 	); handled {
@@ -638,7 +390,7 @@ func (l *Loop) handleToolExecutionFailure(
 	span.RecordError(execErr)
 	span.SetStatus(execErr)
 	log.WarnContext(parentCtx, "tool execution error", "tool", call.Name, "stage", stage, "err", execErr)
-	if errors.Is(execErr, context.Canceled) || errors.Is(execErr, context.DeadlineExceeded) {
+	if stage == "tool" || errors.Is(execErr, context.Canceled) || errors.Is(execErr, context.DeadlineExceeded) {
 		return ToolResult{}, execErr, true
 	}
 
@@ -665,4 +417,10 @@ func spanLogger(span tracing.Span, log *slog.Logger) *slog.Logger {
 		return log
 	}
 	return log.With("trace_id", traceID, "span_id", spanID)
+}
+
+func (l *Loop) invalidArguments(call ToolUseBlock, err error) ToolResult {
+	result := ErrorResult("invalid args: " + err.Error())
+	l.emit(StreamEvent{Kind: StreamToolResult, ToolCall: call, Result: result.Text(), ResultBlocks: result.Blocks, IsError: true, Err: err})
+	return result
 }

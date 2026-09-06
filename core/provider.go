@@ -12,7 +12,7 @@ import (
 // extended thinking skip it.
 type Request struct {
 	Messages []Message
-	Tools    []Tool
+	Tools    []ToolDefinition
 	Options  CallOptions
 }
 

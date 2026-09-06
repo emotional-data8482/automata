@@ -29,7 +29,7 @@ func TestWebSearchFormatsResults(t *testing.T) {
 		{Title: "Second", URL: "https://b.example", Content: "beta content"},
 	}}
 
-	out, err := WebSearch(s).Execute(context.Background(), `{"query":"golang agents","max_results":3}`)
+	out, err := executeDomain(t, WebSearch(s), context.Background(), `{"query":"golang agents","max_results":3}`)
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
@@ -45,7 +45,7 @@ func TestWebSearchFormatsResults(t *testing.T) {
 
 func TestWebSearchDefaults(t *testing.T) {
 	s := &fakeSearcher{}
-	out, err := WebSearch(s).Execute(context.Background(), `{"query":"x"}`)
+	out, err := executeDomain(t, WebSearch(s), context.Background(), `{"query":"x"}`)
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
@@ -58,33 +58,30 @@ func TestWebSearchDefaults(t *testing.T) {
 }
 
 func TestWebSearchErrors(t *testing.T) {
-	if _, err := WebSearch(&fakeSearcher{}).Execute(context.Background(), `{"query":"  "}`); err == nil {
+	if _, err := executeDomain(t, WebSearch(&fakeSearcher{}), context.Background(), `{"query":"  "}`); err == nil {
 		t.Error("blank query: expected error")
 	}
 	boom := &fakeSearcher{err: errors.New("backend down")}
-	if _, err := WebSearch(boom).Execute(context.Background(), `{"query":"x"}`); err == nil || !strings.Contains(err.Error(), "backend down") {
+	if _, err := executeDomain(t, WebSearch(boom), context.Background(), `{"query":"x"}`); err == nil || !strings.Contains(err.Error(), "backend down") {
 		t.Errorf("searcher error not propagated: %v", err)
 	}
 }
 
 func TestWebSearchSchema(t *testing.T) {
 	var schema struct {
-		Name       string `json:"name"`
-		Parameters struct {
-			Properties map[string]json.RawMessage `json:"properties"`
-			Required   []string                   `json:"required"`
-		} `json:"parameters"`
+		Properties map[string]json.RawMessage `json:"properties"`
+		Required   []string                   `json:"required"`
 	}
-	if err := json.Unmarshal(WebSearch(&fakeSearcher{}).Schema(), &schema); err != nil {
+	if err := json.Unmarshal(WebSearch(&fakeSearcher{}).Definition().InputSchema, &schema); err != nil {
 		t.Fatalf("unmarshal schema: %v", err)
 	}
-	if schema.Name != "web_search" {
-		t.Errorf("name = %q, want web_search", schema.Name)
+	if WebSearch(&fakeSearcher{}).Definition().Name != "web_search" {
+		t.Errorf("name = %q, want web_search", WebSearch(&fakeSearcher{}).Definition().Name)
 	}
-	if _, ok := schema.Parameters.Properties["max_results"]; !ok {
+	if _, ok := schema.Properties["max_results"]; !ok {
 		t.Error("schema missing max_results")
 	}
-	if len(schema.Parameters.Required) != 1 || schema.Parameters.Required[0] != "query" {
-		t.Errorf("required = %v, want [query]", schema.Parameters.Required)
+	if len(schema.Required) != 1 || schema.Required[0] != "query" {
+		t.Errorf("required = %v, want [query]", schema.Required)
 	}
 }

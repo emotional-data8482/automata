@@ -68,7 +68,7 @@ func (l *Loop) executeToolBatch(
 			content := canceledToolResult(cause)
 			outcome := toolBatchOutcome{idx: job.idx}
 			if firstFatal {
-				content = "aborted: " + cause.Error()
+				content = "aborted: tool execution failed"
 				outcome.fatal = cause
 			}
 			blocks := Blocks{TextBlock{Text: content}}
@@ -98,7 +98,7 @@ func (l *Loop) executeToolBatch(
 
 		// Preserve this call's real fatal error. A context error caused by an
 		// earlier sibling is represented as synthetic cancellation instead.
-		content := "aborted: " + err.Error()
+		content := "aborted: tool execution failed"
 		if !firstFatal && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
 			content = canceledToolResult(context.Cause(batchCtx))
 		}
@@ -142,6 +142,7 @@ func (l *Loop) executeToolBatch(
 		results[outcome.idx] = outcome.msg
 		if outcome.fatal != nil && fatalErr == nil {
 			fatalErr = outcome.fatal
+			l.diagnostics = append(l.diagnostics, RunDiagnostic{ToolCallID: calls[outcome.idx].ID, Kind: "tool_execution_error", Message: outcome.fatal.Error(), Data: append([]byte(nil), calls[outcome.idx].Input...)})
 		}
 	}
 	return results, fatalErr

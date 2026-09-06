@@ -9,7 +9,7 @@ import (
 
 func TestShellRunsAllowListedCommand(t *testing.T) {
 	tool := Shell(ShellConfig{Allow: []string{"echo"}})
-	out, err := tool.Execute(context.Background(), `{"command":"echo","args":["hi","there"]}`)
+	out, err := executeDomain(t, tool, context.Background(), `{"command":"echo","args":["hi","there"]}`)
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
@@ -20,19 +20,19 @@ func TestShellRunsAllowListedCommand(t *testing.T) {
 
 func TestShellDeniesUnlistedCommand(t *testing.T) {
 	tool := Shell(ShellConfig{Allow: []string{"echo"}})
-	if _, err := tool.Execute(context.Background(), `{"command":"rm","args":["-rf","/"]}`); err == nil {
+	if _, err := executeDomain(t, tool, context.Background(), `{"command":"rm","args":["-rf","/"]}`); err == nil {
 		t.Fatal("unlisted command was not denied")
 	}
 
 	empty := Shell(ShellConfig{})
-	if _, err := empty.Execute(context.Background(), `{"command":"echo"}`); err == nil {
+	if _, err := executeDomain(t, empty, context.Background(), `{"command":"echo"}`); err == nil {
 		t.Fatal("empty allow-list did not deny")
 	}
 }
 
 func TestShellNoShellInterpretation(t *testing.T) {
 	tool := Shell(ShellConfig{Allow: []string{"echo"}})
-	out, err := tool.Execute(context.Background(), `{"command":"echo","args":["$(whoami)"]}`)
+	out, err := executeDomain(t, tool, context.Background(), `{"command":"echo","args":["$(whoami)"]}`)
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
@@ -43,7 +43,7 @@ func TestShellNoShellInterpretation(t *testing.T) {
 
 func TestShellNonZeroExitIsRecoverableError(t *testing.T) {
 	tool := Shell(ShellConfig{Allow: []string{"sh"}})
-	_, err := tool.Execute(context.Background(), `{"command":"sh","args":["-c","echo oops >&2; exit 3"]}`)
+	_, err := executeDomain(t, tool, context.Background(), `{"command":"sh","args":["-c","echo oops >&2; exit 3"]}`)
 	if err == nil {
 		t.Fatal("non-zero exit: expected error")
 	}
@@ -58,7 +58,7 @@ func TestShellNonZeroExitIsRecoverableError(t *testing.T) {
 func TestShellTimeoutDoesNotAbortRun(t *testing.T) {
 	tool := Shell(ShellConfig{Allow: []string{"sleep"}, Timeout: 50 * time.Millisecond})
 	start := time.Now()
-	_, err := tool.Execute(context.Background(), `{"command":"sleep","args":["5"]}`)
+	_, err := executeDomain(t, tool, context.Background(), `{"command":"sleep","args":["5"]}`)
 	if err == nil {
 		t.Fatal("expected timeout error")
 	}

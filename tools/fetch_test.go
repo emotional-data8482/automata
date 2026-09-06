@@ -11,7 +11,7 @@ import (
 
 func fetchURL(t *testing.T, url string) (string, error) {
 	t.Helper()
-	return HTTPFetch().Execute(context.Background(), fmt.Sprintf(`{"url":%q}`, url))
+	return executeDomain(t, HTTPFetch(), context.Background(), fmt.Sprintf(`{"url":%q}`, url))
 }
 
 func TestHTTPFetchExtractsHTML(t *testing.T) {

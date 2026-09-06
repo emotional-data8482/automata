@@ -26,7 +26,7 @@ type writeFileParams struct {
 // sandbox is enforced by [os.Root], not string cleaning). Files are capped at
 // 256 KiB with a truncation marker.
 func ReadFile(root string) core.Tool {
-	return core.Func("read_file",
+	return domainTool("read_file",
 		"Read a text file from the sandboxed working directory and return its content.",
 		func(ctx context.Context, p readFileParams) (string, error) {
 			if p.Path == "" {
@@ -59,7 +59,7 @@ func ReadFile(root string) core.Tool {
 // root, creating parent directories as needed. Path traversal and symlinks
 // that escape the root are rejected (enforced by [os.Root]).
 func WriteFile(root string) core.Tool {
-	return core.Func("write_file",
+	return domainTool("write_file",
 		"Write a file (creating parent directories) inside the sandboxed working directory, replacing any existing content.",
 		func(ctx context.Context, p writeFileParams) (string, error) {
 			if p.Path == "" {

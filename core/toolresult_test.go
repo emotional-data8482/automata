@@ -138,8 +138,8 @@ func TestFuncResultSchemaParityWithFunc(t *testing.T) {
 	str := Func[resultArgs]("weather", "look up weather",
 		func(context.Context, resultArgs) (string, error) { return "", nil })
 
-	if string(res.Schema()) != string(str.Schema()) {
-		t.Errorf("schema mismatch:\nrich: %s\ntext: %s", res.Schema(), str.Schema())
+	if string(res.Definition().InputSchema) != string(str.Definition().InputSchema) {
+		t.Errorf("schema mismatch:\nrich: %s\ntext: %s", res.Definition().InputSchema, str.Definition().InputSchema)
 	}
 }
 
@@ -157,13 +157,13 @@ func TestFuncResultArgs(t *testing.T) {
 		tool := FuncResult("weather", "look up weather", func(_ context.Context, a resultArgs) (ToolResult, error) {
 			return TextResult("sunny in " + a.City), nil
 		})
-		out, err := tool.Execute(context.Background(), tc.args)
+		out, err := tool.Execute(context.Background(), json.RawMessage(tc.args))
 		if err != nil {
 			t.Fatalf("Execute(%q): %v", tc.args, err)
 		}
 		want := "sunny in " + tc.city
-		if out != want {
-			t.Errorf("Execute(%q) = %q, want %q", tc.args, out, want)
+		if out.Text() != want {
+			t.Errorf("Execute(%q) = %q, want %q", tc.args, out.Text(), want)
 		}
 	}
 }
@@ -172,7 +172,7 @@ func TestFuncResultInvalidArgs(t *testing.T) {
 	tool := FuncResult("weather", "look up weather", func(_ context.Context, a resultArgs) (ToolResult, error) {
 		return TextResult("never"), nil
 	})
-	_, err := tool.Execute(context.Background(), `{"city":42}`)
+	_, err := tool.Execute(context.Background(), json.RawMessage(`{"city":42}`))
 	if err == nil || !strings.HasPrefix(err.Error(), "invalid args: ") {
 		t.Errorf("err = %v, want prefix %q", err, "invalid args: ")
 	}
@@ -186,8 +186,8 @@ func TestFuncResultRegistrationPaths(t *testing.T) {
 	_ = New(nil).WithTools(tool)
 	a := New(nil)
 	a.RegisterTool(tool)
-	if a.tools[0].Name() != "echo" {
-		t.Errorf("registered tool name = %q", a.tools[0].Name())
+	if a.tools[0].Definition().Name != "echo" {
+		t.Errorf("registered tool name = %q", a.tools[0].Definition().Name)
 	}
 }
 
@@ -294,7 +294,7 @@ func TestLoopRichResultRecoverableError(t *testing.T) {
 	}}
 	agent := New(provider)
 	agent.RegisterTool(FuncResult("boom", "always fails", func(context.Context, struct{}) (ToolResult, error) {
-		return ToolResult{}, errors.New("exploded")
+		return ErrorResult("exploded"), nil
 	}))
 
 	out, err := agent.Run(context.Background(), "go")
@@ -426,11 +426,7 @@ func TestWithToolRetryPreservesResultTool(t *testing.T) {
 		return BlockResult(TextBlock{Text: "recovered"}, ImageBlock{MediaType: "image/png", Data: []byte{1}}), nil
 	}), retry.Config{MaxAttempts: 3, InitialDelay: time.Millisecond})
 
-	rt, ok := tool.(ResultTool)
-	if !ok {
-		t.Fatal("WithToolRetry stripped the ResultTool interface")
-	}
-	res, err := rt.ExecuteResult(context.Background(), "{}")
+	res, err := tool.Execute(context.Background(), json.RawMessage("{}"))
 	if err != nil {
 		t.Fatalf("ExecuteResult: %v", err)
 	}
@@ -442,11 +438,11 @@ func TestWithToolRetryPreservesResultTool(t *testing.T) {
 	}
 }
 
-func TestWithToolRetryStringToolUnchanged(t *testing.T) {
-	if _, ok := WithToolRetry(Func("plain", "plain", func(context.Context, struct{}) (string, error) {
-		return "", nil
-	}), retry.Config{}).(ResultTool); ok {
-		t.Error("plain Tool wrapped as ResultTool, want Execute only")
+func TestWithToolRetryTextResult(t *testing.T) {
+	tool := WithToolRetry(Func("plain", "plain", func(context.Context, struct{}) (string, error) { return "ok", nil }), retry.Config{})
+	res, err := tool.Execute(context.Background(), json.RawMessage("{}"))
+	if err != nil || res.Text() != "ok" || len(res.Blocks) != 1 {
+		t.Fatalf("result=%+v err=%v", res, err)
 	}
 }
 

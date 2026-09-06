@@ -49,10 +49,15 @@ type wireTool struct {
 // convertTools maps core tools to OpenAI function tools. core's schema shape
 // ({name, description, parameters}) is exactly OpenAI's function shape, so it
 // passes through as the function payload.
-func convertTools(tools []core.Tool) []wireTool {
+func convertTools(tools []core.ToolDefinition) []wireTool {
 	out := make([]wireTool, 0, len(tools))
 	for _, t := range tools {
-		out = append(out, wireTool{Type: "function", Function: t.Schema()})
+		raw, _ := json.Marshal(struct {
+			Name        string          `json:"name"`
+			Description string          `json:"description,omitempty"`
+			Parameters  json.RawMessage `json:"parameters"`
+		}{t.Name, t.Description, t.InputSchema})
+		out = append(out, wireTool{Type: "function", Function: raw})
 	}
 	return out
 }

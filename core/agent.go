@@ -133,12 +133,6 @@ func (a *Agent) WithTools(tools ...Tool) *Agent {
 // and [context.DeadlineExceeded], which abort the run. See [Func] for the
 // typed-handler convenience wrapper.
 func (a *Agent) RegisterTool(t Tool) {
-	for i, existing := range a.tools {
-		if existing.Name() == t.Name() {
-			a.tools[i] = t
-			return
-		}
-	}
 	a.tools = append(a.tools, t)
 }
 
@@ -203,19 +197,17 @@ func (a *Agent) RunBackground(ctx context.Context, task string, opts ...RunOptio
 // the task string handed to a fresh run of the wrapped agent (identity for
 // AsTool, a typed renderer for AsToolFunc).
 type agentTool struct {
-	name   string
-	schema json.RawMessage
-	agent  *Agent
-	task   func(args string) (string, error)
+	definition ToolDefinition
+	agent      *Agent
+	task       func(args string) (string, error)
 }
 
-func (t *agentTool) Name() string            { return t.name }
-func (t *agentTool) Schema() json.RawMessage { return t.schema }
+func (t *agentTool) Definition() ToolDefinition { return cloneToolDefinition(t.definition) }
 
-func (t *agentTool) Execute(ctx context.Context, args string) (string, error) {
-	task, err := t.task(args)
+func (t *agentTool) Execute(ctx context.Context, args json.RawMessage) (ToolResult, error) {
+	task, err := t.task(string(args))
 	if err != nil {
-		return "", err
+		return ToolResult{}, err
 	}
 	// If an enclosing run is streaming, run the sub-agent in streaming mode too
 	// and forward its events into the parent's sink, tagged with this tool's
@@ -226,17 +218,17 @@ func (t *agentTool) Execute(ctx context.Context, args string) (string, error) {
 		invocationID := toolCallIDFrom(ctx)
 		res, err := t.agent.RunStream(ctx, task, func(ev StreamEvent) {
 			if ev.Agent == "" {
-				ev.Agent = t.name
+				ev.Agent = t.definition.Name
 			}
 			if ev.InvocationID == "" {
 				ev.InvocationID = invocationID
 			}
 			emit(ev)
 		})
-		return res.Output, err
+		return BlockResult(res.FinalMessage.Blocks...), err
 	}
 	res, err := t.agent.Run(ctx, task)
-	return res.Output, err
+	return BlockResult(res.FinalMessage.Blocks...), err
 }
 
 // AsTool adapts an Agent into a Tool that an orchestrator can register and the
@@ -256,10 +248,9 @@ func (t *agentTool) Execute(ctx context.Context, args string) (string, error) {
 func AsTool[P any](a *Agent, name, description string) Tool {
 	var zero P
 	return &agentTool{
-		name:   name,
-		schema: buildSchema(name, description, reflect.TypeOf(zero)),
-		agent:  a,
-		task:   func(args string) (string, error) { return args, nil },
+		definition: buildDefinition(name, description, reflect.TypeOf(zero)),
+		agent:      a,
+		task:       func(args string) (string, error) { return args, nil },
 	}
 }
 
@@ -282,9 +273,8 @@ func AsTool[P any](a *Agent, name, description string) Tool {
 func AsToolFunc[P any](a *Agent, name, description string, render func(P) string) Tool {
 	var zero P
 	return &agentTool{
-		name:   name,
-		schema: buildSchema(name, description, reflect.TypeOf(zero)),
-		agent:  a,
+		definition: buildDefinition(name, description, reflect.TypeOf(zero)),
+		agent:      a,
 		task: func(args string) (string, error) {
 			var params P
 			if args != "" && args != "null" && args != "{}" {

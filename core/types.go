@@ -235,27 +235,19 @@ func ToolResultBlockMessage(toolUseID string, blocks Blocks, isError bool) Messa
 	}
 }
 
-type Tool interface {
-	Name() string
-	Schema() json.RawMessage
-	Execute(ctx context.Context, args string) (string, error)
+// ToolDefinition is provider-facing data. InputSchema is the root JSON argument
+// schema; extensions construct their own function envelopes.
+type ToolDefinition struct {
+	Name        string
+	Description string
+	InputSchema json.RawMessage
 }
 
-// ResultTool is the opt-in rich-result extension of [Tool]. A tool may
-// implement it in addition to Tool; the run loop prefers ExecuteResult when
-// present, so the tool can return block-based content ([TextBlock]s,
-// [ImageBlock]s, …) instead of only a string. Tools that implement only Tool
-// are unaffected: their Execute string is wrapped with [TextResult].
-//
-// The same error semantics as Tool.Execute apply: a non-context error is a
-// recoverable tool failure (converted to an error tool result the model can
-// adapt to), while [context.Canceled] and [context.DeadlineExceeded] from the
-// parent run abort it. A deadline created by [ToolPolicy.Timeout] is
-// distinguished from parent cancellation and becomes a recoverable
-// [ErrToolTimeout] result.
-type ResultTool interface {
-	Tool
-	ExecuteResult(ctx context.Context, args string) (ToolResult, error)
+// Tool has one rich execution method. A non-nil error is fatal; an explicit
+// ErrorResult with nil error is a model-recoverable outcome.
+type Tool interface {
+	Definition() ToolDefinition
+	Execute(context.Context, json.RawMessage) (ToolResult, error)
 }
 
 // ToolResult is the execution-layer return value of a rich-result tool

@@ -13,7 +13,7 @@ func TestReadWriteRoundtrip(t *testing.T) {
 	root := t.TempDir()
 	ctx := context.Background()
 
-	out, err := WriteFile(root).Execute(ctx, `{"path":"notes/a.txt","content":"hello sandbox"}`)
+	out, err := executeDomain(t, WriteFile(root), ctx, `{"path":"notes/a.txt","content":"hello sandbox"}`)
 	if err != nil {
 		t.Fatalf("write: %v", err)
 	}
@@ -21,7 +21,7 @@ func TestReadWriteRoundtrip(t *testing.T) {
 		t.Errorf("write result = %q, want it to mention the path", out)
 	}
 
-	got, err := ReadFile(root).Execute(ctx, `{"path":"notes/a.txt"}`)
+	got, err := executeDomain(t, ReadFile(root), ctx, `{"path":"notes/a.txt"}`)
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
@@ -37,7 +37,7 @@ func TestReadFileTruncatesLargeFile(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, err := ReadFile(root).Execute(context.Background(), `{"path":"big.txt"}`)
+	got, err := executeDomain(t, ReadFile(root), context.Background(), `{"path":"big.txt"}`)
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
@@ -67,12 +67,12 @@ func TestSandboxRejectsEscapes(t *testing.T) {
 		"absolute read": fmt.Sprintf(`{"path":%q}`, secret),
 	}
 	for name, args := range escapes {
-		if out, err := ReadFile(root).Execute(ctx, args); err == nil {
+		if out, err := executeDomain(t, ReadFile(root), ctx, args); err == nil {
 			t.Errorf("%s: escaped the sandbox, read %q", name, out)
 		}
 	}
 
-	if _, err := WriteFile(root).Execute(ctx, `{"path":"../evil.txt","content":"x"}`); err == nil {
+	if _, err := executeDomain(t, WriteFile(root), ctx, `{"path":"../evil.txt","content":"x"}`); err == nil {
 		t.Error("dot-dot write escaped the sandbox")
 	}
 	if _, err := os.Stat(filepath.Join(parent, "evil.txt")); err == nil {
@@ -83,10 +83,10 @@ func TestSandboxRejectsEscapes(t *testing.T) {
 func TestFSRequiresPath(t *testing.T) {
 	root := t.TempDir()
 	ctx := context.Background()
-	if _, err := ReadFile(root).Execute(ctx, `{}`); err == nil {
+	if _, err := executeDomain(t, ReadFile(root), ctx, `{}`); err == nil {
 		t.Error("read with no path: expected error")
 	}
-	if _, err := WriteFile(root).Execute(ctx, `{"content":"x"}`); err == nil {
+	if _, err := executeDomain(t, WriteFile(root), ctx, `{"content":"x"}`); err == nil {
 		t.Error("write with no path: expected error")
 	}
 }

@@ -20,11 +20,12 @@ func (e *retryableToolErr) Retryable() bool { return true }
 // retryable error.
 type countingTool struct{ calls atomic.Int32 }
 
-func (t *countingTool) Name() string            { return "counter" }
-func (t *countingTool) Schema() json.RawMessage { return json.RawMessage(`{"name":"counter"}`) }
-func (t *countingTool) Execute(context.Context, string) (string, error) {
+func (t *countingTool) Definition() ToolDefinition {
+	return ToolDefinition{Name: "counter", InputSchema: json.RawMessage(`{"type":"object"}`)}
+}
+func (t *countingTool) Execute(context.Context, json.RawMessage) (ToolResult, error) {
 	t.calls.Add(1)
-	return "", &retryableToolErr{msg: "transient"}
+	return ToolResult{}, &retryableToolErr{msg: "transient"}
 }
 
 // TestToolExecuteNotRetriedByLoop is the regression test for the double-retry
@@ -44,11 +45,9 @@ func TestToolExecuteNotRetriedByLoop(t *testing.T) {
 	agent.RegisterTool(tool)
 
 	out, err := agent.Run(context.Background(), "go")
-	if err != nil {
-		t.Fatalf("Run: %v", err)
-	}
-	if out.Output != final {
-		t.Errorf("output = %q, want %q", out.Output, final)
+	var toolErr *retryableToolErr
+	if !errors.As(err, &toolErr) || provider.calls != 1 || len(transcriptToolResults(out.Messages)) != 1 {
+		t.Fatalf("result=%+v err=%v", out, err)
 	}
 	if got := tool.calls.Load(); got != 1 {
 		t.Errorf("Execute called %d times, want 1 (loop must not retry tools)", got)
@@ -165,9 +164,9 @@ func TestParallelToolBatchRecordsEveryOutcome(t *testing.T) {
 		close(done)
 		return "completed", nil
 	}))
-	agent.RegisterTool(Func("recover", "returns a recoverable error", func(_ context.Context, _ struct{}) (string, error) {
+	agent.RegisterTool(FuncResult("recover", "returns a recoverable error", func(_ context.Context, _ struct{}) (ToolResult, error) {
 		close(recovered)
-		return "", errors.New("recoverable failure")
+		return ErrorResult("recoverable failure"), nil
 	}))
 
 	res, err := agent.Run(context.Background(), "go")
@@ -199,10 +198,10 @@ func TestParallelToolBatchRecordsEveryOutcome(t *testing.T) {
 	if got := (Message{Blocks: byID["r1"].Content}).Text(); got != "recoverable failure" || !byID["r1"].IsError {
 		t.Errorf("recoverable result = %q, IsError=%v", got, byID["r1"].IsError)
 	}
-	if got := (Message{Blocks: byID["f1"].Content}).Text(); got != "aborted: approval exploded" || !byID["f1"].IsError {
+	if got := (Message{Blocks: byID["f1"].Content}).Text(); got != "aborted: tool execution failed" || !byID["f1"].IsError {
 		t.Errorf("fatal result = %q, IsError=%v", got, byID["f1"].IsError)
 	}
-	if got := (Message{Blocks: byID["b1"].Content}).Text(); got != "canceled: tool batch aborted: approval exploded" || !byID["b1"].IsError {
+	if got := (Message{Blocks: byID["b1"].Content}).Text(); got != "canceled: tool batch aborted" || !byID["b1"].IsError {
 		t.Errorf("canceled result = %q, IsError=%v", got, byID["b1"].IsError)
 	}
 }

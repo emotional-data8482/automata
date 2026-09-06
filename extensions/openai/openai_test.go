@@ -47,11 +47,11 @@ func TestInvokeRequestShape(t *testing.T) {
 			core.AssistantMessage(core.ToolUseBlock{ID: "c1", Name: "search", Input: []byte(`{"q":"x"}`)}),
 			core.ToolResultMessage("c1", "result-text", false),
 		},
-		Tools: []core.Tool{core.Func("search", "search the web", func(_ context.Context, _ struct {
+		Tools: []core.ToolDefinition{core.Func("search", "search the web", func(_ context.Context, _ struct {
 			Q string `json:"q"`
 		}) (string, error) {
 			return "", nil
-		})},
+		}).Definition()},
 		Options: core.CallOptions{Temperature: &temp, MaxTokens: 256, StopSequences: []string{"STOP"}},
 	}
 	resp, err := p.Invoke(context.Background(), req)

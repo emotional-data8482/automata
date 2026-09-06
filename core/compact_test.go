@@ -39,7 +39,8 @@ func TestCompactorBelowThresholdIsNoOp(t *testing.T) {
 	hook := Compactor(sum, CompactorConfig{TriggerTokens: 1_000_000, KeepRecent: 2})
 
 	msgs := []Message{SystemMessage("sys"), UserMessage("hi"), asstText("hello")}
-	out, _, err := hook(context.Background(), msgs, nil)
+	req, err := hook(context.Background(), Request{Messages: msgs})
+	out := req.Messages
 	if err != nil {
 		t.Fatalf("hook: %v", err)
 	}
@@ -67,7 +68,8 @@ func TestCompactorSummarizesOlderTurns(t *testing.T) {
 		UserMessage("q3"),
 		asstText("a3"),
 	}
-	out, _, err := hook(context.Background(), msgs, nil)
+	req, err := hook(context.Background(), Request{Messages: msgs})
+	out := req.Messages
 	if err != nil {
 		t.Fatalf("hook: %v", err)
 	}
@@ -117,7 +119,8 @@ func TestCompactorNeverSplitsToolPair(t *testing.T) {
 		AssistantMessage(toolUse("t1", "search", "{}")),
 		ToolResultMessage("t1", "found", false), // KeepRecent=1 would start the suffix here — a split
 	}
-	out, _, err := hook(context.Background(), msgs, nil)
+	req, err := hook(context.Background(), Request{Messages: msgs})
+	out := req.Messages
 	if err != nil {
 		t.Fatalf("hook: %v", err)
 	}
@@ -149,12 +152,12 @@ func TestCompactorMemoizesSummary(t *testing.T) {
 		asstText("a2"),
 	}
 	// First call summarizes.
-	if _, _, err := hook(context.Background(), base, nil); err != nil {
+	if _, err := hook(context.Background(), Request{Messages: base}); err != nil {
 		t.Fatalf("hook 1: %v", err)
 	}
 	// A couple more turns accrue, still within MinRecompute.
 	grown := append(append([]Message(nil), base...), UserMessage("q3"), asstText("a3"))
-	if _, _, err := hook(context.Background(), grown, nil); err != nil {
+	if _, err := hook(context.Background(), Request{Messages: grown}); err != nil {
 		t.Fatalf("hook 2: %v", err)
 	}
 	if sum.count() != 1 {
@@ -180,7 +183,7 @@ func TestCompactorConcurrentSafe(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if _, _, err := hook(context.Background(), msgs, nil); err != nil {
+			if _, err := hook(context.Background(), Request{Messages: msgs}); err != nil {
 				t.Errorf("hook: %v", err)
 			}
 		}()

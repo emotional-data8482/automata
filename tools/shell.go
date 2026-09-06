@@ -48,7 +48,7 @@ func Shell(cfg ShellConfig) core.Tool {
 		timeout = 30 * time.Second
 	}
 
-	return core.Func("shell",
+	return domainTool("shell",
 		"Run an allow-listed program with arguments and return its combined output. No shell features (pipes, globs, variables) are available.",
 		func(ctx context.Context, p shellParams) (string, error) {
 			if !allowed[p.Command] {

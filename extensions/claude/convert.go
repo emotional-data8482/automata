@@ -11,39 +11,16 @@ import (
 	"github.com/emotional-data8482/automata/core"
 )
 
-// core's buildSchema (core/tools.go) emits this exact shape.
-type coreToolSchema struct {
-	Name        string `json:"name"`
-	Description string `json:"description"`
-	Parameters  struct {
-		Type       string         `json:"type"`
-		Properties map[string]any `json:"properties"`
-		Required   []string       `json:"required"`
-	} `json:"parameters"`
-}
-
-func convertTools(tools []core.Tool) []anthropic.ToolUnionParam {
+// convertTools preserves the complete root schema, including provider-supported
+// keywords outside core's structural validation subset.
+func convertTools(tools []core.ToolDefinition) []anthropic.ToolUnionParam {
 	out := make([]anthropic.ToolUnionParam, 0, len(tools))
 	for _, t := range tools {
-		var s coreToolSchema
-		if err := json.Unmarshal(t.Schema(), &s); err != nil {
-			// Schema came from core's own marshaller; a parse failure means the
-			// tool is malformed. Fall back to name + empty schema so the request
-			// doesn't 400 on a missing name.
-			s.Name = t.Name()
-		}
-		if s.Name == "" {
-			s.Name = t.Name()
-		}
-		tp := anthropic.ToolParam{
-			Name: s.Name,
-			InputSchema: anthropic.ToolInputSchemaParam{
-				Properties: s.Parameters.Properties,
-				Required:   s.Parameters.Required,
-			},
-		}
-		if s.Description != "" {
-			tp.Description = anthropic.String(s.Description)
+		var schema anthropic.ToolInputSchemaParam
+		_ = json.Unmarshal(t.InputSchema, &schema)
+		tp := anthropic.ToolParam{Name: t.Name, InputSchema: schema}
+		if t.Description != "" {
+			tp.Description = anthropic.String(t.Description)
 		}
 		out = append(out, anthropic.ToolUnionParam{OfTool: &tp})
 	}

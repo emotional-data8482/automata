@@ -306,7 +306,7 @@ func TestRunStreamToolResultCarriesError(t *testing.T) {
 			e := ev
 			result = &e
 		}
-	}); err != nil {
+	}); err == nil || !strings.Contains(err.Error(), "kaboom") {
 		t.Fatalf("RunStream: %v", err)
 	}
 
@@ -318,8 +318,8 @@ func TestRunStreamToolResultCarriesError(t *testing.T) {
 	}
 	// The core result is the raw error text (no "error: " prefix — that's the
 	// provider's job now), and IsError is set.
-	if result.Result != "kaboom" {
-		t.Errorf("result.Result = %q, want %q", result.Result, "kaboom")
+	if result.Result != "aborted: tool execution failed" {
+		t.Errorf("result.Result = %q, want %q", result.Result, "aborted: tool execution failed")
 	}
 	if !result.IsError {
 		t.Error("result.IsError = false, want true")

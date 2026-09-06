@@ -116,9 +116,8 @@ func TestAsToolFuncInvalidArgs(t *testing.T) {
 	}
 }
 
-// TestAsToolFuncEmptyArgsRenderZero pins parity with Func: "", "null" and "{}"
-// render the zero value of P instead of failing.
-func TestAsToolFuncEmptyArgsRenderZero(t *testing.T) {
+// Missing required arguments are rejected before the renderer or child runs.
+func TestAsToolFuncMissingRequiredArgs(t *testing.T) {
 	subProvider := &capturingProvider{turns: []Message{asstText("done")}}
 	sub := New(subProvider)
 
@@ -132,8 +131,8 @@ func TestAsToolFuncEmptyArgsRenderZero(t *testing.T) {
 	if _, err := orch.Run(context.Background(), "go"); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if got, want := subProvider.lastUserMessage(t), renderResearch(researchArgs{}); got != want {
-		t.Errorf("sub-agent task = %q, want zero-value render %q", got, want)
+	if subProvider.calls != 0 {
+		t.Error("child executed with missing required arguments")
 	}
 }
 
@@ -143,26 +142,22 @@ func TestAsToolFuncSchemaFromP(t *testing.T) {
 	tool := AsToolFunc(New(&scriptedProvider{}), "researcher", "delegate research", renderResearch)
 
 	var schema struct {
-		Name        string `json:"name"`
-		Description string `json:"description"`
-		Parameters  struct {
-			Properties map[string]json.RawMessage `json:"properties"`
-			Required   []string                   `json:"required"`
-		} `json:"parameters"`
+		Properties map[string]json.RawMessage `json:"properties"`
+		Required   []string                   `json:"required"`
 	}
-	if err := json.Unmarshal(tool.Schema(), &schema); err != nil {
+	if err := json.Unmarshal(tool.Definition().InputSchema, &schema); err != nil {
 		t.Fatalf("unmarshal schema: %v", err)
 	}
-	if schema.Name != "researcher" || schema.Description != "delegate research" {
-		t.Errorf("schema name/description = %q/%q", schema.Name, schema.Description)
+	if tool.Definition().Name != "researcher" || tool.Definition().Description != "delegate research" {
+		t.Errorf("schema name/description = %q/%q", tool.Definition().Name, tool.Definition().Description)
 	}
 	for _, prop := range []string{"topic", "questions"} {
-		if _, ok := schema.Parameters.Properties[prop]; !ok {
-			t.Errorf("schema missing property %q (have %v)", prop, schema.Parameters.Properties)
+		if _, ok := schema.Properties[prop]; !ok {
+			t.Errorf("schema missing property %q (have %v)", prop, schema.Properties)
 		}
 	}
-	if len(schema.Parameters.Required) != 1 || schema.Parameters.Required[0] != "topic" {
-		t.Errorf("required = %v, want [topic]", schema.Parameters.Required)
+	if len(schema.Required) != 1 || schema.Required[0] != "topic" {
+		t.Errorf("required = %v, want [topic]", schema.Required)
 	}
 }
 
