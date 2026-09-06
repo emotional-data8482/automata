@@ -1,0 +1,4 @@
+interface:
+  display_name: "Automata Maintainer"
+  short_description: "Change the Automata Go runtime and modules safely"
+  default_prompt: "Use $automata-maintainer to implement this change in the Automata repository."
