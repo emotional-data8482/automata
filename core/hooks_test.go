@@ -25,7 +25,7 @@ func TestPostRunHooksRunInOrderAndJoinErrors(t *testing.T) {
 	type contextKey string
 	const key contextKey = "checkpoint"
 	ctx, cancel := context.WithCancel(context.WithValue(context.Background(), key, "value"))
-	cancel()
+	defer cancel()
 
 	var order []int
 	var seenResults []RunResult
@@ -49,7 +49,7 @@ func TestPostRunHooksRunInOrderAndJoinErrors(t *testing.T) {
 		})
 	}
 
-	result, err := New(&scriptedProvider{turns: []Message{asstText("done")}}).Run(
+	result, err := testAgent(&scriptedProvider{turns: []Message{asstText("done")}}).Run(
 		ctx,
 		"go",
 		makeHook(1, firstErr),
@@ -76,7 +76,7 @@ func TestSessionPostRunHookSeesCommittedMaxStepResult(t *testing.T) {
 	provider := &optionsProvider{turns: []Message{
 		withUsage(asstTool("c1", "echo", `{}`), &Usage{InputTokens: 7, OutputTokens: 3}),
 	}}
-	agent := New(provider).WithMaxSteps(1)
+	agent := testAgent(provider).WithMaxSteps(1)
 	agent.RegisterTool(Func("echo", "echoes", func(context.Context, echoArgs) (string, error) {
 		return "ok", nil
 	}))
@@ -144,7 +144,7 @@ func TestPostRunHookRunsAfterProviderAndCancellationFailures(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			called := false
-			result, err := New(tt.provider).Run(tt.ctx(), "go", WithPostRunHook(
+			result, err := testAgent(tt.provider).Run(tt.ctx(), "go", WithPostRunHook(
 				func(hookCtx context.Context, hookResult RunResult, runErr error) error {
 					called = true
 					if !errors.Is(runErr, tt.wantErr) {
@@ -174,7 +174,7 @@ func TestPostRunHookRunsAfterProviderAndCancellationFailures(t *testing.T) {
 
 func TestSessionRunStreamInvokesPostRunHookAfterCommit(t *testing.T) {
 	provider := &scriptedStreamProvider{turns: [][]StreamChunk{textChunks("done")}}
-	session := New(provider).NewSession()
+	session := testAgent(provider).NewSession()
 	called := false
 
 	result, err := session.RunStream(context.Background(), "go", nil, WithPostRunHook(

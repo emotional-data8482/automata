@@ -24,7 +24,7 @@ func (p *capturingProvider) Invoke(_ context.Context, req Request) (Response, er
 	}
 	m := p.turns[p.calls]
 	p.calls++
-	return Response{Message: m}, nil
+	return fixtureResponse(m), nil
 }
 
 // lastUserMessage returns the content of the most recent role:"user" message
@@ -55,10 +55,10 @@ func renderResearch(p researchArgs) string {
 // natural-language task, not the model's raw JSON arguments.
 func TestAsToolFuncRendersTask(t *testing.T) {
 	subProvider := &capturingProvider{turns: []Message{asstText("notes")}}
-	sub := New(subProvider)
+	sub := testAgent(subProvider)
 
 	final := "final"
-	orch := New(&scriptedProvider{turns: []Message{
+	orch := testAgent(&scriptedProvider{turns: []Message{
 		asstTool("r1", "researcher", `{"topic":"GLP-1","questions":["cost","supply"]}`),
 		asstText(final),
 	}})
@@ -83,11 +83,11 @@ func TestAsToolFuncRendersTask(t *testing.T) {
 // sub-agent is never invoked.
 func TestAsToolFuncInvalidArgs(t *testing.T) {
 	subProvider := &capturingProvider{}
-	sub := New(subProvider)
+	sub := testAgent(subProvider)
 
 	final := "recovered"
-	orch := New(&scriptedProvider{turns: []Message{
-		asstTool("r1", "researcher", `{"topic":`),
+	orch := testAgent(&scriptedProvider{turns: []Message{
+		asstTool("r1", "researcher", `{"topic":42}`),
 		asstText(final),
 	}})
 	orch.RegisterTool(AsToolFunc(sub, "researcher", "delegate research", renderResearch))
@@ -119,10 +119,10 @@ func TestAsToolFuncInvalidArgs(t *testing.T) {
 // Missing required arguments are rejected before the renderer or child runs.
 func TestAsToolFuncMissingRequiredArgs(t *testing.T) {
 	subProvider := &capturingProvider{turns: []Message{asstText("done")}}
-	sub := New(subProvider)
+	sub := testAgent(subProvider)
 
 	final := "final"
-	orch := New(&scriptedProvider{turns: []Message{
+	orch := testAgent(&scriptedProvider{turns: []Message{
 		asstTool("r1", "researcher", "{}"),
 		asstText(final),
 	}})
@@ -139,7 +139,7 @@ func TestAsToolFuncMissingRequiredArgs(t *testing.T) {
 // TestAsToolFuncSchemaFromP pins that the schema advertised to the model is
 // still derived from P, exactly as with AsTool.
 func TestAsToolFuncSchemaFromP(t *testing.T) {
-	tool := AsToolFunc(New(&scriptedProvider{}), "researcher", "delegate research", renderResearch)
+	tool := AsToolFunc(testAgent(&scriptedProvider{}), "researcher", "delegate research", renderResearch)
 
 	var schema struct {
 		Properties map[string]json.RawMessage `json:"properties"`
@@ -166,10 +166,10 @@ func TestAsToolFuncSchemaFromP(t *testing.T) {
 func TestAsToolFuncStreamsTagged(t *testing.T) {
 	subText := "sub result"
 	subProvider := &recordingProvider{turns: []Message{asstText(subText)}}
-	sub := New(subProvider)
+	sub := testAgent(subProvider)
 
 	final := "done"
-	orch := New(&recordingProvider{turns: []Message{
+	orch := testAgent(&recordingProvider{turns: []Message{
 		asstTool("r1", "researcher", `{"topic":"x"}`),
 		asstText(final),
 	}})

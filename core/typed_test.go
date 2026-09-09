@@ -20,7 +20,7 @@ func TestRunTypedHappyPath(t *testing.T) {
 	provider := &scriptedProvider{turns: []Message{
 		asstTool("s1", structuredOutputToolName, `{"name":"Ada","age":36}`),
 	}}
-	agent := New(provider)
+	agent := testAgent(provider)
 
 	got, res, err := RunTyped[personResult](context.Background(), agent, "who?")
 	if err != nil {
@@ -38,7 +38,7 @@ func TestRunTypedHappyPath(t *testing.T) {
 // derived from T and advertised to the model.
 func TestRunTypedInjectsSchemaTool(t *testing.T) {
 	capt := &toolCapturingProvider{reply: asstTool("s1", structuredOutputToolName, `{"name":"x","age":1}`)}
-	agent := New(capt)
+	agent := testAgent(capt)
 
 	if _, _, err := RunTyped[personResult](context.Background(), agent, "go"); err != nil {
 		t.Fatalf("RunTyped: %v", err)
@@ -65,7 +65,7 @@ func TestRunTypedForcesToolOnTextFallback(t *testing.T) {
 			asstTool("s2", structuredOutputToolName, `{"name":"Ada","age":36}`), // forced turn
 		},
 	}
-	agent := New(capt).WithDefaultCallOptions(CallOptions{ThinkingBudget: 2048})
+	agent := testAgent(capt).WithDefaultCallOptions(CallOptions{ThinkingBudget: 2048})
 
 	got, _, err := RunTyped[personResult](context.Background(), agent, "who?")
 	if err != nil {
@@ -96,7 +96,7 @@ func TestRunTypedDecodeErrorCorrects(t *testing.T) {
 		asstTool("s1", structuredOutputToolName, `{"name":"x","age":"not-a-number"}`),
 		asstTool("s2", structuredOutputToolName, `{"name":"x","age":3}`),
 	}}
-	agent := New(provider)
+	agent := testAgent(provider)
 
 	got, _, err := RunTyped[personResult](context.Background(), agent, "go")
 	if err != nil {
@@ -112,9 +112,9 @@ func TestRunTypedDecodeErrorCorrects(t *testing.T) {
 func TestRunTypedDecodeErrorBudgetExhausted(t *testing.T) {
 	provider := &scriptedProvider{turns: []Message{
 		asstTool("s1", structuredOutputToolName, `{"name":"x","age":"not-a-number"}`),
-		asstTool("s2", structuredOutputToolName, `{"name":"x","age":}`), // still malformed
+		asstTool("s2", structuredOutputToolName, `{"name":"x","age":"still-not-a-number"}`), // still wrong type
 	}}
-	agent := New(provider)
+	agent := testAgent(provider)
 
 	_, res, err := RunTyped[personResult](context.Background(), agent, "go")
 	if !errors.Is(err, ErrInvalidStructuredOutput) {
@@ -139,7 +139,7 @@ func TestRunTypedMissingRequiredFieldRejected(t *testing.T) {
 		asstTool("s1", structuredOutputToolName, `{"name":"Ada"}`), // age missing
 		asstTool("s2", structuredOutputToolName, `{"name":"Ada"}`), // still missing
 	}}
-	agent := New(provider)
+	agent := testAgent(provider)
 
 	got, res, err := RunTyped[personResult](context.Background(), agent, "go")
 	if !errors.Is(err, ErrInvalidStructuredOutput) {
@@ -173,7 +173,7 @@ func TestRunTypedWrongTypeRejected(t *testing.T) {
 		asstTool("s1", structuredOutputToolName, `{"name":42,"age":36}`),
 		asstTool("s2", structuredOutputToolName, `{"name":"Ada","age":36}`),
 	}}
-	agent := New(provider)
+	agent := testAgent(provider)
 
 	got, _, err := RunTyped[personResult](context.Background(), agent, "go")
 	if err != nil {
@@ -191,7 +191,7 @@ func TestRunTypedCorrectionPromptListsViolations(t *testing.T) {
 		asstTool("s1", structuredOutputToolName, `{"name":"Ada"}`),
 		asstTool("s2", structuredOutputToolName, `{"name":"Ada","age":36}`),
 	}}
-	agent := New(provider)
+	agent := testAgent(provider)
 
 	if _, _, err := RunTyped[personResult](context.Background(), agent, "go"); err != nil {
 		t.Fatalf("RunTyped: %v", err)
@@ -219,7 +219,7 @@ func TestRunTypedCorrectionBudgetZeroDisables(t *testing.T) {
 	provider := &scriptedProvider{turns: []Message{
 		asstTool("s1", structuredOutputToolName, `{"name":"Ada"}`),
 	}}
-	agent := New(provider)
+	agent := testAgent(provider)
 
 	_, _, err := RunTyped[personResult](context.Background(), agent, "go", WithMaxCorrectionTurns(0))
 	if !errors.Is(err, ErrInvalidStructuredOutput) {
@@ -238,7 +238,7 @@ func TestRunTypedCorrectionBudgetTwo(t *testing.T) {
 		asstTool("s2", structuredOutputToolName, `{"age":36}`),
 		asstTool("s3", structuredOutputToolName, `{"name":"Grace","age":37}`),
 	}}
-	agent := New(provider)
+	agent := testAgent(provider)
 
 	got, _, err := RunTyped[personResult](context.Background(), agent, "go", WithMaxCorrectionTurns(2))
 	if err != nil {
@@ -257,7 +257,7 @@ func TestRunTypedCorrectionBudgetTwo(t *testing.T) {
 func TestRunTypedCorrectionProviderErrorPropagates(t *testing.T) {
 	providerErr := errors.New("provider exploded")
 	provider := &failOnSecondProvider{first: asstTool("s1", structuredOutputToolName, `{"name":"Ada"}`), err: providerErr}
-	agent := New(provider)
+	agent := testAgent(provider)
 
 	_, _, err := RunTyped[personResult](context.Background(), agent, "go")
 	if !errors.Is(err, providerErr) {
@@ -275,9 +275,9 @@ func TestRunSessionTypedCorrectionCheckpointsEachRun(t *testing.T) {
 		asstTool("s1", structuredOutputToolName, `{"name":"Ada"}`),
 		asstTool("s2", structuredOutputToolName, `{"name":"Ada","age":36}`),
 	}}
-	session := New(provider).NewSession()
+	session := testAgent(provider).NewSession()
 	var lengths []int
-	hook := WithPostRunHook(func(_ context.Context, result RunResult, runErr error) error {
+	hook := WithCheckpointHook(func(_ context.Context, result Checkpoint, runErr error) error {
 		if runErr != nil {
 			t.Errorf("hook runErr = %v, want nil", runErr)
 		}
@@ -308,7 +308,7 @@ func TestRunSessionTypedCorrectionTranscriptResumable(t *testing.T) {
 		asstTool("s2", structuredOutputToolName, `{"name":"Ada","age":36}`),
 		asstTool("s3", structuredOutputToolName, `{"name":"Grace","age":37}`),
 	}}
-	agent := New(provider)
+	agent := testAgent(provider)
 	session := agent.NewSession()
 	if _, _, err := RunSessionTyped[personResult](context.Background(), session, "first"); err != nil {
 		t.Fatalf("first: %v", err)
@@ -322,7 +322,7 @@ func TestRunSessionTypedCorrectionTranscriptResumable(t *testing.T) {
 	if err := json.Unmarshal(blob, &transcript); err != nil {
 		t.Fatalf("unmarshal transcript: %v", err)
 	}
-	resumed := agent.ResumeSession(transcript)
+	resumed := agent.testResumeSession(transcript)
 	got, _, err := RunSessionTyped[personResult](context.Background(), resumed, "second")
 	if err != nil {
 		t.Fatalf("resumed RunSessionTyped: %v", err)
@@ -391,7 +391,7 @@ func TestRunTypedProseFencedJSON(t *testing.T) {
 	provider := &scriptedProvider{turns: []Message{
 		asstText("Here is the answer:\n```json\n{\"name\":\"Ada\",\"age\":36}\n```"),
 	}}
-	agent := New(provider)
+	agent := testAgent(provider)
 
 	got, _, err := RunTyped[personResult](context.Background(), agent, "who?")
 	if err != nil {
@@ -410,7 +410,7 @@ func TestRunTypedProseBareObject(t *testing.T) {
 	provider := &scriptedProvider{turns: []Message{
 		asstText(`The answer is {"name": "Grace", "age": 37} — hope that helps.`),
 	}}
-	agent := New(provider)
+	agent := testAgent(provider)
 
 	got, _, err := RunTyped[personResult](context.Background(), agent, "who?")
 	if err != nil {
@@ -431,7 +431,7 @@ func TestRunTypedProseWrongShapeCorrects(t *testing.T) {
 		asstText(`{"name":"Ada"}`), // missing age
 		asstTool("s2", structuredOutputToolName, `{"name":"Ada","age":36}`),
 	}}
-	agent := New(provider)
+	agent := testAgent(provider)
 
 	got, _, err := RunTyped[personResult](context.Background(), agent, "who?")
 	if err != nil {
@@ -452,12 +452,12 @@ func TestRunTypedProseWrongShapeCorrects(t *testing.T) {
 // of silently shadowing.
 func TestRunTypedToolNameCollisionFailsFast(t *testing.T) {
 	provider := &scriptedProvider{turns: []Message{asstText("unused")}}
-	agent := New(provider)
+	agent := testAgent(provider)
 	agent.RegisterTool(Func(structuredOutputToolName, "user tool with the same name",
 		func(context.Context, struct{}) (string, error) { return "", nil }))
 
 	_, _, err := RunTyped[personResult](context.Background(), agent, "go")
-	if err == nil || !strings.Contains(err.Error(), "collides") {
+	if err == nil || !strings.Contains(err.Error(), "reserved") {
 		t.Fatalf("err = %v, want explicit collision error", err)
 	}
 	if provider.calls != 0 {
@@ -476,7 +476,7 @@ func TestStructuredOutputNameIsNamespaced(t *testing.T) {
 	provider := &scriptedProvider{turns: []Message{
 		asstTool("s1", structuredOutputToolName, `{"name":"Ada","age":36}`),
 	}}
-	agent := New(provider)
+	agent := testAgent(provider)
 	agent.RegisterTool(Func("structured_output", "user tool",
 		func(context.Context, struct{}) (string, error) { return "", nil }))
 	if _, _, err := RunTyped[personResult](context.Background(), agent, "go"); err != nil {
@@ -502,7 +502,7 @@ func (p *nativeCapturingProvider) Invoke(_ context.Context, req Request) (Respon
 	p.options = append(p.options, req.Options)
 	p.toolCounts = append(p.toolCounts, len(req.Tools))
 	p.calls++
-	return Response{Message: p.turns[p.calls-1]}, nil
+	return fixtureResponse(p.turns[p.calls-1]), nil
 }
 
 func (p *nativeCapturingProvider) SupportsNativeStructuredOutput() bool { return true }
@@ -514,7 +514,7 @@ func TestRunTypedNativeModeSupportedProvider(t *testing.T) {
 	provider := &nativeCapturingProvider{turns: []Message{
 		asstText(`{"name":"Ada","age":36}`),
 	}}
-	agent := New(provider)
+	agent := testAgent(provider)
 
 	got, _, err := RunTyped[personResult](context.Background(), agent, "who?", WithNativeStructuredOutput())
 	if err != nil {
@@ -542,7 +542,7 @@ func TestRunTypedNativeModeInvalidPayloadFallsBack(t *testing.T) {
 		asstText("I cannot produce that."), // no JSON
 		asstTool("s2", structuredOutputToolName, `{"name":"Ada","age":36}`),
 	}}
-	agent := New(provider)
+	agent := testAgent(provider)
 
 	got, _, err := RunTyped[personResult](context.Background(), agent, "who?", WithNativeStructuredOutput())
 	if err != nil {
@@ -562,7 +562,7 @@ func TestRunTypedNativeModeUnsupportedProviderUsesHiddenTool(t *testing.T) {
 	provider := &scriptedProvider{turns: []Message{
 		asstTool("s1", structuredOutputToolName, `{"name":"Ada","age":36}`),
 	}}
-	agent := New(provider)
+	agent := testAgent(provider)
 
 	got, _, err := RunTyped[personResult](context.Background(), agent, "go", WithNativeStructuredOutput())
 	if err != nil {
@@ -573,7 +573,7 @@ func TestRunTypedNativeModeUnsupportedProviderUsesHiddenTool(t *testing.T) {
 	}
 	// The hidden tool was injected (scriptedProvider has no capability method).
 	capt := &toolCapturingProvider{reply: asstTool("s1", structuredOutputToolName, `{"name":"x","age":1}`)}
-	agent2 := New(capt)
+	agent2 := testAgent(capt)
 	if _, _, err := RunTyped[personResult](context.Background(), agent2, "go", WithNativeStructuredOutput()); err != nil {
 		t.Fatalf("RunTyped: %v", err)
 	}
@@ -592,7 +592,7 @@ type failOnSecondProvider struct {
 func (p *failOnSecondProvider) Invoke(_ context.Context, _ Request) (Response, error) {
 	p.calls++
 	if p.calls == 1 {
-		return Response{Message: p.first}, nil
+		return fixtureResponse(p.first), nil
 	}
 	return Response{}, p.err
 }
@@ -604,7 +604,7 @@ func TestRunTypedCoexistsWithRealTools(t *testing.T) {
 		asstTool("c1", "lookup", `{"q":"Ada"}`),
 		asstTool("s1", structuredOutputToolName, `{"name":"Ada","age":36}`),
 	}}
-	agent := New(provider)
+	agent := testAgent(provider)
 	agent.RegisterTool(Func("lookup", "look up a person", func(_ context.Context, _ struct {
 		Q string `json:"q"`
 	}) (string, error) {
@@ -627,7 +627,7 @@ func TestRunSessionTypedContinuesConversation(t *testing.T) {
 		asstTool("s1", structuredOutputToolName, `{"name":"Ada","age":36}`),
 		asstTool("s2", structuredOutputToolName, `{"name":"Grace","age":37}`),
 	}}
-	agent := New(provider).WithSystemPrompt("Remember prior decisions.")
+	agent := testAgent(provider).WithSystemPrompt("Remember prior decisions.")
 	session := agent.NewSession()
 
 	first, _, err := RunSessionTyped[personResult](context.Background(), session, "first")
@@ -667,7 +667,7 @@ func TestRunSessionTypedResumeJSONRoundTrip(t *testing.T) {
 		asstTool("s1", structuredOutputToolName, `{"name":"Ada","age":36}`),
 		asstTool("s2", structuredOutputToolName, `{"name":"Grace","age":37}`),
 	}}
-	agent := New(provider).WithSystemPrompt("sys")
+	agent := testAgent(provider).WithSystemPrompt("sys")
 	session := agent.NewSession()
 	if _, _, err := RunSessionTyped[personResult](context.Background(), session, "first"); err != nil {
 		t.Fatalf("first RunSessionTyped: %v", err)
@@ -682,7 +682,7 @@ func TestRunSessionTypedResumeJSONRoundTrip(t *testing.T) {
 		t.Fatalf("unmarshal transcript: %v", err)
 	}
 
-	resumed := agent.ResumeSession(transcript)
+	resumed := agent.testResumeSession(transcript)
 	got, _, err := RunSessionTyped[personResult](context.Background(), resumed, "second")
 	if err != nil {
 		t.Fatalf("resumed RunSessionTyped: %v", err)
@@ -709,9 +709,9 @@ func TestRunSessionTypedFallbackCheckpointsEachRun(t *testing.T) {
 		asstText("Ada is 36 years old."),
 		asstTool("s2", structuredOutputToolName, `{"name":"Ada","age":36}`),
 	}}
-	session := New(provider).NewSession()
+	session := testAgent(provider).NewSession()
 	var transcriptLengths []int
-	hook := WithPostRunHook(func(_ context.Context, result RunResult, runErr error) error {
+	hook := WithCheckpointHook(func(_ context.Context, result Checkpoint, runErr error) error {
 		if runErr != nil {
 			t.Errorf("hook runErr = %v, want nil", runErr)
 		}
@@ -737,10 +737,10 @@ func TestRunSessionTypedStopsWhenFirstCheckpointFails(t *testing.T) {
 		asstText("Ada is 36 years old."),
 		asstTool("s2", structuredOutputToolName, `{"name":"Ada","age":36}`),
 	}}
-	session := New(provider).NewSession()
+	session := testAgent(provider).NewSession()
 
 	_, result, err := RunSessionTyped[personResult](context.Background(), session, "who?",
-		WithPostRunHook(func(context.Context, RunResult, error) error {
+		WithCheckpointHook(func(context.Context, Checkpoint, error) error {
 			return checkpointErr
 		}),
 	)
@@ -759,7 +759,7 @@ func TestRunSessionTypedMaxStepsReturnsPartialResult(t *testing.T) {
 	provider := &optionsProvider{turns: []Message{
 		withUsage(asstTool("c1", "lookup", `{}`), &Usage{InputTokens: 4, OutputTokens: 2}),
 	}}
-	agent := New(provider).WithMaxSteps(1)
+	agent := testAgent(provider).WithMaxSteps(1)
 	agent.RegisterTool(Func("lookup", "looks up", func(context.Context, struct{}) (string, error) {
 		return "found", nil
 	}))
@@ -800,7 +800,7 @@ func (p *toolCapturingProvider) Invoke(_ context.Context, req Request) (Response
 		p.toolNames[tl.Name] = string(tl.InputSchema)
 	}
 	p.calls++
-	return Response{Message: p.reply}, nil
+	return fixtureResponse(p.reply), nil
 }
 
 // forcingProvider replies with a scripted sequence and records the CallOptions
@@ -815,5 +815,5 @@ func (p *forcingProvider) Invoke(_ context.Context, req Request) (Response, erro
 	p.seen = append(p.seen, req.Options)
 	m := p.replies[min(p.calls, len(p.replies)-1)]
 	p.calls++
-	return Response{Message: m}, nil
+	return fixtureResponse(m), nil
 }

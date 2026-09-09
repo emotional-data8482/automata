@@ -41,7 +41,7 @@ func TestToolExecuteNotRetriedByLoop(t *testing.T) {
 	}}
 
 	tool := &countingTool{}
-	agent := New(provider)
+	agent := testAgent(provider)
 	agent.RegisterTool(tool)
 
 	out, err := agent.Run(context.Background(), "go")
@@ -65,7 +65,7 @@ func TestUnknownToolIsRecoverable(t *testing.T) {
 		asstText(final),
 	}}
 
-	agent := New(provider)
+	agent := testAgent(provider)
 	agent.RegisterTool(Func("echo", "echoes msg", func(_ context.Context, a echoArgs) (string, error) {
 		return "echoed:" + a.Msg, nil
 	}))
@@ -140,7 +140,7 @@ func TestParallelToolBatchRecordsEveryOutcome(t *testing.T) {
 			toolUse("r1", "recover", `{}`),
 		),
 	}}
-	agent := New(provider).WithApprover(ApproverFunc(func(_ context.Context, call ToolUseBlock, _ []Message) (Decision, error) {
+	agent := testAgent(provider).WithApprover(ApproverFunc(func(_ context.Context, call ToolUseBlock, _ []Message) (Decision, error) {
 		if call.ID != "f1" {
 			return Decision{Outcome: Allow}, nil
 		}

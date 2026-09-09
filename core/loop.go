@@ -65,7 +65,7 @@ type Loop struct {
 func newLoop(a *Agent, history []Message) *Loop {
 	var messages []Message
 	if len(history) > 0 {
-		messages = append([]Message(nil), history...)
+		messages = cloneMessages(history)
 	} else if a.systemPrompt != "" {
 		messages = []Message{SystemMessage(a.systemPrompt)}
 	}
@@ -127,7 +127,12 @@ type RunResult struct {
 // [RunOption]s before the loop starts.
 type runConfig struct {
 	// options is the merged CallOptions sent on every provider turn.
-	options CallOptions
+	options         CallOptions
+	maxTurns        int
+	observers       []RunObserver
+	checkpointHooks []CheckpointHook
+	optionErr       error
+	scope           *runScope
 	// toolPolicy contains the run-scoped local execution controls. A RunOption
 	// replaces the Agent default before execution state is allocated.
 	toolPolicy ToolPolicy
@@ -162,14 +167,10 @@ func WithToolPolicy(policy ToolPolicy) RunOption {
 	return func(c *runConfig) { c.toolPolicy = snapshot.clone() }
 }
 
-// WithCallOptions overrides the agent's default [CallOptions] for one run. The
-// override is merged over the agent defaults field-by-field.
-func WithCallOptions(o CallOptions) RunOption {
-	return func(c *runConfig) { c.options = c.options.merge(o) }
-}
-
 func (l *Loop) run(ctx context.Context, task, mode string, cfg runConfig, invoke invokeFn) (RunResult, error) {
-	m := &loopMachine{loop: l, ctx: ctx, task: task, mode: mode, cfg: cfg, invoke: invoke, result: RunResult{StopReason: StopError}}
+	m := &loopMachine{loop: l, ctx: ctx, task: task, mode: mode, cfg: cfg, invoke: invoke, result: cloneRunResult(cfg.scope.result)}
+	m.result.terminalToolInput = nil
+	m.result.StopReason = StopError
 	return m.drive()
 }
 
@@ -186,13 +187,7 @@ func normalizeResponseStop(response Response, toolUses []ToolUseBlock) (StopReas
 	raw := response.RawStopReason
 
 	if reason == "" {
-		if raw != "" {
-			return StopUnknown, raw
-		}
-		if len(toolUses) > 0 {
-			return StopToolUse, ""
-		}
-		return StopEndTurn, ""
+		return StopIncomplete, raw
 	}
 
 	switch reason {
@@ -209,7 +204,7 @@ func normalizeResponseStop(response Response, toolUses []ToolUseBlock) (StopReas
 
 // snapshot returns a copy of the loop's current transcript for a RunResult.
 func (l *Loop) snapshot() []Message {
-	return append([]Message(nil), l.messages...)
+	return cloneMessages(l.messages)
 }
 
 // executeTool runs one tool call and returns (result, fatalErr). result is the
@@ -281,7 +276,7 @@ func (l *Loop) executeTool(
 		tracing.Bool("policy.rate_limited", limits.RateLimiter != nil),
 	)
 
-	decision, err := a.approver.Approve(ctx, call, messages)
+	decision, err := a.approver.Approve(ctx, cloneBlock(call).(ToolUseBlock), cloneMessages(messages))
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(err)
@@ -343,6 +338,12 @@ func (l *Loop) executeTool(
 	// carried through verbatim; string tools are wrapped with [TextResult].
 	result, executeErr := tool.executor.Execute(execCtx, append(json.RawMessage(nil), call.Input...))
 	result = normalizeResult(result)
+	result.Blocks = cloneBlocks(result.Blocks)
+	if executeErr == nil {
+		if err := validateBlock(ToolResultBlock{ToolUseID: call.ID, Content: result.Blocks}); err != nil {
+			executeErr = fmt.Errorf("invalid tool result: %w", err)
+		}
+	}
 	if policyResult, fatal, handled := l.handleToolExecutionFailure(
 		ctx, execCtx, call, limits.Timeout, "tool", executeErr, span, log,
 	); handled {

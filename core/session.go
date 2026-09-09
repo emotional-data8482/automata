@@ -27,7 +27,8 @@ import (
 //	// ... later, possibly in another process ...
 //	var transcript []core.Message
 //	_ = json.Unmarshal(blob, &transcript)
-//	session = agent.ResumeSession(transcript)
+//	session, err := agent.ResumeSession(transcript)
+//	if err != nil { /* report invalid history */ }
 //
 // Note that [Message.Meta] is excluded from JSON (it is transport-scoped) and
 // does not round-trip.
@@ -35,8 +36,7 @@ import (
 // Concurrency: a Session is safe for concurrent use. Runs are serialized — a
 // Run, RunStream, or [RunSessionTyped] call blocks until the previous operation
 // finishes — and Messages may be called from any goroutine (it reflects the
-// transcript as of the last completed run; for live progress, use RunStream's
-// events).
+// transcript as of the latest committed checkpoint, including during callbacks).
 type Session struct {
 	agent *Agent
 
@@ -58,11 +58,14 @@ func (a *Agent) NewSession() *Session {
 // (normally the output of [Session.Messages]). The transcript is used
 // verbatim — it already contains its system message, so the agent's system
 // prompt is not re-applied. An empty transcript behaves like [Agent.NewSession].
-func (a *Agent) ResumeSession(transcript []Message) *Session {
+func (a *Agent) ResumeSession(transcript []Message) (*Session, error) {
+	if err := validateHistory(transcript); err != nil {
+		return nil, err
+	}
 	return &Session{
 		agent:    a,
-		messages: append([]Message(nil), transcript...),
-	}
+		messages: cloneMessages(transcript),
+	}, nil
 }
 
 // Run continues the conversation with task and returns the [RunResult], like
@@ -79,10 +82,12 @@ func (s *Session) Run(ctx context.Context, task string, opts ...RunOption) (RunR
 // both their initial run and forced fallback as one conversation operation.
 func (s *Session) run(ctx context.Context, task string, opts ...RunOption) (RunResult, error) {
 	cfg := s.agent.newRunConfig(opts)
-	l := newLoop(s.agent, s.Messages())
-	out, err := s.agent.runSync(ctx, l, task, cfg)
-	s.commit(l.messages)
-	return finishRun(ctx, cfg, out, err)
+	scope, err := s.agent.beginRun(ctx, cfg, s.Messages(), s.commit, "sync")
+	if err != nil {
+		return scope.finish(scope.result, err)
+	}
+	out, err := s.runPhase(scope, task, cfg)
+	return scope.finish(out, err)
 }
 
 // RunStream continues the conversation like [Session.Run] while delivering
@@ -96,24 +101,34 @@ func (s *Session) RunStream(ctx context.Context, task string, onEvent func(Strea
 
 func (s *Session) runStream(ctx context.Context, task string, onEvent func(StreamEvent), opts ...RunOption) (RunResult, error) {
 	cfg := s.agent.newRunConfig(opts)
-	l := newLoop(s.agent, s.Messages())
-	out, err := s.agent.runStream(ctx, l, task, onEvent, cfg)
-	s.commit(l.messages)
-	return finishRun(ctx, cfg, out, err)
+	scope, err := s.agent.beginRun(ctx, cfg, s.Messages(), s.commit, "stream")
+	if err != nil {
+		return scope.finish(scope.result, err)
+	}
+	cfg.scope = scope
+	out, err := s.agent.runStream(scope.ctx, newLoop(s.agent, s.Messages()), task, onEvent, cfg)
+	return scope.finish(out, err)
 }
 
-// Messages returns a snapshot of the transcript as of the last completed run.
-// The slice is a copy; treat the messages themselves as read-only.
+// Messages returns a detached snapshot of the latest committed checkpoint.
+// Nested blocks, bytes, and usage may be changed without affecting the session.
 func (s *Session) Messages() []Message {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return append([]Message(nil), s.messages...)
+	return cloneMessages(s.messages)
 }
 
-// commit replaces the transcript with the finished loop's conversation. The
-// loop is discarded by the caller, so taking ownership of its slice is safe.
+// commit replaces the transcript at a reconciled canonical boundary.
 func (s *Session) commit(messages []Message) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.messages = messages
+	s.messages = cloneMessages(messages)
+}
+
+func (s *Session) runPhase(scope *runScope, task string, cfg runConfig) (RunResult, error) {
+	cfg.scope = scope
+	if scope.turns >= scope.config.maxTurns {
+		return scope.result, ErrMaxStepsExceeded
+	}
+	return s.agent.runSync(scope.ctx, newLoop(s.agent, s.Messages()), task, cfg)
 }

@@ -11,16 +11,8 @@ import (
 	"github.com/emotional-data8482/automata/tracing"
 )
 
-// Agent is the unified definition of an agent, whether it runs as a top-level
-// orchestrator or as a sub-agent registered on another agent via [AsTool]. It
-// holds the configuration for a run; the per-run conversation state lives in a
-// [Loop] created fresh for each Run/RunStream call.
-//
-// Concurrency: Run and RunStream are safe to call concurrently — each call
-// builds its own Loop and reads the Agent's config without mutating it. The
-// WithXxx builders and RegisterTool/RegisterFunc mutate the Agent in place and
-// are NOT safe to call concurrently with a run; configure the Agent fully
-// before starting any runs.
+// Agent holds frozen reusable configuration. Run and RunStream may be called
+// concurrently. Construct a new Agent to change its configuration.
 type Agent struct {
 	systemPrompt       string
 	tools              []Tool
@@ -33,113 +25,92 @@ type Agent struct {
 	defaultCallOptions CallOptions
 	toolPolicy         ToolPolicy
 
-	preSendHooks []PreSendHook
+	preSendHooks    []PreSendHook
+	observers       []RunObserver
+	checkpointHooks []CheckpointHook
+	postRunHooks    []PostRunHook
 }
 
-// DefaultMaxSteps is used when an Agent is constructed without calling
-// WithMaxSteps. Chosen to cover typical multi-step tool-using agents without
-// letting a runaway loop burn tokens indefinitely.
-const DefaultMaxSteps = 10
+// DefaultMaxTurns bounds a zero-config agent's public invocation.
+const DefaultMaxTurns = 10
 
-// New returns an Agent backed by the given provider with default
-// configuration: [DefaultMaxSteps] steps, the no-op tracer, the default slog
-// logger, [AllowAll] approval, and [retry.DefaultConfig].
-func New(p Provider) *Agent {
-	return &Agent{
-		provider: p,
-		tracer:   tracing.Noop,
-		log:      slog.Default(),
-		maxSteps: DefaultMaxSteps,
-		approver: AllowAll,
-		retryCfg: retry.DefaultConfig(),
+// AgentConfig is copied and validated by New. Zero MaxTurns selects
+// DefaultMaxTurns; a nil Retry selects retry.DefaultConfig. Nil Logger, Tracer,
+// and Approver select slog.Default, tracing.Noop, and AllowAll. Other zero
+// fields disable optional behavior. Dependency instances and closures are shared
+// and must support concurrent calls; their private state is not cloned.
+type AgentConfig struct {
+	SystemPrompt       string
+	Tools              []Tool
+	MaxTurns           int
+	Retry              *retry.Config
+	Tracer             tracing.Tracer
+	Logger             *slog.Logger
+	Approver           Approver
+	DefaultCallOptions CallOptions
+	ToolPolicy         ToolPolicy
+	PreSendHooks       []PreSendHook
+	Observers          []RunObserver
+	CheckpointHooks    []CheckpointHook
+	PostRunHooks       []PostRunHook
+}
+
+// New validates and freezes reusable configuration before any run is admitted.
+func New(p Provider, config AgentConfig) (*Agent, error) {
+	if nilDependency(p) {
+		return nil, fmt.Errorf("nil provider")
 	}
+	if config.MaxTurns < 0 {
+		return nil, ErrInvalidMaxSteps
+	}
+	if config.MaxTurns == 0 {
+		config.MaxTurns = DefaultMaxTurns
+	}
+	if err := config.ToolPolicy.validate(); err != nil {
+		return nil, err
+	}
+	if err := validateCallOptions(config.DefaultCallOptions); err != nil {
+		return nil, err
+	}
+	frozen, err := freezeTools(config.Tools, "")
+	if err != nil {
+		return nil, err
+	}
+	a := &Agent{provider: p, systemPrompt: config.SystemPrompt, tools: frozen,
+		maxSteps: config.MaxTurns, retryCfg: retry.DefaultConfig(), tracer: config.Tracer,
+		log: config.Logger, approver: config.Approver,
+		defaultCallOptions: cloneCallOptions(config.DefaultCallOptions), toolPolicy: config.ToolPolicy.clone(),
+		preSendHooks:    append([]PreSendHook(nil), config.PreSendHooks...),
+		observers:       append([]RunObserver(nil), config.Observers...),
+		checkpointHooks: append([]CheckpointHook(nil), config.CheckpointHooks...),
+		postRunHooks:    append([]PostRunHook(nil), config.PostRunHooks...)}
+	if config.Retry != nil {
+		a.retryCfg = *config.Retry
+	}
+	if a.retryCfg.MaxAttempts < 0 || a.retryCfg.InitialDelay < 0 || a.retryCfg.MaxDelay < 0 || a.retryCfg.Multiplier < 0 {
+		return nil, fmt.Errorf("invalid retry configuration")
+	}
+	if nilDependency(a.tracer) {
+		a.tracer = tracing.Noop
+	}
+	if a.log == nil {
+		a.log = slog.Default()
+	}
+	if nilDependency(a.approver) {
+		a.approver = AllowAll
+	}
+	return a, nil
 }
 
-func (a *Agent) WithLogger(l *slog.Logger) *Agent {
-	a.log = l
-	return a
-}
-
-func (a *Agent) WithTracer(t tracing.Tracer) *Agent {
-	a.tracer = t
-	return a
-}
-
-func (a *Agent) WithSystemPrompt(prompt string) *Agent {
-	a.systemPrompt = prompt
-	return a
-}
-
-func (a *Agent) WithMaxSteps(maxSteps int) *Agent {
-	a.maxSteps = maxSteps
-	return a
-}
-
-func (a *Agent) WithRetry(cfg retry.Config) *Agent {
-	a.retryCfg = cfg
-	return a
-}
-
-// WithApprover sets the Approver that gates tool calls before execution. The
-// default is [AllowAll], which permits every call unconditionally.
-func (a *Agent) WithApprover(ap Approver) *Agent {
-	a.approver = ap
-	return a
-}
-
-// WithToolPolicy sets the default deterministic limits for local tool work.
-// The zero policy preserves the historical unbounded behavior. The policy is
-// copied; configure the agent before starting any runs. Use the package-level
-// [WithToolPolicy] RunOption to replace it for one run.
-func (a *Agent) WithToolPolicy(policy ToolPolicy) *Agent {
-	a.toolPolicy = policy.clone()
-	return a
-}
-
-// WithDefaultCallOptions sets the [CallOptions] applied to every run of this
-// agent. A per-run [WithCallOptions] override is merged over these defaults.
-func (a *Agent) WithDefaultCallOptions(o CallOptions) *Agent {
-	a.defaultCallOptions = o
-	return a
-}
-
-// WithPreSendHook registers a PreSendHook. Hooks fire in registration order
-// once per turn, immediately before each provider invocation. Each hook
-// receives the output of the previous hook.
-//
-// Like the other WithXxx methods, this mutates the Agent in place and is not
-// safe to call concurrently with a run — configure all hooks before starting
-// any runs.
-func (a *Agent) WithPreSendHook(hook PreSendHook) *Agent {
-	a.preSendHooks = append(a.preSendHooks, hook)
-	return a
-}
-
-// WithTools replaces the agent's tool set with the given tools. Each call
-// replaces the previous set; call once with all tools the agent should have.
-// For incremental registration, use [Agent.RegisterTool].
-func (a *Agent) WithTools(tools ...Tool) *Agent {
-	a.tools = tools
-	return a
-}
-
-// RegisterTool adds a tool to the agent. The tool's name (from t.Name()) is
-// what the model uses to invoke it; registering a tool whose name matches an
-// already-registered tool silently replaces the existing one.
-//
-// Tool errors are not fatal: if the tool's Execute returns an error, the run
-// converts it to "error: <msg>" and feeds it back to the model as the tool
-// result, letting the model recover. The exceptions are [context.Canceled]
-// and [context.DeadlineExceeded], which abort the run. See [Func] for the
-// typed-handler convenience wrapper.
-func (a *Agent) RegisterTool(t Tool) {
-	a.tools = append(a.tools, t)
-}
-
-func (a *Agent) RegisterFunc(name, description string, fn func(context.Context) string) {
-	a.RegisterTool(Func(name, description, func(ctx context.Context, _ struct{}) (string, error) {
-		return fn(ctx), nil
-	}))
+func nilDependency(v any) bool {
+	if v == nil {
+		return true
+	}
+	switch reflect.ValueOf(v).Kind() {
+	case reflect.Pointer, reflect.Func, reflect.Map, reflect.Slice, reflect.Interface, reflect.Chan:
+		return reflect.ValueOf(v).IsNil()
+	}
+	return false
 }
 
 // Run executes the agent on task and returns the [RunResult]. Options customize
@@ -148,8 +119,13 @@ func (a *Agent) RegisterFunc(name, description string, fn func(context.Context) 
 // populated as far as the run got, even on error.
 func (a *Agent) Run(ctx context.Context, task string, opts ...RunOption) (RunResult, error) {
 	cfg := a.newRunConfig(opts)
-	result, err := a.runSync(ctx, newLoop(a, nil), task, cfg)
-	return finishRun(ctx, cfg, result, err)
+	s, err := a.beginRun(ctx, cfg, nil, nil, "sync")
+	if err != nil {
+		return s.finish(s.result, err)
+	}
+	cfg.scope = s
+	result, err := a.runSync(s.ctx, newLoop(a, nil), task, cfg)
+	return s.finish(result, err)
 }
 
 // runSync drives a pre-built loop through the non-streaming path. Split from
@@ -157,7 +133,13 @@ func (a *Agent) Run(ctx context.Context, task string, opts ...RunOption) (RunRes
 func (a *Agent) runSync(ctx context.Context, l *Loop, task string, cfg runConfig) (RunResult, error) {
 	return l.run(ctx, task, "sync", cfg, func(ctx context.Context, _ *slog.Logger, req Request) (Response, error) {
 		return retry.Do(ctx, a.retryCfg, func() (Response, error) {
-			return a.provider.Invoke(ctx, req)
+			cfg.scope.providerAttempts++
+			resp, err := a.provider.Invoke(ctx, cloneRequest(req))
+			if err != nil && responseHasPartial(resp) {
+				resp.completionErr = err
+				return resp, nil
+			}
+			return resp, err
 		})
 	})
 }
@@ -165,9 +147,11 @@ func (a *Agent) runSync(ctx context.Context, l *Loop, task string, cfg runConfig
 // newRunConfig resolves the effective run configuration: the agent's default
 // CallOptions and ToolPolicy with each RunOption applied in order.
 func (a *Agent) newRunConfig(opts []RunOption) runConfig {
-	cfg := runConfig{options: a.defaultCallOptions, toolPolicy: a.toolPolicy.clone()}
+	cfg := runConfig{options: cloneCallOptions(a.defaultCallOptions), toolPolicy: a.toolPolicy.clone(), maxTurns: a.maxSteps, observers: append([]RunObserver(nil), a.observers...), checkpointHooks: append([]CheckpointHook(nil), a.checkpointHooks...), postRunHooks: append([]PostRunHook(nil), a.postRunHooks...)}
 	for _, opt := range opts {
-		opt(&cfg)
+		if opt != nil {
+			opt(&cfg)
+		}
 	}
 	return cfg
 }

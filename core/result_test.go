@@ -43,7 +43,7 @@ func TestRunResultFields(t *testing.T) {
 		withUsage(asstTool("c1", "echo", `{"msg":"hi"}`), &Usage{InputTokens: 10, OutputTokens: 5}),
 		withUsage(asstText("all done"), &Usage{InputTokens: 8, OutputTokens: 3}),
 	}}
-	agent := New(provider)
+	agent := testAgent(provider)
 	agent.RegisterTool(Func("echo", "echoes", func(_ context.Context, a echoArgs) (string, error) {
 		return "echoed:" + a.Msg, nil
 	}))
@@ -79,7 +79,7 @@ func TestRunResultMaxStepsReturnsPartials(t *testing.T) {
 	provider := &optionsProvider{turns: []Message{
 		withUsage(asstTool("c1", "echo", "{}"), &Usage{InputTokens: 4, OutputTokens: 2}),
 	}}
-	agent := New(provider).WithMaxSteps(1)
+	agent := testAgent(provider).WithMaxSteps(1)
 	agent.RegisterTool(Func("echo", "echoes", func(_ context.Context, _ echoArgs) (string, error) {
 		return "ok", nil
 	}))
@@ -143,7 +143,7 @@ func TestCompletionFailuresReturnPartialResults(t *testing.T) {
 				StopReason:    tt.reason,
 				RawStopReason: tt.raw,
 			}}
-			res, err := New(provider).Run(context.Background(), "go")
+			res, err := testAgent(provider).Run(context.Background(), "go")
 			if !errors.Is(err, tt.wantIs) {
 				t.Fatalf("err = %v, want errors.Is(_, %v)", err, tt.wantIs)
 			}
@@ -172,7 +172,7 @@ func TestUnrecognizedResponseReasonDoesNotBecomeSuccess(t *testing.T) {
 		Message:    asstText("looks complete"),
 		StopReason: StopReason("brand_new_reason"),
 	}}
-	res, err := New(provider).Run(context.Background(), "go")
+	res, err := testAgent(provider).Run(context.Background(), "go")
 	if !errors.Is(err, ErrUnknownStopReason) {
 		t.Fatalf("err = %v, want ErrUnknownStopReason", err)
 	}
@@ -185,7 +185,7 @@ func TestUnrecognizedResponseReasonDoesNotBecomeSuccess(t *testing.T) {
 // provider on every turn.
 func TestDefaultCallOptionsSent(t *testing.T) {
 	provider := &optionsProvider{turns: []Message{asstText("done")}}
-	agent := New(provider).WithDefaultCallOptions(CallOptions{
+	agent := testAgent(provider).WithDefaultCallOptions(CallOptions{
 		Temperature: floatPtr(0.2),
 		MaxTokens:   1024,
 	})
@@ -206,13 +206,13 @@ func TestDefaultCallOptionsSent(t *testing.T) {
 // the agent default field-by-field: overridden fields change, others persist.
 func TestWithCallOptionsMergesOverDefault(t *testing.T) {
 	provider := &optionsProvider{turns: []Message{asstText("done")}}
-	agent := New(provider).WithDefaultCallOptions(CallOptions{
+	agent := testAgent(provider).WithDefaultCallOptions(CallOptions{
 		Temperature: floatPtr(0.2),
 		MaxTokens:   1024,
 	})
 
 	if _, err := agent.Run(context.Background(), "go",
-		WithCallOptions(CallOptions{MaxTokens: 4096}), // override only MaxTokens
+		legacyCallOptions(CallOptions{MaxTokens: 4096}), // override only MaxTokens
 	); err != nil {
 		t.Fatalf("Run: %v", err)
 	}

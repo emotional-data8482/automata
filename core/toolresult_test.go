@@ -183,8 +183,8 @@ func TestFuncResultRegistrationPaths(t *testing.T) {
 		return TextResult("ok"), nil
 	})
 	// FuncResult returns a Tool, so both registration paths accept it.
-	_ = New(nil).WithTools(tool)
-	a := New(nil)
+	_ = testAgent(nil).WithTools(tool)
+	a := testAgent(nil)
 	a.RegisterTool(tool)
 	if a.tools[0].Definition().Name != "echo" {
 		t.Errorf("registered tool name = %q", a.tools[0].Definition().Name)
@@ -199,7 +199,7 @@ func TestLoopRichTextResult(t *testing.T) {
 		asstTool("r1", "weather", `{"city":"Paris"}`),
 		asstText(final),
 	}}
-	agent := New(provider)
+	agent := testAgent(provider)
 	agent.RegisterTool(FuncResult("weather", "look up weather",
 		func(_ context.Context, a resultArgs) (ToolResult, error) {
 			return TextResult("sunny in " + a.City), nil
@@ -231,7 +231,7 @@ func TestLoopRichMixedResultPreservesBlockOrder(t *testing.T) {
 		asstTool("r1", "shot", "{}"),
 		asstText("done"),
 	}}
-	agent := New(provider)
+	agent := testAgent(provider)
 	agent.RegisterTool(FuncResult("shot", "take a screenshot", func(context.Context, struct{}) (ToolResult, error) {
 		return BlockResult(
 			TextBlock{Text: "screenshot:"},
@@ -268,7 +268,7 @@ func TestLoopRichResultZeroValueNormalized(t *testing.T) {
 		asstTool("r1", "noop", "{}"),
 		asstText("done"),
 	}}
-	agent := New(provider)
+	agent := testAgent(provider)
 	agent.RegisterTool(FuncResult("noop", "does nothing", func(context.Context, struct{}) (ToolResult, error) {
 		return ToolResult{}, nil // handler returns the zero value
 	}))
@@ -292,7 +292,7 @@ func TestLoopRichResultRecoverableError(t *testing.T) {
 		asstTool("r1", "boom", "{}"),
 		asstText(final),
 	}}
-	agent := New(provider)
+	agent := testAgent(provider)
 	agent.RegisterTool(FuncResult("boom", "always fails", func(context.Context, struct{}) (ToolResult, error) {
 		return ErrorResult("exploded"), nil
 	}))
@@ -317,7 +317,7 @@ func TestLoopRichResultFatalCancellation(t *testing.T) {
 	provider := &capturingProvider{turns: []Message{
 		asstTool("r1", "hang", "{}"),
 	}}
-	agent := New(provider)
+	agent := testAgent(provider)
 	agent.RegisterTool(FuncResult("hang", "waits for cancellation", func(ctx context.Context, _ struct{}) (ToolResult, error) {
 		<-ctx.Done()
 		return ToolResult{}, ctx.Err()
@@ -336,7 +336,7 @@ func TestLoopStringToolTranscriptUnchanged(t *testing.T) {
 		asstTool("s1", "echo", `{"msg":"hi"}`),
 		asstText(final),
 	}}
-	agent := New(provider)
+	agent := testAgent(provider)
 	agent.RegisterTool(Func("echo", "echoes msg", func(_ context.Context, a echoArgs) (string, error) {
 		return "echoed:" + a.Msg, nil
 	}))
@@ -383,7 +383,7 @@ func TestLoopRichResultStreamEventsCarryBlocks(t *testing.T) {
 		asstTool("r1", "shot", "{}"),
 		asstText("done"),
 	}}
-	agent := New(provider)
+	agent := testAgent(provider)
 	agent.RegisterTool(FuncResult("shot", "screenshot", func(context.Context, struct{}) (ToolResult, error) {
 		return BlockResult(TextBlock{Text: "shot!"}, ImageBlock{MediaType: "image/png", Data: []byte{1}}), nil
 	}))

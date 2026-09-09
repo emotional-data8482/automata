@@ -20,7 +20,7 @@ func TestToolPolicyTimeoutIsRecoverable(t *testing.T) {
 		asstTool("slow-1", "slow", `{}`),
 		asstText("recovered"),
 	}}
-	agent := New(provider).WithToolPolicy(ToolPolicy{Timeout: 20 * time.Millisecond})
+	agent := testAgent(provider).WithToolPolicy(ToolPolicy{Timeout: 20 * time.Millisecond})
 	agent.RegisterTool(Func("slow", "wait for cancellation", func(ctx context.Context, _ struct{}) (string, error) {
 		<-ctx.Done()
 		return "", ctx.Err()
@@ -57,7 +57,7 @@ func TestToolPolicyTimeoutKeepsSiblingOutcome(t *testing.T) {
 		AssistantMessage(toolUse("slow-1", "slow", `{}`), toolUse("fast-1", "fast", `{}`)),
 		asstText("done"),
 	}}
-	agent := New(provider).WithToolPolicy(ToolPolicy{Timeout: 20 * time.Millisecond})
+	agent := testAgent(provider).WithToolPolicy(ToolPolicy{Timeout: 20 * time.Millisecond})
 	agent.RegisterTool(Func("slow", "wait for timeout", func(ctx context.Context, _ struct{}) (string, error) {
 		<-ctx.Done()
 		return "", ctx.Err()
@@ -84,7 +84,7 @@ func TestToolPolicyTimeoutKeepsSiblingOutcome(t *testing.T) {
 
 func TestToolPolicyParentDeadlineRemainsFatal(t *testing.T) {
 	provider := &scriptedProvider{turns: []Message{asstTool("slow-1", "slow", `{}`)}}
-	agent := New(provider).WithToolPolicy(ToolPolicy{Timeout: time.Second})
+	agent := testAgent(provider).WithToolPolicy(ToolPolicy{Timeout: time.Second})
 	agent.RegisterTool(Func("slow", "wait for cancellation", func(ctx context.Context, _ struct{}) (string, error) {
 		<-ctx.Done()
 		return "", ctx.Err()
@@ -111,7 +111,7 @@ func TestToolPolicyBudgetDeniesBatchOverflowInModelOrder(t *testing.T) {
 		asstText("done"),
 	}}
 	var executed atomic.Int64
-	agent := New(provider).WithToolPolicy(ToolPolicy{MaxCalls: 2})
+	agent := testAgent(provider).WithToolPolicy(ToolPolicy{MaxCalls: 2})
 	agent.RegisterTool(Func("work", "count calls", func(context.Context, struct{}) (string, error) {
 		executed.Add(1)
 		return "ok", nil
@@ -148,7 +148,7 @@ func TestToolPolicyBudgetPersistsAcrossProviderSteps(t *testing.T) {
 		asstText("done"),
 	}}
 	var executed atomic.Int64
-	agent := New(provider).WithToolPolicy(ToolPolicy{MaxCalls: 1})
+	agent := testAgent(provider).WithToolPolicy(ToolPolicy{MaxCalls: 1})
 	agent.RegisterTool(Func("work", "count calls", func(context.Context, struct{}) (string, error) {
 		executed.Add(1)
 		return "ok", nil
@@ -178,7 +178,7 @@ func TestToolPolicyPerToolBudgetDoesNotLimitOtherTools(t *testing.T) {
 	}}
 	var workCalls atomic.Int64
 	var otherCalls atomic.Int64
-	agent := New(provider).WithToolPolicy(ToolPolicy{PerTool: map[string]ToolLimits{
+	agent := testAgent(provider).WithToolPolicy(ToolPolicy{PerTool: map[string]ToolLimits{
 		"work": {MaxCalls: 1},
 	}})
 	agent.RegisterTool(Func("work", "limited calls", func(context.Context, struct{}) (string, error) {
@@ -213,7 +213,7 @@ func TestToolPolicyBudgetReservationPrecedesApproval(t *testing.T) {
 	}}
 	var approvals atomic.Int64
 	var executions atomic.Int64
-	agent := New(provider).
+	agent := testAgent(provider).
 		WithToolPolicy(ToolPolicy{MaxCalls: 1}).
 		WithApprover(ApproverFunc(func(_ context.Context, _ ToolUseBlock, _ []Message) (Decision, error) {
 			approvals.Add(1)
@@ -247,7 +247,7 @@ func TestRunToolPolicyReplacesAgentDefaultAndBudgetsReset(t *testing.T) {
 	batch := AssistantMessage(toolUse("c1", "work", `{}`), toolUse("c2", "work", `{}`))
 	provider := &scriptedProvider{turns: []Message{batch, asstText("one"), batch, asstText("two")}}
 	var executed atomic.Int64
-	agent := New(provider).WithToolPolicy(ToolPolicy{MaxCalls: 1})
+	agent := testAgent(provider).WithToolPolicy(ToolPolicy{MaxCalls: 1})
 	agent.RegisterTool(Func("work", "count calls", func(context.Context, struct{}) (string, error) {
 		executed.Add(1)
 		return "ok", nil
@@ -290,7 +290,7 @@ func TestToolPolicyRateLimiterDoesNotThrottleOtherTools(t *testing.T) {
 			return ctx.Err()
 		}
 	})
-	agent := New(provider).WithToolPolicy(ToolPolicy{PerTool: map[string]ToolLimits{
+	agent := testAgent(provider).WithToolPolicy(ToolPolicy{PerTool: map[string]ToolLimits{
 		"limited": {RateLimiter: limiter},
 	}})
 	agent.RegisterTool(Func("limited", "limited work", func(context.Context, struct{}) (string, error) {
@@ -343,7 +343,7 @@ func TestToolPolicyTimeoutIncludesRateLimiterWait(t *testing.T) {
 		<-ctx.Done()
 		return ctx.Err()
 	})
-	agent := New(provider).WithToolPolicy(ToolPolicy{PerTool: map[string]ToolLimits{
+	agent := testAgent(provider).WithToolPolicy(ToolPolicy{PerTool: map[string]ToolLimits{
 		"limited": {Timeout: 20 * time.Millisecond, RateLimiter: limiter},
 	}})
 	agent.RegisterTool(Func("limited", "never reaches execute", func(context.Context, struct{}) (string, error) {
@@ -375,7 +375,7 @@ func TestToolPolicyRateLimiterErrorIsRecoverable(t *testing.T) {
 	}}
 	var executed atomic.Bool
 	limiterErr := errors.New("quota service unavailable")
-	agent := New(provider).WithToolPolicy(ToolPolicy{RateLimiter: rateLimiterFunc(func(context.Context) error {
+	agent := testAgent(provider).WithToolPolicy(ToolPolicy{RateLimiter: rateLimiterFunc(func(context.Context) error {
 		return limiterErr
 	})})
 	agent.RegisterTool(Func("limited", "never reaches execute", func(context.Context, struct{}) (string, error) {
@@ -407,7 +407,7 @@ func TestToolPolicyMaxParallel(t *testing.T) {
 	release := make(chan struct{})
 	var active atomic.Int64
 	var maxActive atomic.Int64
-	agent := New(provider).WithToolPolicy(ToolPolicy{MaxParallel: 2})
+	agent := testAgent(provider).WithToolPolicy(ToolPolicy{MaxParallel: 2})
 	agent.RegisterTool(Func("work", "bounded work", func(context.Context, struct{}) (string, error) {
 		current := active.Add(1)
 		for {
@@ -459,7 +459,7 @@ func TestToolPolicyWithToolRetryUsesOneBudgetReservation(t *testing.T) {
 		asstText("done"),
 	}}
 	var attempts atomic.Int64
-	agent := New(provider).WithToolPolicy(ToolPolicy{MaxCalls: 1})
+	agent := testAgent(provider).WithToolPolicy(ToolPolicy{MaxCalls: 1})
 	tool := Func("work", "retry transient work", func(context.Context, struct{}) (string, error) {
 		if attempts.Add(1) == 1 {
 			return "", errors.New("transient")
@@ -486,14 +486,15 @@ type nestedBudgetProvider struct{}
 func (nestedBudgetProvider) Invoke(_ context.Context, req Request) (Response, error) {
 	for _, message := range req.Messages {
 		if message.Role == "tool" {
-			return Response{Message: asstText("child done")}, nil
+			return fixtureResponse(asstText("child done")), nil
 		}
 	}
-	return Response{Message: asstTool("leaf-1", "leaf", `{}`)}, nil
+	return fixtureResponse(asstTool("leaf-1", "leaf", `{}`)), nil
+
 }
 
 func TestToolPolicyBudgetIsSharedAcrossConcurrentAsToolRuns(t *testing.T) {
-	child := New(nestedBudgetProvider{})
+	child := testAgent(nestedBudgetProvider{})
 	var leafCalls atomic.Int64
 	child.RegisterTool(Func("leaf", "nested work", func(context.Context, struct{}) (string, error) {
 		leafCalls.Add(1)
@@ -504,7 +505,7 @@ func TestToolPolicyBudgetIsSharedAcrossConcurrentAsToolRuns(t *testing.T) {
 		AssistantMessage(toolUse("sub-1", "child", `{}`), toolUse("sub-2", "child", `{}`)),
 		asstText("parent done"),
 	}}
-	parent := New(parentProvider).WithToolPolicy(ToolPolicy{MaxCalls: 3})
+	parent := testAgent(parentProvider).WithToolPolicy(ToolPolicy{MaxCalls: 3})
 	parent.RegisterTool(AsTool[struct{}](child, "child", "delegate"))
 
 	result, err := parent.Run(context.Background(), "go")
@@ -522,7 +523,7 @@ func TestToolPolicyBudgetIsSharedAcrossConcurrentAsToolRuns(t *testing.T) {
 }
 
 func TestToolPolicyNestedBudgetStreamEventKeepsSubAgentTags(t *testing.T) {
-	child := New(nestedBudgetProvider{})
+	child := testAgent(nestedBudgetProvider{})
 	var leafCalls atomic.Int64
 	child.RegisterTool(Func("leaf", "nested work", func(context.Context, struct{}) (string, error) {
 		leafCalls.Add(1)
@@ -533,7 +534,7 @@ func TestToolPolicyNestedBudgetStreamEventKeepsSubAgentTags(t *testing.T) {
 		asstTool("sub-1", "child", `{}`),
 		asstText("parent done"),
 	}}
-	parent := New(parentProvider).WithToolPolicy(ToolPolicy{MaxCalls: 1})
+	parent := testAgent(parentProvider).WithToolPolicy(ToolPolicy{MaxCalls: 1})
 	parent.RegisterTool(AsTool[struct{}](child, "child", "delegate"))
 
 	var budgetEvent StreamEvent
@@ -565,7 +566,7 @@ func TestTerminalToolProducesResultsForEverySiblingCall(t *testing.T) {
 		),
 	}}
 	var executed atomic.Bool
-	agent := New(provider)
+	agent := testAgent(provider)
 	agent.RegisterTool(Func("work", "must not execute", func(context.Context, struct{}) (string, error) {
 		executed.Store(true)
 		return "unexpected", nil
@@ -589,7 +590,7 @@ func TestTerminalToolProducesResultsForEverySiblingCall(t *testing.T) {
 
 func TestToolPolicyInvalidConfigurationFailsBeforeProviderCall(t *testing.T) {
 	provider := &capturingProvider{turns: []Message{asstText("unexpected")}}
-	agent := New(provider).WithToolPolicy(ToolPolicy{MaxParallel: -1})
+	agent := testAgent(provider).WithToolPolicy(ToolPolicy{MaxParallel: -1})
 	result, err := agent.Run(context.Background(), "go")
 	if !errors.Is(err, ErrInvalidToolPolicy) {
 		t.Fatalf("err = %v, want ErrInvalidToolPolicy", err)

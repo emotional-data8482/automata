@@ -37,8 +37,13 @@ type partialBlock struct {
 // safe for concurrent use.
 func (a *Agent) RunStream(ctx context.Context, task string, onEvent func(StreamEvent), opts ...RunOption) (RunResult, error) {
 	cfg := a.newRunConfig(opts)
-	result, err := a.runStream(ctx, newLoop(a, nil), task, onEvent, cfg)
-	return finishRun(ctx, cfg, result, err)
+	scope, err := a.beginRun(ctx, cfg, nil, nil, "stream")
+	if err != nil {
+		return scope.finish(scope.result, err)
+	}
+	cfg.scope = scope
+	result, err := a.runStream(scope.ctx, newLoop(a, nil), task, onEvent, cfg)
+	return scope.finish(result, err)
 }
 
 // runStream drives a pre-built loop through the streaming path. Split from
@@ -55,13 +60,19 @@ func (a *Agent) runStream(ctx context.Context, l *Loop, task string, onEvent fun
 	l.emit = func(ev StreamEvent) {
 		mu.Lock()
 		defer mu.Unlock()
-		onEvent(ev)
+		onEvent(cloneStreamEvent(ev))
 	}
 
 	if !streamOK {
 		return l.run(ctx, task, "fallback", cfg, func(ctx context.Context, _ *slog.Logger, req Request) (Response, error) {
 			resp, err := retry.Do(ctx, a.retryCfg, func() (Response, error) {
-				return a.provider.Invoke(ctx, req)
+				cfg.scope.providerAttempts++
+				resp, err := a.provider.Invoke(ctx, cloneRequest(req))
+				if err != nil && responseHasPartial(resp) {
+					resp.completionErr = err
+					return resp, nil
+				}
+				return resp, err
 			})
 			if err == nil {
 				if think := resp.Message.Thinking(); think != "" {
@@ -83,7 +94,8 @@ func (a *Agent) runStream(ctx context.Context, l *Loop, task string, onEvent fun
 			l.emit(StreamEvent{Kind: kind, Text: delta})
 		}
 		resp, err := retry.Do(ctx, a.retryCfg, func() (Response, error) {
-			streamResp, cerr := consumeStream(ctx, sp, req, streamEmit, log)
+			cfg.scope.providerAttempts++
+			streamResp, cerr := consumeStream(ctx, sp, cloneRequest(req), streamEmit, log)
 			if cerr != nil && (emitted || responseHasPartial(streamResp) || errors.Is(cerr, ErrIncompleteResponse)) {
 				streamResp.completionErr = cerr
 				partial = streamResp
@@ -143,19 +155,7 @@ func consumeStream(ctx context.Context, sp StreamProvider, req Request, onDelta 
 				}
 				return resp, nil
 			}
-			if chunk.Err != nil {
-				// Abandon the stream — producer may still have unsent chunks.
-				go drain(ch)
-				reason := StopIncomplete
-				if errors.Is(chunk.Err, context.Canceled) || errors.Is(chunk.Err, context.DeadlineExceeded) {
-					reason = StopCancelled
-				}
-				return Response{
-					Message:       buildAssistantMessage(partials, usage),
-					StopReason:    reason,
-					RawStopReason: rawStopReason,
-				}, chunk.Err
-			}
+
 			chunkRawReason := chunk.RawStopReason
 			if chunkRawReason == "" {
 				chunkRawReason = chunk.FinishReason
@@ -215,6 +215,19 @@ func consumeStream(ctx context.Context, sp StreamProvider, req Request, onDelta 
 				}
 				usage.Merge(chunk.Usage)
 			}
+			if chunk.Err != nil {
+				// Abandon the stream — producer may still have unsent chunks.
+				go drain(ch)
+				reason := StopIncomplete
+				if errors.Is(chunk.Err, context.Canceled) || errors.Is(chunk.Err, context.DeadlineExceeded) {
+					reason = StopCancelled
+				}
+				return Response{
+					Message:       buildAssistantMessage(partials, usage),
+					StopReason:    reason,
+					RawStopReason: rawStopReason,
+				}, chunk.Err
+			}
 		}
 	}
 }
@@ -245,14 +258,7 @@ func buildAssistantMessage(partials []partialBlock, usage *Usage) Message {
 				Signature: p.signature,
 			})
 		case "tool_use":
-			// A real tool call always carries a name; an unnamed slot is a gap.
-			if p.name == "" {
-				continue
-			}
 			input := p.input.String()
-			if input == "" {
-				input = "{}"
-			}
 			blocks = append(blocks, ToolUseBlock{
 				ID:    p.id,
 				Name:  p.name,

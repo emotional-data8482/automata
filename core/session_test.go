@@ -24,7 +24,7 @@ func TestSessionMultiTurn(t *testing.T) {
 		asstText(four),
 		asstText(eight),
 	}}
-	agent := New(provider).WithSystemPrompt("You are a calculator.")
+	agent := testAgent(provider).WithSystemPrompt("You are a calculator.")
 
 	s := agent.NewSession()
 	if out, err := s.Run(context.Background(), "2+2?"); err != nil || out.Output != four {
@@ -51,7 +51,7 @@ func TestSessionTranscriptIncludesToolTurns(t *testing.T) {
 		asstTool("c1", "echo", `{"msg":"hi"}`),
 		asstText("done"),
 	}}
-	agent := New(provider).WithSystemPrompt("sys")
+	agent := testAgent(provider).WithSystemPrompt("sys")
 	agent.RegisterTool(Func("echo", "echoes msg", func(_ context.Context, a echoArgs) (string, error) {
 		return "echoed:" + a.Msg, nil
 	}))
@@ -74,7 +74,7 @@ func TestSessionTranscriptSurvivesError(t *testing.T) {
 	provider := &capturingProvider{turns: []Message{
 		asstTool("c1", "echo", `{"msg":"x"}`),
 	}}
-	agent := New(provider).WithMaxSteps(1)
+	agent := testAgent(provider).WithMaxSteps(1)
 	agent.RegisterTool(Func("echo", "echoes msg", func(_ context.Context, a echoArgs) (string, error) {
 		return "echoed:" + a.Msg, nil
 	}))
@@ -104,7 +104,7 @@ func TestSessionResumesAfterParallelToolAbort(t *testing.T) {
 		),
 		asstText("resumed"),
 	}}
-	agent := New(provider)
+	agent := testAgent(provider)
 	agent.RegisterTool(Func("abort", "aborts the batch", func(_ context.Context, _ struct{}) (string, error) {
 		<-blockedStarted
 		return "", context.Canceled
@@ -165,7 +165,7 @@ func TestSessionResumeRoundTrip(t *testing.T) {
 		asstText(first),
 		asstText(second),
 	}}
-	agent := New(provider).WithSystemPrompt("sys")
+	agent := testAgent(provider).WithSystemPrompt("sys")
 
 	s := agent.NewSession()
 	if _, err := s.Run(context.Background(), "one"); err != nil {
@@ -181,7 +181,7 @@ func TestSessionResumeRoundTrip(t *testing.T) {
 		t.Fatalf("unmarshal: %v", err)
 	}
 
-	resumed := agent.ResumeSession(transcript)
+	resumed := agent.testResumeSession(transcript)
 	if out, err := resumed.Run(context.Background(), "two"); err != nil || out.Output != second {
 		t.Fatalf("resumed run = %q, %v", out.Output, err)
 	}
@@ -222,8 +222,8 @@ func TestSessionPersistsEveryBlockType(t *testing.T) {
 		}}},
 	}
 
-	agent := New(&capturingProvider{turns: []Message{asstText("final")}})
-	blob, err := json.Marshal(agent.ResumeSession(transcript).Messages())
+	agent := testAgent(&capturingProvider{turns: []Message{asstText("final")}})
+	blob, err := json.Marshal(agent.testResumeSession(transcript).Messages())
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
@@ -240,7 +240,7 @@ func TestSessionPersistsEveryBlockType(t *testing.T) {
 	}
 
 	// Spot-check the resumed session still runs and continues the history.
-	resumed := agent.ResumeSession(reloaded)
+	resumed := agent.testResumeSession(reloaded)
 	if out, err := resumed.Run(context.Background(), "next"); err != nil || out.Output != "final" {
 		t.Fatalf("resumed run = %q, %v", out.Output, err)
 	}
@@ -254,7 +254,7 @@ func TestSessionRunStream(t *testing.T) {
 		asstText(hello),
 		asstText(again),
 	}}
-	agent := New(provider)
+	agent := testAgent(provider)
 
 	s := agent.NewSession()
 	var texts []string

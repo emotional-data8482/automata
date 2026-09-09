@@ -120,7 +120,7 @@ func (p *scriptedProvider) Invoke(context.Context, Request) (Response, error) {
 	}
 	m := p.turns[p.calls]
 	p.calls++
-	return Response{Message: m}, nil
+	return fixtureResponse(m), nil
 }
 
 // recordingProvider implements both Provider and StreamProvider, replaying the
@@ -148,7 +148,7 @@ func (p *recordingProvider) next() (Message, error) {
 func (p *recordingProvider) Invoke(context.Context, Request) (Response, error) {
 	p.syncCalls++
 	m, err := p.next()
-	return Response{Message: m}, err
+	return fixtureResponse(m), err
 }
 
 func (p *recordingProvider) InvokeStream(context.Context, Request) (<-chan StreamChunk, error) {
@@ -204,7 +204,7 @@ func TestRunStreamEmitsTextToolCallAndResult(t *testing.T) {
 		textChunks("Done."),
 	}}
 
-	agent := New(provider)
+	agent := testAgent(provider)
 	agent.RegisterTool(Func("echo", "echoes msg", func(_ context.Context, a echoArgs) (string, error) {
 		return "echoed:" + a.Msg, nil
 	}))
@@ -261,7 +261,7 @@ func TestRunStreamSkipsGapToolSlots(t *testing.T) {
 		textChunks("done"),
 	}}
 
-	agent := New(provider)
+	agent := testAgent(provider)
 	agent.RegisterTool(Func("now", "returns a time", func(_ context.Context, _ struct{}) (string, error) {
 		return "a-time", nil
 	}))
@@ -295,7 +295,7 @@ func TestRunStreamToolResultCarriesError(t *testing.T) {
 		textChunks("recovered"),
 	}}
 
-	agent := New(provider)
+	agent := testAgent(provider)
 	agent.RegisterTool(Func("boom", "always fails", func(_ context.Context, _ struct{}) (string, error) {
 		return "", errors.New("kaboom")
 	}))
@@ -332,7 +332,7 @@ func TestRunStreamFallbackEmitsToolEvents(t *testing.T) {
 		asstText("final"),
 	}}
 
-	agent := New(provider)
+	agent := testAgent(provider)
 	agent.RegisterTool(Func("echo", "echoes msg", func(_ context.Context, a echoArgs) (string, error) {
 		return "echoed:" + a.Msg, nil
 	}))
@@ -370,7 +370,7 @@ func TestRunStreamEmitsUsage(t *testing.T) {
 		),
 	}}
 
-	agent := New(provider)
+	agent := testAgent(provider)
 
 	var usage *Usage
 	var usageEvents int
@@ -398,7 +398,7 @@ func TestRunStreamTransportFailurePreservesPartialResult(t *testing.T) {
 		{Err: io.ErrUnexpectedEOF},
 	}}}
 
-	res, err := New(provider).RunStream(context.Background(), "go", nil)
+	res, err := testAgent(provider).RunStream(context.Background(), "go", nil)
 	if !errors.Is(err, ErrIncompleteResponse) || !errors.Is(err, io.ErrUnexpectedEOF) {
 		t.Fatalf("err = %v, want incomplete response wrapping unexpected EOF", err)
 	}
@@ -425,9 +425,9 @@ func TestAsToolStreamsSubAgentEvents(t *testing.T) {
 	// Streaming parent: sub-agent should stream and its text should arrive tagged.
 	t.Run("streaming propagates tagged events", func(t *testing.T) {
 		subProvider := &recordingProvider{turns: []Message{asstText(subText)}}
-		sub := New(subProvider)
+		sub := testAgent(subProvider)
 
-		orch := New(&recordingProvider{turns: []Message{
+		orch := testAgent(&recordingProvider{turns: []Message{
 			AssistantMessage(subCall),
 			asstText(final),
 		}})
@@ -466,9 +466,9 @@ func TestAsToolStreamsSubAgentEvents(t *testing.T) {
 	// Non-streaming parent: sub-agent should run through Invoke, not InvokeStream.
 	t.Run("plain Run does not stream sub-agent", func(t *testing.T) {
 		subProvider := &recordingProvider{turns: []Message{asstText(subText)}}
-		sub := New(subProvider)
+		sub := testAgent(subProvider)
 
-		orch := New(&recordingProvider{turns: []Message{
+		orch := testAgent(&recordingProvider{turns: []Message{
 			AssistantMessage(subCall),
 			asstText(final),
 		}})
@@ -502,7 +502,7 @@ func TestRunStreamTurnOrdering(t *testing.T) {
 		append(textChunks("done"), StreamChunk{Usage: &Usage{InputTokens: 20, OutputTokens: 3}}),
 	}}
 
-	agent := New(provider)
+	agent := testAgent(provider)
 	agent.RegisterTool(Func("echo", "echoes msg", func(_ context.Context, a echoArgs) (string, error) {
 		return "echoed:" + a.Msg, nil
 	}))
@@ -560,14 +560,14 @@ func TestAsToolNestedTagsAndUsage(t *testing.T) {
 	leafProvider := &recordingProvider{turns: []Message{
 		withUsage(asstText(leafText), &Usage{InputTokens: 5, OutputTokens: 3}),
 	}}
-	leaf := New(leafProvider)
+	leaf := testAgent(leafProvider)
 
 	midText := "mid-says"
 	midProvider := &recordingProvider{turns: []Message{
 		withUsage(asstTool("L1", "leaf", "{}"), &Usage{InputTokens: 7, OutputTokens: 2}),
 		withUsage(asstText(midText), &Usage{InputTokens: 9, OutputTokens: 4}),
 	}}
-	mid := New(midProvider)
+	mid := testAgent(midProvider)
 	mid.RegisterTool(AsTool[struct{}](leaf, "leaf", "leaf sub-agent"))
 
 	topText := "top-says"
@@ -575,7 +575,7 @@ func TestAsToolNestedTagsAndUsage(t *testing.T) {
 		withUsage(asstTool("M1", "mid", "{}"), &Usage{InputTokens: 11, OutputTokens: 1}),
 		withUsage(asstText(topText), &Usage{InputTokens: 13, OutputTokens: 6}),
 	}}
-	orch := New(orchProvider)
+	orch := testAgent(orchProvider)
 	orch.RegisterTool(AsTool[struct{}](mid, "mid", "mid sub-agent"))
 
 	var acc StreamAccumulator

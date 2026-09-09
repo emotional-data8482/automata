@@ -76,9 +76,7 @@ func (m *loopMachine) transition(next loopState) {
 	if m.state == loopStatePrepareTurn && next == loopStateInvokeProvider && len(m.request.Messages) == 0 {
 		panic("provider request not prepared")
 	}
-	if m.state == loopStateInvokeProvider && next == loopStateClassifyResponse && m.result.Steps != m.step+1 {
-		panic("response not committed")
-	}
+
 	if m.state == loopStateExecuteTools {
 		msgs := m.loop.messages
 		if len(msgs) < len(m.calls) {
@@ -118,7 +116,15 @@ func (m *loopMachine) drive() (RunResult, error) {
 			next = m.executeTools()
 		case loopStateFinish:
 			m.result.Messages = m.loop.snapshot()
-			m.result.Diagnostics = append([]RunDiagnostic(nil), m.loop.diagnostics...)
+			m.result.Diagnostics = append(m.result.Diagnostics, m.loop.diagnostics...)
+			m.result.Output = m.result.FinalMessage.Text()
+			m.result.Turns = m.cfg.scope.turns
+			m.result.ProviderAttempts = m.cfg.scope.providerAttempts
+			m.result.Usage = m.cfg.scope.usage
+			if e := m.cfg.scope.checkpoint(m.loop.messages, m.err); e != nil {
+				m.err = &checkpointFailure{executionErr: m.err}
+			}
+			m.cfg.scope.result = cloneRunResult(m.result)
 			next = loopStateDone
 		}
 		m.transition(next)
@@ -129,16 +135,7 @@ func (m *loopMachine) fail(err error) loopState { m.err = err; return loopStateF
 func (m *loopMachine) start() loopState {
 	l, ctx, task, mode, cfg := m.loop, m.ctx, m.task, m.mode, m.cfg
 	a := l.agent
-	if a.maxSteps <= 0 {
-		return m.fail(fmt.Errorf("%w; use WithMaxSteps to configure", ErrInvalidMaxSteps))
-	}
-
-	var policy *toolPolicyState
-	var policyErr error
-	ctx, policy, policyErr = newToolPolicyState(ctx, cfg.toolPolicy)
-	if policyErr != nil {
-		return m.fail(policyErr)
-	}
+	policy := cfg.scope.policy
 
 	ctx, span := a.tracer.Start(ctx, "agent.run",
 		tracing.String("task", task),
@@ -174,13 +171,19 @@ func (m *loopMachine) prepareTurn() loopState {
 	l, ctx, a, result, step, log, span := m.loop, m.ctx, m.loop.agent, &m.result, m.step, m.log, m.span
 	_, _, _, _, _, _, _ = l, ctx, a, result, step, log, span
 
-	if step >= a.maxSteps {
+	if err := ctx.Err(); err != nil {
+		m.result.StopReason = StopCancelled
+		return m.fail(err)
+	}
+	if m.cfg.scope.turns >= m.cfg.scope.config.maxTurns {
 		err := fmt.Errorf("%w (%d)", ErrMaxStepsExceeded, a.maxSteps)
 		span.SetStatus(err)
 		log.WarnContext(ctx, "exceeded max steps", "max_steps", a.maxSteps)
 		result.StopReason = StopMaxSteps
 		return m.fail(err)
 	}
+	m.cfg.scope.turns++
+	m.result.Turns = m.cfg.scope.turns
 	log.DebugContext(ctx, "invoking provider", "step", step)
 
 	req := cloneRequest(Request{Messages: l.messages, Tools: m.tools, Options: m.cfg.options})
@@ -233,6 +236,12 @@ func (m *loopMachine) prepareTurn() loopState {
 		hookSpan.End()
 	}
 
+	if err := validateCallOptions(req.Options); err != nil {
+		return m.fail(err)
+	}
+	if err := validateHistory(req.Messages); err != nil {
+		return m.fail(fmt.Errorf("request history: %w", err))
+	}
 	selected, err := effectiveTools(req, m.registry, m.cfg.terminalTool)
 	if err != nil {
 		return m.fail(fmt.Errorf("prepare request at step %d: %w", step, err))
@@ -270,14 +279,13 @@ func (m *loopMachine) invokeProvider() loopState {
 			"input_tokens", msg.Usage.InputTokens,
 			"output_tokens", msg.Usage.OutputTokens,
 		)
-		result.Usage.Add(msg.Usage)
+		m.cfg.scope.usage.Add(msg.Usage)
+		result.Usage = m.cfg.scope.usage
 		l.emit(StreamEvent{Kind: StreamUsage, Usage: msg.Usage})
 	}
 	invokeSpan.End()
 
-	l.messages = append(l.messages, msg)
 	result.Steps = step + 1
-	result.FinalMessage = msg
 
 	m.response = response
 	return loopStateClassifyResponse
@@ -287,11 +295,31 @@ func (m *loopMachine) classifyResponse() loopState {
 	_, _, _, _, _, _, _ = l, ctx, a, result, step, log, span
 
 	response := m.response
-	msg := response.Message
+	msg, rejection := reconcileAssistant(response.Message)
 	toolUses := msg.ToolUses()
 	m.calls = toolUses
 	stopReason, rawStopReason := normalizeResponseStop(response, toolUses)
+	result.ProviderStopReason = stopReason
+	result.RawProviderStopReason = rawStopReason
 	result.RawStopReason = rawStopReason
+	if response.completionErr != nil && (stopReason == StopEndTurn || stopReason == StopToolUse) {
+		stopReason = StopIncomplete
+	}
+	if rejection != nil {
+		l.diagnostics = append(l.diagnostics, responseDiagnostics(response.Message, m.cfg.scope.turns, rejection)...)
+		if stopReason == StopEndTurn || stopReason == StopToolUse {
+			stopReason = StopIncomplete
+		}
+		response.completionErr = errors.Join(response.completionErr, rejection)
+	}
+	if len(msg.Blocks) > 0 {
+		l.messages = append(l.messages, msg)
+		result.FinalMessage = cloneMessages([]Message{msg})[0]
+	}
+	m.response.Message = msg
+	if err := ctx.Err(); err != nil {
+		return m.failCompletion(StopCancelled, rawStopReason, errors.Join(err, response.completionErr))
+	}
 
 	// These provider outcomes are never successful final answers, even when
 	// the provider returned nonempty text. Preserve that partial text and the
@@ -392,6 +420,9 @@ func (m *loopMachine) executeTools() loopState {
 		span.SetStatus(fatalErr)
 		return m.fail(fatalErr)
 	}
+	if err := m.cfg.scope.checkpoint(l.messages, nil); err != nil {
+		return m.fail(&checkpointFailure{})
+	}
 	m.step++
 	return loopStatePrepareTurn
 }
@@ -399,6 +430,17 @@ func (m *loopMachine) failCompletion(reason StopReason, raw string, cause error)
 	l, ctx, a, result, step, log, span := m.loop, m.ctx, m.loop.agent, &m.result, m.step, m.log, m.span
 	_, _, _, _, _, _, _ = l, ctx, a, result, step, log, span
 
+	for _, call := range m.calls {
+		l.emit(StreamEvent{Kind: StreamToolCall, ToolCall: call})
+	}
+	for _, call := range m.calls {
+		r := ErrorResult("not executed: provider response incomplete")
+		l.messages = append(l.messages, ToolResultBlockMessage(call.ID, r.Blocks, true))
+		l.emit(StreamEvent{Kind: StreamToolResult, ToolCall: call, Result: r.Text(), ResultBlocks: r.Blocks, IsError: true})
+	}
+	if cause != nil {
+		l.diagnostics = append(l.diagnostics, RunDiagnostic{Turn: m.cfg.scope.turns, Kind: "completion", Message: cause.Error()})
+	}
 	result.Output = result.FinalMessage.Text()
 	result.StopReason = reason
 	result.RawStopReason = raw

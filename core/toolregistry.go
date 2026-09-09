@@ -21,8 +21,13 @@ func cloneToolDefinition(d ToolDefinition) ToolDefinition {
 // preparation. Duplicate/reserved names and malformed definitions fail the run
 // before provider work. Hooks can only select from the resulting registry.
 func WithTools(tools ...Tool) RunOption {
-	snapshot := append([]Tool(nil), tools...)
-	return func(c *runConfig) { c.extraTools = append(c.extraTools, snapshot...) }
+	snapshot, err := freezeTools(tools, "")
+	return func(c *runConfig) {
+		c.extraTools = append(c.extraTools, snapshot...)
+		if err != nil {
+			c.optionErr = err
+		}
+	}
 }
 
 func registerTools(tools []Tool, terminal string) (map[string]registeredTool, []ToolDefinition, error) {

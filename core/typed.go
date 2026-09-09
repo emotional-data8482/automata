@@ -122,12 +122,22 @@ func RunTyped[T any](ctx context.Context, a *Agent, task string, opts ...RunOpti
 // errors.Is) is returned with the per-field violations; malformed JSON wraps
 // the syntax error as the error's Cause. The [RunResult] is returned alongside
 // T (populated as far as the run got, even on error) so callers still see
-// usage, steps, and the transcript. [PostRunHook]s fire after each underlying
-// run — initial, every correction, and the forced fallback — so checkpoint
-// consumers see each committed transcript.
-func RunSessionTyped[T any](ctx context.Context, session *Session, task string, opts ...RunOption) (T, RunResult, error) {
+// cumulative usage, turns, and the transcript. [CheckpointHook]s see each
+// committed boundary; [PostRunHook]s fire once after the complete typed run,
+// including corrections, fallback, and typed validation.
+func RunSessionTyped[T any](ctx context.Context, session *Session, task string, opts ...RunOption) (value T, result RunResult, runErr error) {
 	session.runMu.Lock()
 	defer session.runMu.Unlock()
+
+	cfg := session.agent.newRunConfig(opts)
+	scope, err := session.agent.beginRun(ctx, cfg, session.Messages(), session.commit, "typed")
+	defer func() { result, runErr = scope.finish(result, runErr) }()
+	if err != nil {
+		return value, scope.result, err
+	}
+	phase := func(task string, options ...RunOption) (RunResult, error) {
+		return session.runPhase(scope, task, session.agent.newRunConfig(options))
+	}
 
 	var zero T
 
@@ -135,7 +145,9 @@ func RunSessionTyped[T any](ctx context.Context, session *Session, task string, 
 	// defaults, so applying them to a zero runConfig is sufficient.
 	var knobs runConfig
 	for _, opt := range opts {
-		opt(&knobs)
+		if opt != nil {
+			opt(&knobs)
+		}
 	}
 	correctionBudget := 1
 	if knobs.maxCorrectionTurns != nil {
@@ -154,6 +166,7 @@ func RunSessionTyped[T any](ctx context.Context, session *Session, task string, 
 	force := func(c *runConfig) {
 		c.options.ToolChoice = &ToolChoice{Mode: ToolChoiceTool, Name: structuredOutputToolName}
 		c.options.ThinkingBudget = 0
+		c.options.OutputSchema = nil
 	}
 	base := append([]RunOption{inject}, opts...)
 	forced := append(append([]RunOption{inject}, opts...), force)
@@ -175,12 +188,12 @@ func RunSessionTyped[T any](ctx context.Context, session *Session, task string, 
 	// schema and the hidden tool is skipped entirely.
 	if knobs.nativeStructuredOutput {
 		if p, ok := session.agent.provider.(StructuredOutputProvider); ok && p.SupportsNativeStructuredOutput() {
-			return runTypedNative[T](ctx, session, task, opts, forced, forcedPrompt)
+			return runTypedNative[T](ctx, session, phase, task, opts, forced, forcedPrompt)
 		}
 		session.agent.log.DebugContext(ctx, "native structured output requested but provider does not support it; using hidden tool")
 	}
 
-	res, err := session.run(ctx, task, base...)
+	res, err := phase(task, base...)
 	if err != nil {
 		return zero, res, err
 	}
@@ -217,9 +230,12 @@ func RunSessionTyped[T any](ctx context.Context, session *Session, task string, 
 		corrections++
 		session.agent.log.InfoContext(ctx, "structured output failed validation; requesting correction",
 			"violations", len(invalid.Violations), "correction", corrections, "budget", correctionBudget)
-		res, err = session.run(ctx, correctionPrompt(invalid), base...)
+		res, err = phase(correctionPrompt(invalid), base...)
 		if err != nil {
-			return zero, res, err // provider/hook failure: surface it, unmasked
+			if errors.Is(err, ErrMaxStepsExceeded) {
+				err = errors.Join(err, invalid)
+			}
+			return zero, res, err
 		}
 	}
 
@@ -230,7 +246,7 @@ func RunSessionTyped[T any](ctx context.Context, session *Session, task string, 
 	// The forced fallback: thinking disabled (forced tool choice + thinking is
 	// rejected by Anthropic). Its output is the last resort and is not
 	// corrected further.
-	res, err = session.run(ctx, forcedPrompt, forced...)
+	res, err = phase(forcedPrompt, forced...)
 	if err != nil {
 		return zero, res, err
 	}
@@ -248,28 +264,32 @@ func RunSessionTyped[T any](ctx context.Context, session *Session, task string, 
 // schema travels via CallOptions.OutputSchema, and the response text is parsed
 // and validated like any other payload. An unusable native payload falls back
 // to the hidden-tool path exactly once.
-func runTypedNative[T any](ctx context.Context, session *Session, task string, opts, forced []RunOption, forcedPrompt string) (T, RunResult, error) {
+func runTypedNative[T any](ctx context.Context, session *Session, phase func(string, ...RunOption) (RunResult, error), task string, opts, forced []RunOption, forcedPrompt string) (T, RunResult, error) {
 	var zero T
 	nativeInject := func(c *runConfig) {
 		c.options.OutputSchema = typedRootSchema[T]()
 	}
 	session.agent.log.DebugContext(ctx, "using provider-native structured output")
 
-	res, err := session.run(ctx, task, append([]RunOption{nativeInject}, opts...)...)
+	res, err := phase(task, append([]RunOption{nativeInject}, opts...)...)
 	if err != nil {
 		return zero, res, err
 	}
 
-	if val, derr := decodeNativePayload[T](res.FinalMessage.Text()); derr == nil {
+	val, nativeErr := decodeNativePayload[T](res.FinalMessage.Text())
+	if nativeErr == nil {
 		return val, res, nil
 	} else {
 		session.agent.log.InfoContext(ctx, "native structured output payload unusable; falling back to hidden tool",
-			"err", derr.Error())
+			"err", nativeErr.Error())
 	}
 
 	// One retry on the hidden-tool path; do not loop.
-	res, err = session.run(ctx, forcedPrompt, forced...)
+	res, err = phase(forcedPrompt, forced...)
 	if err != nil {
+		if errors.Is(err, ErrMaxStepsExceeded) {
+			err = errors.Join(err, nativeErr)
+		}
 		return zero, res, err
 	}
 	if len(res.terminalToolInput) == 0 {

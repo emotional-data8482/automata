@@ -19,7 +19,7 @@ func (p *countingSummarizer) Invoke(_ context.Context, _ Request) (Response, err
 	p.mu.Lock()
 	p.calls++
 	p.mu.Unlock()
-	return Response{Message: asstText(p.reply)}, nil
+	return fixtureResponse(asstText(p.reply)), nil
 }
 
 func (p *countingSummarizer) count() int {
