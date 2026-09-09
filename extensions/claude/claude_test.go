@@ -64,7 +64,11 @@ func TestMaxTokensReturnsTypedPartialResult(t *testing.T) {
 			option.WithMaxRetries(0),
 		),
 	}
-	res, err := core.New(p).Run(context.Background(), "go")
+	agent, err := core.New(p, core.AgentConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := agent.Run(context.Background(), "go")
 	if !errors.Is(err, core.ErrTokenLimit) {
 		t.Fatalf("err = %v, want core.ErrTokenLimit", err)
 	}

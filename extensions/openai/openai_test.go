@@ -120,7 +120,11 @@ func TestLengthReturnsTypedPartialResult(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	res, err := core.New(New("m", srv.URL)).Run(context.Background(), "go")
+	agent, err := core.New(New("m", srv.URL), core.AgentConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := agent.Run(context.Background(), "go")
 	if !errors.Is(err, core.ErrTokenLimit) {
 		t.Fatalf("err = %v, want core.ErrTokenLimit", err)
 	}
@@ -338,10 +342,12 @@ func TestStreamEndToEndThroughLoop(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	agent := core.New(New("m", srv.URL))
-	agent.RegisterTool(core.Func("echo", "echo", func(_ context.Context, _ struct{}) (string, error) {
+	agent, err := core.New(New("m", srv.URL), core.AgentConfig{Tools: []core.Tool{core.Func("echo", "echo", func(_ context.Context, _ struct{}) (string, error) {
 		return "echoed", nil
-	}))
+	})}})
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	res, err := agent.RunStream(context.Background(), "go", nil)
 	if err != nil {

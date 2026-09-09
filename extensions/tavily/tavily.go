@@ -2,7 +2,10 @@
 // (https://tavily.com), so a researcher agent can use the vendor-neutral
 // tools.WebSearch tool with Tavily as the backend:
 //
-//	agent.RegisterTool(tools.WebSearch(tavily.New(apiKey)))
+//	agent, err := core.New(provider, core.AgentConfig{
+//	    Tools: []core.Tool{tools.WebSearch(tavily.New(apiKey))},
+//	})
+//	if err != nil { /* handle invalid configuration */ }
 package tavily
 
 import (

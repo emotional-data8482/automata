@@ -207,9 +207,6 @@ func convertResponse(msg wireMessage) core.Message {
 	}
 	for _, tc := range msg.ToolCalls {
 		args := tc.Function.Arguments
-		if args == "" {
-			args = "{}"
-		}
 		blocks = append(blocks, core.ToolUseBlock{
 			ID:    tc.ID,
 			Name:  tc.Function.Name,

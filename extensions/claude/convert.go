@@ -225,9 +225,6 @@ func convertResponse(resp *anthropic.Message) core.Message {
 			})
 		case anthropic.ToolUseBlock:
 			args := v.JSON.Input.Raw()
-			if args == "" {
-				args = "{}"
-			}
 			blocks = append(blocks, core.ToolUseBlock{
 				ID:    v.ID,
 				Name:  v.Name,

@@ -4,7 +4,8 @@
 // configurable base URL.
 //
 //	p := openai.New("gpt-4o", "https://api.openai.com/v1").WithAPIKey(key)
-//	agent := core.New(p)
+//	agent, err := core.New(p, core.AgentConfig{})
+//	if err != nil { /* handle invalid configuration */ }
 //
 // Block-model notes: thinking and provider-raw blocks are dropped on send
 // (Chat Completions has no input for them); images map to image_url content
