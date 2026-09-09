@@ -82,43 +82,37 @@ func discardLogger() *slog.Logger {
 
 // buildResearcher builds the researcher sub-agent: web search only. The tool
 // is the framework's vendor-neutral tools.WebSearch with Tavily as backend.
-func buildResearcher(cfg appConfig) *core.Agent {
-	a := core.New(claude.New(cfg.researchModel, cfg.apiKey)).
-		WithLogger(discardLogger()).
-		WithSystemPrompt(researcherPrompt).
-		WithMaxSteps(10)
-	a.RegisterTool(tools.WebSearch(tavily.New(cfg.tavilyKey)))
-	return a
+func buildResearcher(cfg appConfig) (*core.Agent, error) {
+	return core.New(claude.New(cfg.researchModel, cfg.apiKey), core.AgentConfig{Logger: discardLogger(), SystemPrompt: researcherPrompt, MaxTurns: 10, Tools: []core.Tool{tools.WebSearch(tavily.New(cfg.tavilyKey))}})
+
 }
 
 // buildWriter builds the writer sub-agent: it composes Markdown and saves it.
-func buildWriter(cfg appConfig, sink func(tea.Msg)) *core.Agent {
-	a := core.New(claude.New(cfg.writerModel, cfg.apiKey)).
-		WithLogger(discardLogger()).
-		WithSystemPrompt(writerPrompt).
-		WithMaxSteps(5)
-	a.RegisterTool(saveDocumentTool(cfg.topic, cfg.outPath, sink))
-	return a
+func buildWriter(cfg appConfig, sink func(tea.Msg)) (*core.Agent, error) {
+	return core.New(claude.New(cfg.writerModel, cfg.apiKey), core.AgentConfig{Logger: discardLogger(), SystemPrompt: writerPrompt, MaxTurns: 5, Tools: []core.Tool{saveDocumentTool(cfg.topic, cfg.outPath, sink)}})
+
 }
 
 // buildOrchestrator builds the top-level agent: it owns the to-do list and
 // delegates to the researcher and writer, which are registered as streaming
 // sub-agent tools. core.AsToolFunc renders each typed assignment into natural
 // language, so the sub-agent prompts carry no JSON-parsing boilerplate.
-func buildOrchestrator(cfg appConfig, store *todoStore, sink func(tea.Msg)) *core.Agent {
-	researcher := buildResearcher(cfg)
-	writer := buildWriter(cfg, sink)
+func buildOrchestrator(cfg appConfig, store *todoStore, sink func(tea.Msg)) (*core.Agent, error) {
+	researcher, err := buildResearcher(cfg)
+	if err != nil {
+		return nil, err
+	}
+	writer, err := buildWriter(cfg, sink)
+	if err != nil {
+		return nil, err
+	}
 
-	a := core.New(claude.New(cfg.orchestratorModel, cfg.apiKey)).
-		WithLogger(discardLogger()).
-		WithSystemPrompt(orchestratorPrompt).
-		WithMaxSteps(30)
-	a.RegisterTool(todoTool(store, sink))
-	a.RegisterTool(core.AsToolFunc(researcher, "researcher",
-		"Delegate a focused research assignment. Provide a topic and optional specific questions; returns concise notes with source URLs.",
-		renderResearchTask))
-	a.RegisterTool(core.AsToolFunc(writer, "writer",
-		"Delegate writing the final report. Provide a title, an outline, and the combined research notes; it composes the Markdown, saves the file, and returns the saved path.",
-		renderWriteTask))
-	return a
+	return core.New(claude.New(cfg.orchestratorModel, cfg.apiKey), core.AgentConfig{Logger: discardLogger(), SystemPrompt: orchestratorPrompt, MaxTurns: 30, Tools: []core.Tool{todoTool(store, sink),
+		core.AsToolFunc(researcher, "researcher",
+			"Delegate a focused research assignment. Provide a topic and optional specific questions; returns concise notes with source URLs.",
+			renderResearchTask),
+		core.AsToolFunc(writer, "writer",
+			"Delegate writing the final report. Provide a title, an outline, and the combined research notes; it composes the Markdown, saves the file, and returns the saved path.",
+			renderWriteTask)}})
+
 }

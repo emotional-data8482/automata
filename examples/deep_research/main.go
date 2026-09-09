@@ -89,7 +89,7 @@ func main() {
 
 	// Build the orchestrator once the topic is known (the save filename derives
 	// from it), so it works for both the arg and interactive-prompt paths.
-	build := func(topic string) *core.Agent {
+	build := func(topic string) (*core.Agent, error) {
 		c := cfg
 		c.topic = topic
 		return buildOrchestrator(c, store, sink)

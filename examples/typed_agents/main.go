@@ -92,8 +92,11 @@ func main() {
 	}
 
 	meter := &usageMeter{}
-	orchestrator := newOrchestrator(claude.New(model, os.Getenv("ANTHROPIC_API_KEY")), meter, *native)
+	orchestrator, err := newOrchestrator(claude.New(model, os.Getenv("ANTHROPIC_API_KEY")), meter, *native)
 
+	if err != nil {
+		exitf("construct agents: %v", err)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
@@ -103,7 +106,7 @@ func main() {
 	// including failures.
 	opts := []core.RunOption{
 		core.WithMaxCorrectionTurns(2),
-		core.WithPostRunHook(checkpointTo(*statePath)),
+		core.WithCheckpointHook(checkpointTo(*statePath)),
 	}
 	if *native {
 		opts = append(opts, core.WithNativeStructuredOutput())
@@ -132,7 +135,10 @@ func main() {
 	if err != nil {
 		exitf("reload session: %v", err)
 	}
-	session = orchestrator.ResumeSession(transcript)
+	session, err = orchestrator.ResumeSession(transcript)
+	if err != nil {
+		exitf("resume session: %v", err)
+	}
 	fmt.Printf("\n\033[2mcheckpointed %d messages to %s and resumed from it\033[0m\n",
 		len(transcript), *statePath)
 
@@ -154,14 +160,12 @@ func main() {
 		len(session.Messages()), meter.report())
 }
 
-// checkpointTo returns a post-run hook that writes the committed transcript to
-// path. Hooks fire after every underlying run — the initial turn, each
-// correction turn, and the forced fallback — and also after failures, so the
-// file always reflects the last committed state. The hook's context keeps the
+// checkpointTo writes each changed canonical transcript boundary to path,
+// including tool turns, typed corrections, fallback, and partial failures. The hook's context keeps the
 // run's values but drops its deadline, so a checkpoint still completes when the
 // run was canceled; a real store should impose its own timeout.
-func checkpointTo(path string) core.PostRunHook {
-	return func(_ context.Context, res core.RunResult, _ error) error {
+func checkpointTo(path string) core.CheckpointHook {
+	return func(_ context.Context, res core.Checkpoint, _ error) error {
 		blob, err := json.MarshalIndent(res.Messages, "", "  ")
 		if err != nil {
 			return err

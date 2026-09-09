@@ -82,7 +82,7 @@ type model struct {
 	sub    chan tea.Msg
 	ctx    context.Context
 	cancel context.CancelFunc
-	build  func(topic string) *core.Agent
+	build  func(topic string) (*core.Agent, error)
 
 	input    textinput.Model
 	spinner  spinner.Model
@@ -105,7 +105,7 @@ type model struct {
 	height  int
 }
 
-func newModel(cfg appConfig, sub chan tea.Msg, ctx context.Context, cancel context.CancelFunc, build func(string) *core.Agent) model {
+func newModel(cfg appConfig, sub chan tea.Msg, ctx context.Context, cancel context.CancelFunc, build func(string) (*core.Agent, error)) model {
 	ti := textinput.New()
 	ti.Placeholder = "e.g. the impact of GLP-1 drugs on US healthcare costs"
 	ti.Focus()
@@ -149,7 +149,10 @@ func (m model) Init() tea.Cmd {
 // doneMsg when it returns.
 func (m model) startRun(topic string) tea.Cmd {
 	return func() tea.Msg {
-		orch := m.build(topic)
+		orch, err := m.build(topic)
+		if err != nil {
+			return doneMsg{err: err}
+		}
 		go func() {
 			res, err := orch.RunStream(m.ctx, topic, func(ev core.StreamEvent) {
 				m.sub <- uiEvent{ev: ev}

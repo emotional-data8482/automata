@@ -56,33 +56,25 @@ type Diagnosis struct {
 // newLibrarian builds the knowledge-base sub-agent. Its prompt says nothing
 // about JSON: the orchestrator's typed arguments are rendered into plain
 // English by the AsToolFunc renderer in newOrchestrator.
-func newLibrarian(p core.Provider) *core.Agent {
-	return core.New(p).
-		WithSystemPrompt(`You are a support knowledge-base librarian.
+func newLibrarian(p core.Provider) (*core.Agent, error) {
+	return core.New(p, core.AgentConfig{SystemPrompt: `You are a support knowledge-base librarian.
 
 Search the knowledge base with the kb_search tool, then answer in at most six
 lines. Always cite the article IDs you used (e.g. KB-104). If nothing relevant
-exists, say so plainly instead of guessing.`).
-		WithMaxSteps(6).
-		WithToolPolicy(core.ToolPolicy{Timeout: 15 * time.Second, MaxCalls: 6}).
-		WithTools(kbSearchTool())
+exists, say so plainly instead of guessing.`, MaxTurns: 6, ToolPolicy: core.ToolPolicy{Timeout: 15 * time.Second, MaxCalls: 6}, Tools: []core.Tool{kbSearchTool()}})
 }
 
 // newDiagnostician builds the service-health sub-agent. It answers through
 // core.RunTyped, so its system prompt describes the investigation, not the
 // output format — the schema derived from Diagnosis is what constrains the
 // answer.
-func newDiagnostician(p core.Provider) *core.Agent {
-	return core.New(p).
-		WithSystemPrompt(`You are a site-reliability engineer on the incident desk.
+func newDiagnostician(p core.Provider) (*core.Agent, error) {
+	return core.New(p, core.AgentConfig{SystemPrompt: `You are a site-reliability engineer on the incident desk.
 
 Check the named component with the service_status tool before concluding
 anything, and check its dependencies when the status mentions them. Base every
 claim on tool output; never invent metrics. Report low confidence rather than
-overstating a cause you could not confirm.`).
-		WithMaxSteps(8).
-		WithToolPolicy(core.ToolPolicy{Timeout: 15 * time.Second, MaxCalls: 8}).
-		WithTools(serviceStatusTool())
+overstating a cause you could not confirm.`, MaxTurns: 8, ToolPolicy: core.ToolPolicy{Timeout: 15 * time.Second, MaxCalls: 8}, Tools: []core.Tool{serviceStatusTool()}})
 }
 
 // ---------------------------------------------------------------------------
@@ -93,9 +85,15 @@ overstating a cause you could not confirm.`).
 // sub-agent is not a special kind of object here — it is an ordinary Agent
 // adapted to the Tool interface, so the orchestrator's model picks it the same
 // way it picks kb_search.
-func newOrchestrator(p core.Provider, meter *usageMeter, native bool) *core.Agent {
-	librarian := newLibrarian(p)
-	diagnostician := newDiagnostician(p)
+func newOrchestrator(p core.Provider, meter *usageMeter, native bool) (*core.Agent, error) {
+	librarian, err := newLibrarian(p)
+	if err != nil {
+		return nil, err
+	}
+	diagnostician, err := newDiagnostician(p)
+	if err != nil {
+		return nil, err
+	}
 
 	// Options for the diagnostician's own typed run. WithNativeStructuredOutput
 	// asks the provider to enforce the schema itself (Anthropic
@@ -107,45 +105,42 @@ func newOrchestrator(p core.Provider, meter *usageMeter, native bool) *core.Agen
 		childOpts = append(childOpts, core.WithNativeStructuredOutput())
 	}
 
-	return core.New(p).
-		WithSystemPrompt(orchestratorPrompt).
-		WithMaxSteps(12).
-		WithToolPolicy(core.ToolPolicy{
-			// A timeout here bounds a complete sub-agent run, not just one of
-			// its turns.
-			Timeout: 90 * time.Second,
-			// Total call budgets are shared atomically with nested sub-agent
-			// runs, so a chatty child cannot outspend the parent's budget.
-			MaxCalls:    12,
-			MaxParallel: 2,
-		}).
-		WithTools(
-			// Pattern 1 — typed in, prose out. AsToolFunc advertises the
-			// schema derived from librarianQuery and renders the decoded
-			// params into the child's task string. (core.AsTool[P] is the
-			// zero-config variant: it forwards the raw JSON arguments as the
-			// task instead.)
-			core.AsToolFunc[librarianQuery](librarian, "librarian",
-				"Search the internal knowledge base for prior write-ups about a customer problem.",
-				func(q librarianQuery) string {
-					return fmt.Sprintf("Customer problem: %s\n\nSearch the knowledge base for: %s",
-						q.Problem, strings.Join(q.Keywords, ", "))
-				}),
+	return core.New(p, core.AgentConfig{SystemPrompt: orchestratorPrompt, MaxTurns: 12, ToolPolicy: core.ToolPolicy{
+		// A timeout here bounds a complete sub-agent run, not just one of
+		// its turns.
+		Timeout: 90 * time.Second,
+		// Total call budgets are shared atomically with nested sub-agent
+		// runs, so a chatty child cannot outspend the parent's budget.
+		MaxCalls:    12,
+		MaxParallel: 2,
+	}, Tools: []core.Tool{
 
-			// Pattern 2 — typed in, typed out. The child's answer is decoded
-			// and validated as a Diagnosis before the orchestrator sees it.
-			typedAgentTool[diagnosisRequest, Diagnosis](diagnostician, "diagnostician",
-				"Diagnose a failing component against live service status. Returns a JSON diagnosis.",
-				meter,
-				func(r diagnosisRequest) string {
-					task := fmt.Sprintf("Investigate the %s component.\nSymptoms: %s", r.Component, r.Symptoms)
-					if r.SinceUTC != "" {
-						task += "\nStarted at: " + r.SinceUTC
-					}
-					return task
-				},
-				childOpts...),
-		)
+		// Pattern 1 — typed in, prose out. AsToolFunc advertises the
+		// schema derived from librarianQuery and renders the decoded
+		// params into the child's task string. (core.AsTool[P] is the
+		// zero-config variant: it forwards the raw JSON arguments as the
+		// task instead.)
+		core.AsToolFunc[librarianQuery](librarian, "librarian",
+			"Search the internal knowledge base for prior write-ups about a customer problem.",
+			func(q librarianQuery) string {
+				return fmt.Sprintf("Customer problem: %s\n\nSearch the knowledge base for: %s",
+					q.Problem, strings.Join(q.Keywords, ", "))
+			}),
+
+		// Pattern 2 — typed in, typed out. The child's answer is decoded
+		// and validated as a Diagnosis before the orchestrator sees it.
+		typedAgentTool[diagnosisRequest, Diagnosis](diagnostician, "diagnostician",
+			"Diagnose a failing component against live service status. Returns a JSON diagnosis.",
+			meter,
+			func(r diagnosisRequest) string {
+				task := fmt.Sprintf("Investigate the %s component.\nSymptoms: %s", r.Component, r.Symptoms)
+				if r.SinceUTC != "" {
+					task += "\nStarted at: " + r.SinceUTC
+				}
+				return task
+			},
+			childOpts...)}},
+	)
 }
 
 // typedAgentTool adapts an agent into a tool whose input *and* output are

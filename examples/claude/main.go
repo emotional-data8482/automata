@@ -34,11 +34,7 @@ func main() {
 
 	provider := claude.New(model, os.Getenv("ANTHROPIC_API_KEY"))
 
-	agent := core.New(provider).
-		WithSystemPrompt("You are a concise assistant. Use the available tools when they help you answer precisely.").
-		WithMaxSteps(5)
-
-	agent.RegisterTool(core.Func("current_time",
+	agent, err := core.New(provider, core.AgentConfig{SystemPrompt: "You are a concise assistant. Use the available tools when they help you answer precisely.", MaxTurns: 5, Tools: []core.Tool{core.Func("current_time",
 		"Returns the current wall-clock time in the given IANA timezone.",
 		func(_ context.Context, p currentTimeParams) (string, error) {
 			loc := time.UTC
@@ -50,9 +46,13 @@ func main() {
 				loc = l
 			}
 			return time.Now().In(loc).Format(time.RFC1123), nil
-		}))
+		})}})
 
-	_, err := agent.RunStream(
+	if err != nil {
+		panic(err)
+	}
+
+	_, err = agent.RunStream(
 		context.Background(),
 		"What time is it right now in Tokyo, and how many hours ahead of UTC is that?",
 		func(ev core.StreamEvent) {

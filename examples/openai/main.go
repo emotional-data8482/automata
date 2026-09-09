@@ -36,10 +36,7 @@ func main() {
 		New(envOr("OPENAI_MODEL", "gpt-4o-mini"), envOr("OPENAI_BASE_URL", "https://api.openai.com/v1")).
 		WithAPIKey(os.Getenv("OPENAI_API_KEY"))
 
-	agent := core.New(provider).
-		WithSystemPrompt("You are a concise assistant. Use tools when they help.")
-
-	agent.RegisterTool(core.Func("current_time", "Get the current time in a timezone",
+	agent, err := core.New(provider, core.AgentConfig{SystemPrompt: "You are a concise assistant. Use tools when they help.", Tools: []core.Tool{core.Func("current_time", "Get the current time in a timezone",
 		func(_ context.Context, a timeArgs) (string, error) {
 			loc := time.UTC
 			if a.TZ != "" {
@@ -48,7 +45,11 @@ func main() {
 				}
 			}
 			return time.Now().In(loc).Format(time.RFC1123), nil
-		}))
+		})}})
+
+	if err != nil {
+		panic(err)
+	}
 
 	res, err := agent.RunStream(
 		context.Background(),
