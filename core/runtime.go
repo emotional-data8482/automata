@@ -27,6 +27,10 @@ const (
 	runtimeReceiptsBucket  = "runtime_receipts"
 )
 
+// runtimeRecoverPageSize bounds how many run records one recovery scan page
+// decodes. Records are compact; transcripts load only when a run is inspected.
+const runtimeRecoverPageSize = 128
+
 var (
 	ErrDefinitionNotRegistered = errors.New("runtime definition is not registered")
 	ErrDefinitionConflict      = errors.New("runtime definition registration conflicts")
@@ -366,20 +370,33 @@ func (r *Runtime) Handle(runID string) *RunHandle {
 	return &RunHandle{runtime: r, runID: runID}
 }
 
-// Recover enumerates persisted work. Ready work with a registered binding is
-// resumed. A run found in running state came from an interrupted owner and is
-// conservatively marked attention-needed; T03/T04 add finer-grained recovery.
+// Recover enumerates persisted work in bounded pages. Ready work with a
+// registered binding is resumed. A run found in running state came from an
+// interrupted owner and is conservatively marked attention-needed; T03/T04 add
+// finer-grained recovery.
 func (r *Runtime) Recover(ctx context.Context) error {
 	var records []storedRuntimeRun
 	if err := r.transaction(ctx, false, func(tx StoreTransaction) error {
-		return tx.Scan(runtimeRunsBucket, "", func(_ string, raw []byte) error {
-			record, err := decodeRuntimeRun(raw)
+		// Records are compact; one read transaction pages through every run
+		// without decoding any transcript.
+		after := ""
+		for {
+			last, err := tx.ScanPage(runtimeRunsBucket, "", after, runtimeRecoverPageSize, func(_ string, raw []byte) error {
+				record, err := decodeRuntimeRun(raw)
+				if err != nil {
+					return err
+				}
+				records = append(records, record)
+				return nil
+			})
 			if err != nil {
 				return err
 			}
-			records = append(records, record)
-			return nil
-		})
+			if last == "" {
+				return nil
+			}
+			after = last
+		}
 	}); err != nil {
 		return err
 	}

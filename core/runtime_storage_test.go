@@ -523,3 +523,54 @@ func TestRuntimeUnsupportedStorageVersionIsRejectedWithoutRewrite(t *testing.T) 
 		t.Fatal(err)
 	}
 }
+
+// --- paged recovery ----------------------------------------------------------
+
+type countingScanPageStore struct {
+	Store
+	scans atomic.Int32
+}
+
+func (s *countingScanPageStore) Transaction(ctx context.Context, writable bool, fn func(StoreTransaction) error) error {
+	return s.Store.Transaction(ctx, writable, func(tx StoreTransaction) error {
+		return fn(&countingScanPageTransaction{StoreTransaction: tx, store: s})
+	})
+}
+
+type countingScanPageTransaction struct {
+	StoreTransaction
+	store *countingScanPageStore
+}
+
+func (tx *countingScanPageTransaction) ScanPage(bucket, prefix, after string, limit int, visit func(string, []byte) error) (string, error) {
+	tx.store.scans.Add(1)
+	return tx.StoreTransaction.ScanPage(bucket, prefix, after, limit, visit)
+}
+
+func TestRuntimeRecoverPagesThroughRuns(t *testing.T) {
+	base := &memoryStore{buckets: make(map[string]map[string][]byte)}
+	store := &countingScanPageStore{Store: base}
+	runtime, err := NewRuntime(context.Background(), RuntimeConfig{Store: store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = runtime.Close() })
+	for i := range runtimeRecoverPageSize*3 + 5 {
+		record := storedRuntimeRun{
+			Version: runtimeEncodingVersion, RunID: fmt.Sprintf("%032x", i), DefinitionID: "agent",
+			DefinitionRevision: "v1", Task: "work", State: RuntimeTerminal, Generation: 1,
+			Result: RunResult{RunID: fmt.Sprintf("%032x", i), Status: RunCompleted, Output: "done"},
+		}
+		if err := base.Transaction(context.Background(), true, func(tx StoreTransaction) error {
+			return putRuntimeRun(tx, record)
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := runtime.Recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := store.scans.Load(); got < 4 {
+		t.Fatalf("recovery used %d scan pages, want at least 4", got)
+	}
+}
