@@ -9,6 +9,7 @@ import (
 	"sync"
 )
 
+// ErrStoreKeyNotFound is returned when a transaction reads a missing key.
 var ErrStoreKeyNotFound = errors.New("runtime store key not found")
 
 // Store is the provider-neutral persistence port used by Runtime. A Store owns
@@ -29,10 +30,25 @@ type StoreTransaction interface {
 	Get(bucket, key string) ([]byte, error)
 	Put(bucket, key string, value []byte) error
 	Scan(bucket, prefix string, visit func(key string, value []byte) error) error
+	// ScanPage visits entries with the given prefix whose keys are strictly
+	// greater than after, in ascending key order, up to limit entries. It
+	// returns the last visited key, or "" when the page was empty (end of the
+	// prefix range). A limit <= 0 removes the page bound. An error from visit
+	// aborts the scan and fails the transaction; the returned key is the last
+	// entry actually visited before the error.
+	ScanPage(bucket, prefix, after string, limit int, visit func(key string, value []byte) error) (string, error)
+}
+
+// NewMemoryStore returns the explicitly ephemeral Store that backs
+// [NewEphemeralRuntime]. It holds everything in process memory, promises no
+// restart recovery, and exists for tests and intentionally temporary
+// applications. Persistent runtimes must never fall back to it.
+func NewMemoryStore() Store {
+	return &memoryStore{buckets: make(map[string]map[string][]byte)}
 }
 
 func newEphemeralStore() Store {
-	return &memoryStore{buckets: make(map[string]map[string][]byte)}
+	return NewMemoryStore()
 }
 
 type memoryStore struct {
@@ -103,22 +119,33 @@ func (tx *memoryTransaction) Put(bucket, key string, value []byte) error {
 }
 
 func (tx *memoryTransaction) Scan(bucket, prefix string, visit func(string, []byte) error) error {
+	_, err := tx.ScanPage(bucket, prefix, "", 0, visit)
+	return err
+}
+
+func (tx *memoryTransaction) ScanPage(bucket, prefix, after string, limit int, visit func(string, []byte) error) (string, error) {
 	if visit == nil {
-		return nil
+		return "", fmt.Errorf("nil scan visitor")
 	}
-	keys := make([]string, 0, len(tx.source[bucket]))
-	for key := range tx.source[bucket] {
-		if strings.HasPrefix(key, prefix) {
+	values := tx.source[bucket]
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		if strings.HasPrefix(key, prefix) && key > after {
 			keys = append(keys, key)
 		}
 	}
 	sort.Strings(keys)
-	for _, key := range keys {
-		if err := visit(key, append([]byte(nil), tx.source[bucket][key]...)); err != nil {
-			return err
-		}
+	if limit > 0 && len(keys) > limit {
+		keys = keys[:limit]
 	}
-	return nil
+	var last string
+	for _, key := range keys {
+		if err := visit(key, append([]byte(nil), values[key]...)); err != nil {
+			return last, err
+		}
+		last = key
+	}
+	return last, nil
 }
 
 func cloneBuckets(in map[string]map[string][]byte) map[string]map[string][]byte {

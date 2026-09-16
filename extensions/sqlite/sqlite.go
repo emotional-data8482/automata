@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -183,36 +182,68 @@ func (tx *transaction) Put(bucket, key string, value []byte) error {
 }
 
 func (tx *transaction) Scan(bucket, prefix string, visit func(string, []byte) error) error {
+	_, err := tx.ScanPage(bucket, prefix, "", 0, visit)
+	return err
+}
+
+func (tx *transaction) ScanPage(bucket, prefix, after string, limit int, visit func(string, []byte) error) (string, error) {
 	if visit == nil {
-		return nil
+		return "", fmt.Errorf("nil scan visitor")
 	}
-	rows, err := tx.tx.Query(`SELECT key, value FROM runtime_kv WHERE bucket=?`, bucket)
-	if err != nil {
-		return err
+	// Stream in key order with a bounded page size. Keys sharing a prefix are
+	// contiguous in ascending order, so the first mismatch after a match ends
+	// the range without reading the rest of the bucket.
+	pageSize := 256
+	if limit > 0 && limit < pageSize {
+		pageSize = limit
 	}
-	defer rows.Close()
-	type item struct {
-		key   string
-		value []byte
-	}
-	var items []item
-	for rows.Next() {
-		var entry item
-		if err := rows.Scan(&entry.key, &entry.value); err != nil {
-			return err
+	var last string
+	visited := 0
+	cursor := after
+	seenMatch := false
+	for limit <= 0 || visited < limit {
+		rows, err := tx.tx.Query(`SELECT key, value FROM runtime_kv WHERE bucket=? AND key>? ORDER BY key LIMIT ?`, bucket, cursor, pageSize)
+		if err != nil {
+			return last, err
 		}
-		if strings.HasPrefix(entry.key, prefix) {
-			items = append(items, entry)
+		exhausted := true
+		done := false
+		for rows.Next() {
+			exhausted = false
+			var key string
+			var value []byte
+			if err := rows.Scan(&key, &value); err != nil {
+				rows.Close()
+				return last, err
+			}
+			cursor = key
+			if !strings.HasPrefix(key, prefix) {
+				if seenMatch {
+					done = true
+					break
+				}
+				continue
+			}
+			seenMatch = true
+			if err := visit(key, append([]byte(nil), value...)); err != nil {
+				rows.Close()
+				return last, err
+			}
+			last = key
+			visited++
+			if limit > 0 && visited >= limit {
+				done = true
+				break
+			}
+		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			return last, err
+		}
+		if done || exhausted {
+			return last, nil
 		}
 	}
-	if err := rows.Err(); err != nil {
-		return err
-	}
-	sort.Slice(items, func(i, j int) bool { return items[i].key < items[j].key })
-	for _, entry := range items {
-		if err := visit(entry.key, append([]byte(nil), entry.value...)); err != nil {
-			return err
-		}
-	}
-	return nil
+	return last, nil
 }
