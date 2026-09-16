@@ -50,3 +50,7 @@ planning/
 # Pi Config
 .pi/
 .pi-lens.json
+
+internal/durabletest
+
+HARNESS_EVOLUTION.md
