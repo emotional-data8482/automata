@@ -36,17 +36,17 @@ var (
 	ErrToolNotFound = errors.New("tool not found")
 )
 
-// Loop is the execution engine: it holds the per-run conversation state and
-// drives the turn-by-turn cycle for an [Agent]. A Loop is created fresh per run
+// loop is the execution engine: it holds the per-run conversation state and
+// drives the turn-by-turn cycle for an [Agent]. A loop is created fresh per run
 // (see newLoop) and is not reused across runs.
-type Loop struct {
+type loop struct {
 	agent       *Agent
 	messages    []Message
 	toolsByName map[string]registeredTool
 	log         *slog.Logger
 	// emit receives run-level observations (text deltas, tool calls, tool
 	// results). It defaults to a no-op; RunStream installs a callback-backed
-	// sink. Loop code calls it unconditionally. The sink must be safe for
+	// sink. The loop calls it unconditionally. The sink must be safe for
 	// concurrent use — tool-result events fire from the parallel executeTool
 	// goroutines (RunStream's sink serializes with a mutex).
 	emit func(StreamEvent)
@@ -58,11 +58,11 @@ type Loop struct {
 	diagnostics []RunDiagnostic
 }
 
-// newLoop creates a run-scoped Loop for the agent and indexes its tools for
+// newLoop creates a run-scoped loop for the agent and indexes its tools for
 // lookup. With no history the conversation is seeded with the agent's system
 // prompt (if any); a non-empty history (a [Session] transcript, which already
 // carries its system message) is copied in verbatim instead.
-func newLoop(a *Agent, history []Message) *Loop {
+func newLoop(a *Agent, history []Message) *loop {
 	var messages []Message
 	if len(history) > 0 {
 		messages = cloneMessages(history)
@@ -70,7 +70,7 @@ func newLoop(a *Agent, history []Message) *Loop {
 		messages = []Message{SystemMessage(a.systemPrompt)}
 	}
 	toolsByName := make(map[string]registeredTool)
-	return &Loop{
+	return &loop{
 		agent:       a,
 		messages:    messages,
 		toolsByName: toolsByName,
@@ -171,7 +171,7 @@ func WithToolPolicy(policy ToolPolicy) RunOption {
 	return func(c *runConfig) { c.toolPolicy = snapshot.clone() }
 }
 
-func (l *Loop) run(ctx context.Context, task, mode string, cfg runConfig, invoke invokeFn) (RunResult, error) {
+func (l *loop) run(ctx context.Context, task, mode string, cfg runConfig, invoke invokeFn) (RunResult, error) {
 	m := &loopMachine{loop: l, ctx: ctx, task: task, mode: mode, cfg: cfg, invoke: invoke, result: cloneRunResult(cfg.scope.result)}
 	m.result.terminalToolInput = nil
 	m.result.StopReason = StopError
@@ -207,7 +207,7 @@ func normalizeResponseStop(response Response, toolUses []ToolUseBlock) (StopReas
 }
 
 // snapshot returns a copy of the loop's current transcript for a RunResult.
-func (l *Loop) snapshot() []Message {
+func (l *loop) snapshot() []Message {
 	return cloneMessages(l.messages)
 }
 
@@ -228,7 +228,7 @@ func (l *Loop) snapshot() []Message {
 // This is also the pre-append choke point: a future per-result truncation or
 // summarization limiter (see planning/roadmap.md) runs here, after executeTool
 // returns and before the result becomes a transcript message.
-func (l *Loop) executeTool(
+func (l *loop) executeTool(
 	ctx context.Context,
 	call ToolUseBlock,
 	messages []Message,
@@ -364,7 +364,7 @@ func (l *Loop) executeTool(
 // handleToolExecutionFailure distinguishes an Automata-created per-tool
 // deadline (recoverable) from cancellation of the parent run (fatal). It also
 // normalizes limiter and ordinary tool errors into auditable result events.
-func (l *Loop) handleToolExecutionFailure(
+func (l *loop) handleToolExecutionFailure(
 	parentCtx context.Context,
 	execCtx context.Context,
 	call ToolUseBlock,
@@ -424,7 +424,7 @@ func spanLogger(span tracing.Span, log *slog.Logger) *slog.Logger {
 	return log.With("trace_id", traceID, "span_id", spanID)
 }
 
-func (l *Loop) invalidArguments(call ToolUseBlock, err error) ToolResult {
+func (l *loop) invalidArguments(call ToolUseBlock, err error) ToolResult {
 	result := ErrorResult("invalid args: " + err.Error())
 	l.emit(StreamEvent{Kind: StreamToolResult, ToolCall: call, Result: result.Text(), ResultBlocks: result.Blocks, IsError: true, Err: err})
 	return result

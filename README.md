@@ -26,7 +26,7 @@ agents run inside a web server, not a notebook.
 
 | Module / package | What it is |
 | --- | --- |
-| `core` | Agent, Loop, Session, Tool, Provider, streaming, hooks, approval |
+| `core` | Agent, Runtime, Session, Tool, Provider, streaming, hooks, approval |
 | `tools` (module) | First-party tools: `HTTPFetch`, `ReadFile`/`WriteFile` (sandboxed), `Shell` (allow-listed), `WebSearch` |
 | `extensions/claude` (module) | Anthropic provider (`core.StreamProvider`); thinking, images, prompt caching |
 | `extensions/openai` (module) | OpenAI Chat Completions provider (stdlib-only); any OpenAI-compatible base URL |

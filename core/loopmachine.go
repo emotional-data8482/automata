@@ -49,7 +49,7 @@ func validLoopTransition(from, to loopState) bool {
 // loopMachine is the current internal turn driver. Runtime may replace or
 // reshape it as durable transition semantics become richer.
 type loopMachine struct {
-	loop       *Loop
+	loop       *loop
 	ctx        context.Context
 	task, mode string
 	cfg        runConfig

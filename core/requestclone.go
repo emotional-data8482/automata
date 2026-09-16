@@ -76,46 +76,7 @@ func cloneEventPayload(p RunEventPayload) RunEventPayload {
 	case CheckpointCommittedPayload:
 		v.Checkpoint.Messages = cloneMessages(v.Checkpoint.Messages)
 		return v
-	case ProviderRequestPreparedPayload:
-		v.Request = cloneRequest(v.Request)
-		return v
-	case ProviderResponseAcceptedPayload:
-		v.Response.Message = cloneMessages([]Message{v.Response.Message})[0]
-		v.Diagnostics = cloneDiagnostics(v.Diagnostics)
-		return v
-	case ToolBatchStartedPayload:
-		v.Calls = append([]ToolCallData(nil), v.Calls...)
-		for i := range v.Calls {
-			v.Calls[i] = cloneCallData(v.Calls[i])
-		}
-		return v
-	case ToolCallRequestedPayload:
-		v.Call = cloneCallData(v.Call)
-		return v
-	case ToolCallFinishedPayload:
-		v.Call = cloneCallData(v.Call)
-		v.Result.Blocks = cloneBlocks(v.Result.Blocks)
-		return v
-	case ToolBatchFinishedPayload:
-		v.Results = append([]ToolCallFinishedPayload(nil), v.Results...)
-		for i := range v.Results {
-			v.Results[i] = cloneEventPayload(v.Results[i]).(ToolCallFinishedPayload)
-		}
-		return v
-	case TurnFinishedPayload:
-		if v.Response != nil {
-			r := *v.Response
-			r.Message = cloneMessages([]Message{r.Message})[0]
-			v.Response = &r
-		}
-		v.Results = cloneEventPayload(ToolBatchFinishedPayload{Results: v.Results}).(ToolBatchFinishedPayload).Results
-		return v
 	default:
 		return p
 	}
-}
-func cloneCallData(c ToolCallData) ToolCallData {
-	c.Requested = cloneBlock(c.Requested).(ToolUseBlock)
-	c.Effective = cloneBlock(c.Effective).(ToolUseBlock)
-	return c
 }

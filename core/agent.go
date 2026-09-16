@@ -126,7 +126,7 @@ func (a *Agent) Run(ctx context.Context, task string, opts ...RunOption) (RunRes
 
 // runSync drives a pre-built loop through the non-streaming path. Split from
 // Run so a [Session] can supply a loop seeded with its transcript.
-func (a *Agent) runSync(ctx context.Context, l *Loop, task string, cfg runConfig) (RunResult, error) {
+func (a *Agent) runSync(ctx context.Context, l *loop, task string, cfg runConfig) (RunResult, error) {
 	return l.run(ctx, task, "sync", cfg, func(ctx context.Context, _ *slog.Logger, req Request) (Response, error) {
 		return retry.Do(ctx, a.retryCfg, func() (Response, error) {
 			cfg.scope.providerAttempts++

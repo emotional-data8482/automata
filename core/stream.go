@@ -51,7 +51,7 @@ func (a *Agent) RunStream(ctx context.Context, task string, onEvent func(StreamE
 
 // runStream drives a pre-built loop through the streaming path. Split from
 // RunStream so a [Session] can supply a loop seeded with its transcript.
-func (a *Agent) runStream(ctx context.Context, l *Loop, task string, onEvent func(StreamEvent), cfg runConfig) (RunResult, error) {
+func (a *Agent) runStream(ctx context.Context, l *loop, task string, onEvent func(StreamEvent), cfg runConfig) (RunResult, error) {
 	if onEvent == nil {
 		onEvent = func(StreamEvent) {}
 	}

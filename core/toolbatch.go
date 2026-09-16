@@ -24,7 +24,7 @@ type toolBatchOutcome struct {
 // Budget planning is serial and model-ordered; executable calls are then run
 // with optional bounded worker concurrency. Live result events still reflect
 // completion order.
-func (l *Loop) executeToolBatch(
+func (l *loop) executeToolBatch(
 	ctx context.Context,
 	calls []ToolUseBlock,
 	messages []Message,
@@ -148,7 +148,7 @@ func (l *Loop) executeToolBatch(
 	return results, fatalErr
 }
 
-func (l *Loop) policyDeniedToolResult(
+func (l *loop) policyDeniedToolResult(
 	ctx context.Context,
 	call ToolUseBlock,
 	usage toolBudgetUsage,

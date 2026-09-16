@@ -8,8 +8,8 @@ import "context"
 type emitterKey struct{}
 
 // withEmitter returns a child context carrying emit as the active stream sink.
-// A [Loop] driving a RunStream installs its sink here before executing tools
-// (see Loop.executeTool); a plain Run never installs one.
+// A [loop] driving a RunStream installs its sink here before executing tools
+// (see loop.executeTool); a plain Run never installs one.
 func withEmitter(ctx context.Context, emit func(StreamEvent)) context.Context {
 	return context.WithValue(ctx, emitterKey{}, emit)
 }
@@ -30,7 +30,7 @@ func emitterFrom(ctx context.Context) func(StreamEvent) {
 type toolCallIDKey struct{}
 
 // withToolCallID returns a child context carrying id as the active tool-call
-// ID. [Loop.executeTool] installs it (alongside the emitter) before running a
+// ID. [loop.executeTool] installs it (alongside the emitter) before running a
 // tool in a streaming run.
 func withToolCallID(ctx context.Context, id string) context.Context {
 	return context.WithValue(ctx, toolCallIDKey{}, id)
