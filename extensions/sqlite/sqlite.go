@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 
 	"github.com/emotional-data8482/automata/core"
@@ -28,6 +29,9 @@ var ErrOwned = errors.New("sqlite runtime store already has a local owner")
 type Store struct {
 	db       *sql.DB
 	lockFile *os.File
+
+	mu     sync.Mutex
+	closed bool
 }
 
 func Open(ctx context.Context, path string) (*Store, error) {
@@ -109,7 +113,13 @@ func (s *Store) Transaction(ctx context.Context, writable bool, fn func(core.Sto
 	if fn == nil {
 		return fmt.Errorf("nil sqlite store transaction")
 	}
-	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: !writable})
+	s.mu.Lock()
+	closed, db := s.closed, s.db
+	s.mu.Unlock()
+	if closed || db == nil {
+		return errors.New("sqlite runtime store is closed")
+	}
+	tx, err := db.BeginTx(ctx, &sql.TxOptions{ReadOnly: !writable})
 	if err != nil {
 		return err
 	}
@@ -122,14 +132,17 @@ func (s *Store) Transaction(ctx context.Context, writable bool, fn func(core.Sto
 }
 
 func (s *Store) Close() error {
+	s.mu.Lock()
+	s.closed = true
+	db, lockFile := s.db, s.lockFile
+	s.db, s.lockFile = nil, nil
+	s.mu.Unlock()
 	var errs []error
-	if s.db != nil {
-		errs = append(errs, s.db.Close())
-		s.db = nil
+	if db != nil {
+		errs = append(errs, db.Close())
 	}
-	if s.lockFile != nil {
-		errs = append(errs, unlockClose(s.lockFile))
-		s.lockFile = nil
+	if lockFile != nil {
+		errs = append(errs, unlockClose(lockFile))
 	}
 	return errors.Join(errs...)
 }
@@ -158,6 +171,11 @@ func (tx *transaction) Get(bucket, key string) ([]byte, error) {
 func (tx *transaction) Put(bucket, key string, value []byte) error {
 	if !tx.writable {
 		return fmt.Errorf("read-only sqlite store transaction")
+	}
+	// A nil Go slice is a valid zero-length value in the core contract; bind it
+	// as an empty blob, not SQL NULL, so the NOT NULL column accepts it.
+	if value == nil {
+		value = []byte{}
 	}
 	_, err := tx.tx.Exec(`INSERT INTO runtime_kv(bucket, key, value) VALUES (?, ?, ?)
 		ON CONFLICT(bucket, key) DO UPDATE SET value=excluded.value`, bucket, key, value)
