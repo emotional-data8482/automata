@@ -68,6 +68,28 @@ func TestRuntimeRecordEncodingIsStable(t *testing.T) {
 	}
 }
 
+func TestAdmissionDigestRuleIsStable(t *testing.T) {
+	got := admissionDigest(admissionPayload{DefinitionID: "agent", Revision: "v1", Task: "work"})
+	// sha256 of {"definition_id":"agent","revision":"v1","task":"work","deadline":"0001-01-01T00:00:00Z"}:
+	// a zero Deadline still marshals, keeping the rule field-complete.
+	const want = "a9c041113609e2440d326b47a882fff370750a4c5355195a18ed92cc43ab2ccb"
+	if got != want {
+		t.Fatalf("digest rule drifted = %s, want %s", got, want)
+	}
+	if got == admissionDigest(admissionPayload{DefinitionID: "agent", Revision: "v1", Task: "changed"}) {
+		t.Fatal("different payloads produced the same digest")
+	}
+	// The same deadline instant in a different location resolves the same
+	// admission identity: Go marshals time.Time in the value's own zone, so the
+	// rule normalizes to UTC before encoding.
+	zoned := time.Date(2026, 1, 2, 5, 4, 5, 0, time.FixedZone("+02", 2*60*60))
+	utcForm := admissionPayload{DefinitionID: "agent", Revision: "v1", Task: "work", Deadline: zoned}
+	utcForm.Deadline = utcForm.Deadline.UTC()
+	if admissionDigest(admissionPayload{DefinitionID: "agent", Revision: "v1", Task: "work", Deadline: zoned}) != admissionDigest(utcForm) {
+		t.Fatal("same instant in different locations produced different admission digests")
+	}
+}
+
 // --- transcript facts --------------------------------------------------------
 
 func TestRuntimeTranscriptIsStoredAsAppendOnlyFacts(t *testing.T) {
@@ -189,6 +211,117 @@ func TestRuntimeCompactChangesDoNotRewriteUnboundedHistories(t *testing.T) {
 	// them.
 	if float64(large) > 3*float64(small) {
 		t.Fatalf("write amplification: %d bytes for %d turns vs %d bytes for %d turns", large, long, small, short)
+	}
+}
+
+// --- receipts and lost acknowledgements --------------------------------------
+
+func TestRuntimeLostAdmissionAcknowledgementResolvesOnRetry(t *testing.T) {
+	base := &memoryStore{buckets: make(map[string]map[string][]byte)}
+	store := &unknownAdmissionStore{Store: base, err: errors.New("admission commit outcome unknown")}
+	provider := &countingRuntimeProvider{}
+	runtime, err := NewRuntime(context.Background(), RuntimeConfig{Store: store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = runtime.Close() })
+	if err := runtime.Register("agent", "v1", testAgent(provider)); err != nil {
+		t.Fatal(err)
+	}
+	options := SubmitOptions{Scope: "tenant", Key: "lost-ack"}
+
+	store.armed.Store(true)
+	if _, err := runtime.Submit(context.Background(), "agent", "v1", "work", options); !errors.Is(err, store.err) {
+		t.Fatalf("lost acknowledgement = %v", err)
+	}
+	runID := onlyStoredRunID(t, base)
+
+	// A later cancel command commits before the lost acknowledgement resolves.
+	if err := runtime.Handle(runID).Cancel(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	retried, err := runtime.Submit(context.Background(), "agent", "v1", "work", options)
+	if err != nil || retried.ID() != runID {
+		t.Fatalf("resolved admission = %q, %v; want run %q", retried.ID(), err, runID)
+	}
+	result, err := retried.Await(context.Background())
+	if !errors.Is(err, context.Canceled) || result.Status != RunCancelled || result.RunID != runID {
+		t.Fatalf("resolved receipt = %#v, %v; want the cancelled run without dispatch", result, err)
+	}
+	if got := provider.calls.Load(); got != 0 {
+		t.Fatalf("provider dispatched against stale pre-cancel state %d times", got)
+	}
+
+	// The same flow without cancel B resumes the run exactly once.
+	base2 := &memoryStore{buckets: make(map[string]map[string][]byte)}
+	store2 := &unknownAdmissionStore{Store: base2, err: errors.New("admission commit outcome unknown")}
+	runtime2, err := NewRuntime(context.Background(), RuntimeConfig{Store: store2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = runtime2.Close() })
+	if err := runtime2.Register("agent", "v1", testAgent(provider)); err != nil {
+		t.Fatal(err)
+	}
+	store2.armed.Store(true)
+	if _, err := runtime2.Submit(context.Background(), "agent", "v1", "work", options); err == nil {
+		t.Fatal("expected unknown admission outcome")
+	}
+	resumed, err := runtime2.Submit(context.Background(), "agent", "v1", "work", options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	awaitCtx, awaitCancel := context.WithTimeout(context.Background(), time.Second)
+	defer awaitCancel()
+	result, err = resumed.Await(awaitCtx)
+	if err != nil || result.Output != "done" {
+		t.Fatalf("resumed run = %#v, %v", result, err)
+	}
+	if got := provider.calls.Load(); got != 1 {
+		t.Fatalf("provider calls = %d, want 1", got)
+	}
+}
+
+func TestRuntimeCancelReceiptSurvivesLaterCommits(t *testing.T) {
+	base := &memoryStore{buckets: make(map[string]map[string][]byte)}
+	store := &unknownAdmissionStore{Store: base, err: errors.New("admission commit outcome unknown")}
+	runtime, err := NewRuntime(context.Background(), RuntimeConfig{Store: store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = runtime.Close() })
+	if err := runtime.Register("agent", "v1", testAgent(&countingRuntimeProvider{})); err != nil {
+		t.Fatal(err)
+	}
+	store.armed.Store(true)
+	if _, err := runtime.Submit(context.Background(), "agent", "v1", "work", SubmitOptions{Scope: "tenant", Key: "cancel-receipt"}); err == nil {
+		t.Fatal("expected unknown admission outcome")
+	}
+	runID := onlyStoredRunID(t, base)
+	handle := runtime.Handle(runID)
+	if err := handle.Cancel(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Corrupt the record state to prove the retry resolves from the receipt,
+	// not from re-deriving current state: a receipt-blind retry would rewrite
+	// the running record to terminal-cancelled again.
+	if err := base.Transaction(context.Background(), true, func(tx StoreTransaction) error {
+		record, err := getRuntimeRun(tx, runID)
+		if err != nil {
+			return err
+		}
+		record.State = RuntimeRunning
+		return putRuntimeRun(tx, record)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := handle.Cancel(context.Background()); err != nil {
+		t.Fatalf("cancel retry did not resolve its receipt: %v", err)
+	}
+	record := getRecord(t, base, runID)
+	if record.State != RuntimeRunning || record.Result.Status != RunCancelled || record.Generation != 2 {
+		t.Fatalf("retry re-derived state instead of resolving its receipt: %#v", record)
 	}
 }
 

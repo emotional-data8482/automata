@@ -24,6 +24,7 @@ const (
 	runtimeRunsBucket      = "runtime_runs"
 	runtimeAdmissionBucket = "runtime_admissions"
 	runtimeFactsBucket     = "runtime_facts"
+	runtimeReceiptsBucket  = "runtime_receipts"
 )
 
 var (
@@ -97,6 +98,40 @@ type storedRuntimeRun struct {
 	AttentionReason    string          `json:"attention_reason,omitempty"`
 	HookResults        []RunHookResult `json:"hook_results,omitempty"`
 }
+
+// admissionPayload is the canonical admission identity payload. Its JSON
+// encoding is the version 2 digest rule: changing any field, tag, or encoding
+// changes every persisted admission digest and requires a new encoding
+// version.
+type admissionPayload struct {
+	DefinitionID string    `json:"definition_id"`
+	Revision     string    `json:"revision"`
+	Task         string    `json:"task"`
+	Deadline     time.Time `json:"deadline,omitempty"`
+}
+
+// admissionDigest derives the canonical admission identity digest. The
+// deadline is normalized to UTC before encoding: Go marshals time.Time in the
+// value's own location, and the same instant expressed in a different zone
+// must resolve the same run, not mint a new identity.
+func admissionDigest(payload admissionPayload) string {
+	payload.Deadline = payload.Deadline.UTC()
+	data, _ := json.Marshal(payload)
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
+// cancelReceipt is the durable receipt for one cancel command. It commits
+// atomically with the state change it drove, so an exact retry resolves the
+// original outcome even after a lost acknowledgement and any later commands.
+type cancelReceipt struct {
+	Version       int          `json:"version"`
+	RunID         string       `json:"run_id"`
+	Generation    uint64       `json:"generation"`
+	ObservedState RuntimeState `json:"observed_state"`
+}
+
+func cancelReceiptKey(runID string) string { return "cancel\x00" + runID }
 
 type admissionRecord struct {
 	RunID  string `json:"run_id"`
@@ -253,14 +288,7 @@ func (r *Runtime) submit(ctx context.Context, definitionID, revision, task strin
 	if _, err := r.binding(definitionID, revision); err != nil {
 		return nil, err
 	}
-	payload, _ := json.Marshal(struct {
-		DefinitionID string
-		Revision     string
-		Task         string
-		Deadline     time.Time
-	}{definitionID, revision, task, options.Deadline})
-	digest := sha256.Sum256(payload)
-	digestText := hex.EncodeToString(digest[:])
+	digestText := admissionDigest(admissionPayload{DefinitionID: definitionID, Revision: revision, Task: task, Deadline: options.Deadline})
 	var runID string
 	var shouldStart bool
 	err := r.transaction(ctx, true, func(tx StoreTransaction) error {
@@ -926,9 +954,21 @@ func resultWithRunID(result RunResult, runID string) RunResult {
 func (h *RunHandle) Cancel(ctx context.Context) error {
 	var cancel context.CancelFunc
 	err := h.runtime.transaction(ctx, true, func(tx StoreTransaction) error {
+		// Resolve an exact retry from the persisted receipt before touching
+		// current state: a lost acknowledgement followed by any later command
+		// still resolves the original outcome without re-deriving state.
+		if _, err := tx.Get(runtimeReceiptsBucket, cancelReceiptKey(h.runID)); err == nil {
+			return nil
+		} else if !errors.Is(err, ErrStoreKeyNotFound) {
+			return err
+		}
 		record, err := getRuntimeRun(tx, h.runID)
 		if err != nil {
 			return err
+		}
+		receipt := cancelReceipt{
+			Version: runtimeEncodingVersion, RunID: h.runID,
+			Generation: record.Generation, ObservedState: record.State,
 		}
 		switch record.State {
 		case RuntimeFinalizing, RuntimeTerminal:
@@ -942,6 +982,13 @@ func (h *RunHandle) Cancel(ctx context.Context) error {
 		}
 		record.Generation++
 		if err := putRuntimeRun(tx, record); err != nil {
+			return err
+		}
+		data, err := json.Marshal(receipt)
+		if err != nil {
+			return err
+		}
+		if err := tx.Put(runtimeReceiptsBucket, cancelReceiptKey(h.runID), data); err != nil {
 			return err
 		}
 		h.runtime.mu.Lock()
