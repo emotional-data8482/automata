@@ -18,6 +18,11 @@ import (
 
 const schemaVersion = 1
 
+// userVersionPragma is the fixed statement that stamps the schema version.
+// SQLite cannot bind PRAGMA arguments as query parameters, so the statement is
+// a literal rather than formatted; a test pins it to schemaVersion.
+const userVersionPragma = "PRAGMA user_version=1"
+
 var ErrOwned = errors.New("sqlite runtime store already has a local owner")
 
 type Store struct {
@@ -92,7 +97,9 @@ func (s *Store) initialize(ctx context.Context) error {
 	)`); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version=%d", schemaVersion)); err != nil {
+	// SQLite cannot bind PRAGMA arguments as query parameters; the statement
+	// is the fixed literal above, never assembled from input.
+	if _, err := tx.ExecContext(ctx, userVersionPragma); err != nil {
 		return err
 	}
 	return tx.Commit()

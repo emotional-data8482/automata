@@ -4,11 +4,20 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"testing"
 
 	"github.com/emotional-data8482/automata/core"
 )
+
+// The schema stamp is a fixed literal because SQLite cannot bind PRAGMA
+// arguments; this guard fails when the literal drifts from schemaVersion.
+func TestUserVersionPragmaMatchesSchemaVersion(t *testing.T) {
+	if userVersionPragma != fmt.Sprintf("PRAGMA user_version=%d", schemaVersion) {
+		t.Fatalf("user_version stamp %q does not match schema version %d", userVersionPragma, schemaVersion)
+	}
+}
 
 func TestPersistentRuntimeReopensTerminalRun(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "runtime.sqlite")
