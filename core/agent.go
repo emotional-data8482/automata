@@ -25,10 +25,8 @@ type Agent struct {
 	defaultCallOptions CallOptions
 	toolPolicy         ToolPolicy
 
-	preSendHooks    []PreSendHook
-	observers       []RunObserver
-	checkpointHooks []CheckpointHook
-	postRunHooks    []PostRunHook
+	preSendHooks []PreSendHook
+	observers    []RunObserver
 }
 
 // DefaultMaxTurns bounds a zero-config agent's public invocation.
@@ -51,8 +49,6 @@ type AgentConfig struct {
 	ToolPolicy         ToolPolicy
 	PreSendHooks       []PreSendHook
 	Observers          []RunObserver
-	CheckpointHooks    []CheckpointHook
-	PostRunHooks       []PostRunHook
 }
 
 // New validates and freezes reusable configuration before any run is admitted.
@@ -80,10 +76,8 @@ func New(p Provider, config AgentConfig) (*Agent, error) {
 		maxSteps: config.MaxTurns, retryCfg: retry.DefaultConfig(), tracer: config.Tracer,
 		log: config.Logger, approver: config.Approver,
 		defaultCallOptions: cloneCallOptions(config.DefaultCallOptions), toolPolicy: config.ToolPolicy.clone(),
-		preSendHooks:    append([]PreSendHook(nil), config.PreSendHooks...),
-		observers:       append([]RunObserver(nil), config.Observers...),
-		checkpointHooks: append([]CheckpointHook(nil), config.CheckpointHooks...),
-		postRunHooks:    append([]PostRunHook(nil), config.PostRunHooks...)}
+		preSendHooks: append([]PreSendHook(nil), config.PreSendHooks...),
+		observers:    append([]RunObserver(nil), config.Observers...)}
 	if config.Retry != nil {
 		a.retryCfg = *config.Retry
 	}
@@ -113,10 +107,12 @@ func nilDependency(v any) bool {
 	return false
 }
 
-// Run executes the agent on task and returns the [RunResult]. Options customize
-// this run only; [WithCallOptions] overrides the agent's default call options,
-// while [WithPostRunHook] observes the completed result. The result is
-// populated as far as the run got, even on error.
+// Run executes the agent directly on task and returns the [RunResult]. Options customize
+// this run only; [WithCallOptions] overrides the agent's default call options.
+// The result is populated as far as the run got, even on error.
+//
+// Run is a process-local convenience and is not persistent. New durable code
+// registers the Agent with [Runtime] and uses Runtime.Run or Runtime.Submit.
 func (a *Agent) Run(ctx context.Context, task string, opts ...RunOption) (RunResult, error) {
 	cfg := a.newRunConfig(opts)
 	s, err := a.beginRun(ctx, cfg, nil, nil, "sync")
@@ -147,7 +143,7 @@ func (a *Agent) runSync(ctx context.Context, l *Loop, task string, cfg runConfig
 // newRunConfig resolves the effective run configuration: the agent's default
 // CallOptions and ToolPolicy with each RunOption applied in order.
 func (a *Agent) newRunConfig(opts []RunOption) runConfig {
-	cfg := runConfig{options: cloneCallOptions(a.defaultCallOptions), toolPolicy: a.toolPolicy.clone(), maxTurns: a.maxSteps, observers: append([]RunObserver(nil), a.observers...), checkpointHooks: append([]CheckpointHook(nil), a.checkpointHooks...), postRunHooks: append([]PostRunHook(nil), a.postRunHooks...)}
+	cfg := runConfig{options: cloneCallOptions(a.defaultCallOptions), toolPolicy: a.toolPolicy.clone(), maxTurns: a.maxSteps, observers: append([]RunObserver(nil), a.observers...)}
 	for _, opt := range opts {
 		if opt != nil {
 			opt(&cfg)

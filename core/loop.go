@@ -127,12 +127,11 @@ type RunResult struct {
 // [RunOption]s before the loop starts.
 type runConfig struct {
 	// options is the merged CallOptions sent on every provider turn.
-	options         CallOptions
-	maxTurns        int
-	observers       []RunObserver
-	checkpointHooks []CheckpointHook
-	optionErr       error
-	scope           *runScope
+	options   CallOptions
+	maxTurns  int
+	observers []RunObserver
+	optionErr error
+	scope     *runScope
 	// toolPolicy contains the run-scoped local execution controls. A RunOption
 	// replaces the Agent default before execution state is allocated.
 	toolPolicy ToolPolicy
@@ -143,9 +142,10 @@ type runConfig struct {
 	// executing it; the call's Input is recorded in the result. Used by typed
 	// runs; empty for ordinary runs.
 	terminalTool string
-	// postRunHooks observe the fully populated result after the owning run API
-	// has finalized its state. They are added with [WithPostRunHook].
-	postRunHooks []PostRunHook
+	// durableTransition is installed only by Runtime. The existing loop calls
+	// it at safety-relevant boundaries before it can dispatch requested tools.
+	// Direct compatibility entry points leave it nil.
+	durableTransition func(context.Context, durableLoopTransition) error
 	// maxCorrectionTurns bounds model-mediated correction turns in typed runs
 	// (see [WithMaxCorrectionTurns]). nil means the default of 1.
 	maxCorrectionTurns *int
@@ -155,8 +155,12 @@ type runConfig struct {
 	nativeStructuredOutput bool
 }
 
-// RunOption customizes a single run. See [WithCallOptions], [WithToolPolicy],
-// and [WithPostRunHook].
+type durableLoopTransition struct {
+	Kind   string
+	Result RunResult
+}
+
+// RunOption customizes a single run. See [WithCallOptions] and [WithToolPolicy].
 type RunOption func(*runConfig)
 
 // WithToolPolicy replaces the Agent's default [ToolPolicy] for one run. Unlike

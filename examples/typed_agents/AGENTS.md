@@ -1,7 +1,7 @@
 # Typed agents example guidance
 
 This example demonstrates typed sub-agent handoffs, typed session results, and
-JSON transcript checkpoint/resume behavior.
+explicit JSON transcript save/resume behavior.
 
 - Keep typed schemas small, explicit, and useful at orchestration boundaries.
 - Preserve the distinction between `AsToolFunc` natural-language handoffs and

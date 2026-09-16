@@ -122,9 +122,7 @@ func RunTyped[T any](ctx context.Context, a *Agent, task string, opts ...RunOpti
 // errors.Is) is returned with the per-field violations; malformed JSON wraps
 // the syntax error as the error's Cause. The [RunResult] is returned alongside
 // T (populated as far as the run got, even on error) so callers still see
-// cumulative usage, turns, and the transcript. [CheckpointHook]s see each
-// committed boundary; [PostRunHook]s fire once after the complete typed run,
-// including corrections, fallback, and typed validation.
+// cumulative usage, turns, and the transcript.
 func RunSessionTyped[T any](ctx context.Context, session *Session, task string, opts ...RunOption) (value T, result RunResult, runErr error) {
 	session.runMu.Lock()
 	defer session.runMu.Unlock()

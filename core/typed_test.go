@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -268,35 +269,21 @@ func TestRunTypedCorrectionProviderErrorPropagates(t *testing.T) {
 	}
 }
 
-// TestRunSessionTypedCorrectionCheckpointsEachRun pins that post-run hooks
-// fire per underlying run: initial + correction, each with its own transcript.
-func TestRunSessionTypedCorrectionCheckpointsEachRun(t *testing.T) {
+func TestRunSessionTypedCorrectionCommitsConversation(t *testing.T) {
 	provider := &scriptedProvider{turns: []Message{
 		asstTool("s1", structuredOutputToolName, `{"name":"Ada"}`),
 		asstTool("s2", structuredOutputToolName, `{"name":"Ada","age":36}`),
 	}}
 	session := testAgent(provider).NewSession()
-	var lengths []int
-	hook := WithCheckpointHook(func(_ context.Context, result Checkpoint, runErr error) error {
-		if runErr != nil {
-			t.Errorf("hook runErr = %v, want nil", runErr)
-		}
-		lengths = append(lengths, len(result.Messages))
-		return nil
-	})
-
-	got, _, err := RunSessionTyped[personResult](context.Background(), session, "who?", hook)
+	got, result, err := RunSessionTyped[personResult](context.Background(), session, "who?")
 	if err != nil {
 		t.Fatalf("RunSessionTyped: %v", err)
 	}
 	if got.Name != "Ada" || got.Age != 36 {
 		t.Errorf("decoded = %+v, want Ada/36", got)
 	}
-	if len(lengths) != 2 {
-		t.Fatalf("hook fired %d times, want 2 (initial + correction)", len(lengths))
-	}
-	if lengths[0] >= lengths[1] {
-		t.Errorf("correction checkpoint transcript not longer: %v", lengths)
+	if !reflect.DeepEqual(session.Messages(), result.Messages) {
+		t.Errorf("corrected result was not committed to the conversation")
 	}
 }
 
@@ -702,56 +689,21 @@ func TestRunSessionTypedResumeJSONRoundTrip(t *testing.T) {
 	}
 }
 
-// TestRunSessionTypedFallbackCheckpointsEachRun pins the checkpoint cadence:
-// the prose attempt is committed first, followed by the forced typed run.
-func TestRunSessionTypedFallbackCheckpointsEachRun(t *testing.T) {
+func TestRunSessionTypedFallbackCommitsConversation(t *testing.T) {
 	provider := &forcingProvider{replies: []Message{
 		asstText("Ada is 36 years old."),
 		asstTool("s2", structuredOutputToolName, `{"name":"Ada","age":36}`),
 	}}
 	session := testAgent(provider).NewSession()
-	var transcriptLengths []int
-	hook := WithCheckpointHook(func(_ context.Context, result Checkpoint, runErr error) error {
-		if runErr != nil {
-			t.Errorf("hook runErr = %v, want nil", runErr)
-		}
-		transcriptLengths = append(transcriptLengths, len(result.Messages))
-		return nil
-	})
-
-	got, _, err := RunSessionTyped[personResult](context.Background(), session, "who?", hook)
+	got, result, err := RunSessionTyped[personResult](context.Background(), session, "who?")
 	if err != nil {
 		t.Fatalf("RunSessionTyped: %v", err)
 	}
 	if got.Name != "Ada" || got.Age != 36 {
 		t.Errorf("decoded = %+v, want Ada/36", got)
 	}
-	if len(transcriptLengths) != 2 || transcriptLengths[0] != 2 || transcriptLengths[1] != 5 {
-		t.Errorf("checkpoint transcript lengths = %v, want [2 5]", transcriptLengths)
-	}
-}
-
-func TestRunSessionTypedStopsWhenFirstCheckpointFails(t *testing.T) {
-	checkpointErr := errors.New("checkpoint failed")
-	provider := &forcingProvider{replies: []Message{
-		asstText("Ada is 36 years old."),
-		asstTool("s2", structuredOutputToolName, `{"name":"Ada","age":36}`),
-	}}
-	session := testAgent(provider).NewSession()
-
-	_, result, err := RunSessionTyped[personResult](context.Background(), session, "who?",
-		WithCheckpointHook(func(context.Context, Checkpoint, error) error {
-			return checkpointErr
-		}),
-	)
-	if !errors.Is(err, checkpointErr) {
-		t.Fatalf("err = %v, want checkpoint failure", err)
-	}
-	if provider.calls != 1 {
-		t.Errorf("provider calls = %d, want 1 (forced fallback must not start)", provider.calls)
-	}
-	if result.Output != "Ada is 36 years old." || len(session.Messages()) != 2 {
-		t.Errorf("first run result/session = %+v / %+v", result, session.Messages())
+	if len(result.Messages) != 5 || !reflect.DeepEqual(session.Messages(), result.Messages) {
+		t.Errorf("fallback conversation = %+v", result.Messages)
 	}
 }
 

@@ -5,7 +5,6 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
-	"fmt"
 	"reflect"
 )
 
@@ -42,11 +41,6 @@ type Checkpoint struct {
 	ProviderAttempts int
 }
 
-// CheckpointHook persists committed history. Finalization supplies a
-// value-preserving, cancellation-detached context; implementations bound their
-// own storage work. Returning an error stops continuation after all hooks run.
-type CheckpointHook func(context.Context, Checkpoint, error) error
-
 // runScope owns a public invocation. Internal machines and typed phases
 // borrow it; background delivery does not
 // create another owner. Children own distinct scopes and inherit only total tool
@@ -58,18 +52,15 @@ type runScope struct {
 	usage                               Usage
 	policy                              *toolPolicyState
 	observers                           []RunObserver
-	checkpointHooks                     []CheckpointHook
-	postRunHooks                        []PostRunHook
 	result                              RunResult
 	ctx                                 context.Context
 	commit                              func([]Message)
 	checkpointMessages                  []Message
-	finalization                        runFinalization
 	sequence                            uint64
 }
 
-func newRunScope(parentRunID, parentInvocationID string, cfg runConfig) *runScope {
-	return &runScope{id: newRunIdentity(), parentRunID: parentRunID, parentInvocationID: parentInvocationID, config: cfg, postRunHooks: append([]PostRunHook(nil), cfg.postRunHooks...), observers: append([]RunObserver(nil), cfg.observers...), checkpointHooks: append([]CheckpointHook(nil), cfg.checkpointHooks...)}
+func newRunScopeWithID(parentRunID, parentInvocationID string, cfg runConfig, id string) *runScope {
+	return &runScope{id: id, parentRunID: parentRunID, parentInvocationID: parentInvocationID, config: cfg, observers: append([]RunObserver(nil), cfg.observers...)}
 }
 func newRunIdentity() string {
 	var id [16]byte
@@ -78,43 +69,28 @@ func newRunIdentity() string {
 	}
 	return hex.EncodeToString(id[:])
 }
-func newInvocationIdentity() string { return newRunIdentity() }
 
-// runFinalization keeps the execution outcome distinct from persistence failures.
-// An execution cancellation/limit wins over hook failures; errors.Join retains
-// all causes for errors.Is/errors.As. Hook-only context errors mean failed storage,
-// not cancellation of the public execution.
-type runFinalization struct {
-	executionErr     error
-	checkpointErrors []error
-	postRunErrors    []error
-}
-
-func (f runFinalization) outcome() (RunStatus, error) {
+func runOutcome(executionErr error) RunStatus {
 	status := RunCompleted
-	if f.executionErr != nil {
+	if executionErr != nil {
 		switch {
-		case errors.Is(f.executionErr, context.Canceled), errors.Is(f.executionErr, context.DeadlineExceeded):
+		case errors.Is(executionErr, context.Canceled), errors.Is(executionErr, context.DeadlineExceeded):
 			status = RunCancelled
-		case errors.Is(f.executionErr, ErrMaxStepsExceeded), errors.Is(f.executionErr, ErrTokenLimit):
+		case errors.Is(executionErr, ErrMaxStepsExceeded), errors.Is(executionErr, ErrTokenLimit):
 			status = RunLimitReached
 		default:
 			status = RunFailed
 		}
 	}
-	errs := []error{f.executionErr}
-	errs = append(errs, f.checkpointErrors...)
-	errs = append(errs, f.postRunErrors...)
-	err := errors.Join(errs...)
-	if err != nil && status == RunCompleted {
-		status = RunFailed
-	}
-	return status, err
+	return status
 }
 
 // beginRun admits an invocation before validating its effective options.
 func (a *Agent) beginRun(ctx context.Context, cfg runConfig, history []Message, commit func([]Message), mode string) (*runScope, error) {
-	s := newRunScope("", "", cfg)
+	return a.beginRunWithID(ctx, cfg, history, commit, mode, newRunIdentity())
+}
+func (a *Agent) beginRunWithID(ctx context.Context, cfg runConfig, history []Message, commit func([]Message), mode, runID string) (*runScope, error) {
+	s := newRunScopeWithID("", "", cfg, runID)
 	s.ctx = ctx
 	s.commit = commit
 	s.checkpointMessages = cloneMessages(history)
@@ -156,9 +132,9 @@ func (s *runScope) emit(ctx context.Context, turn int, p RunEventPayload) {
 		}()
 	}
 }
-func (s *runScope) checkpoint(messages []Message, executionErr error) error {
+func (s *runScope) checkpoint(messages []Message) {
 	if reflect.DeepEqual(messages, s.checkpointMessages) {
-		return nil
+		return
 	}
 	s.checkpointMessages = cloneMessages(messages)
 	if s.commit != nil {
@@ -166,44 +142,34 @@ func (s *runScope) checkpoint(messages []Message, executionErr error) error {
 	}
 	cp := Checkpoint{RunID: s.id, Turn: s.turns, Messages: cloneMessages(messages), Usage: s.usage, Turns: s.turns, ProviderAttempts: s.providerAttempts}
 	s.emit(s.ctx, s.turns, CheckpointCommittedPayload{Checkpoint: cp})
-	var errs []error
-	for i, h := range s.checkpointHooks {
-		if h != nil {
-			c := cp
-			c.Messages = cloneMessages(cp.Messages)
-			if e := h(context.WithoutCancel(s.ctx), c, executionErr); e != nil {
-				errs = append(errs, fmt.Errorf("checkpoint hook %d failed: %w", i, e))
-			}
-		}
-	}
-	s.finalization.checkpointErrors = append(s.finalization.checkpointErrors, errs...)
-	return errors.Join(errs...)
 }
-func (s *runScope) finish(result RunResult, executionErr error) (RunResult, error) {
-	var checkpointErr *checkpointFailure
-	if errors.As(executionErr, &checkpointErr) {
-		executionErr = checkpointErr.executionErr
+func (s *runScope) finalize(result RunResult, executionErr error) (RunResult, error) {
+	var transitionErr *durableTransitionFailure
+	if errors.As(executionErr, &transitionErr) {
+		executionErr = transitionErr.executionErr
 	}
-	s.finalization.executionErr = executionErr
 	result.RunID = s.id
 	result.Turns = s.turns
 	result.ProviderAttempts = s.providerAttempts
 	result.Usage = s.usage
-	result.Status, executionErr = s.finalization.outcome()
-	for i, h := range s.postRunHooks {
-		if h != nil {
-			if err := h(context.WithoutCancel(s.ctx), cloneRunResult(result), executionErr); err != nil {
-				s.finalization.postRunErrors = append(s.finalization.postRunErrors, fmt.Errorf("post-run hook %d failed: %w", i, err))
-			}
-		}
-	}
-	var err error
-	result.Status, err = s.finalization.outcome()
-	s.emit(s.ctx, 0, RunFinishedPayload{Result: result, Err: err})
-	return cloneRunResult(result), err
+	result.Status = runOutcome(executionErr)
+	return cloneRunResult(result), executionErr
 }
 
-type checkpointFailure struct{ executionErr error }
+func (s *runScope) finish(result RunResult, executionErr error) (RunResult, error) {
+	result, executionErr = s.finalize(result, executionErr)
+	s.emit(s.ctx, 0, RunFinishedPayload{Result: result, Err: executionErr})
+	return cloneRunResult(result), executionErr
+}
 
-func (e *checkpointFailure) Error() string { return "checkpoint failed" }
-func (e *checkpointFailure) Unwrap() error { return e.executionErr }
+type durableTransitionFailure struct {
+	executionErr error
+	cause        error
+}
+
+func (e *durableTransitionFailure) Error() string {
+	return "durable transition failed: " + e.cause.Error()
+}
+func (e *durableTransitionFailure) Unwrap() error {
+	return errors.Join(e.executionErr, e.cause)
+}

@@ -128,7 +128,7 @@ func TestInvalidConstructionAndAdmittedOptions(t *testing.T) {
 	}
 	var kinds []RunEventKind
 	a := newTestAgent(t, p, AgentConfig{})
-	r, e := a.Run(context.Background(), "go", WithMaxTurns(0), WithObserver(func(_ context.Context, e RunEvent) { kinds = append(kinds, e.Kind) }), WithCheckpointHook(func(context.Context, Checkpoint, error) error { t.Error("invalid run checkpointed"); return nil }))
+	r, e := a.Run(context.Background(), "go", WithMaxTurns(0), WithObserver(func(_ context.Context, e RunEvent) { kinds = append(kinds, e.Kind) }))
 	if e == nil || r.Status != RunFailed || r.RunID == "" || r.Turns != 0 || len(r.Messages) != 0 || !reflect.DeepEqual(kinds, []RunEventKind{RunStarted, RunFinished}) {
 		t.Fatalf("%+v %v %v", r, e, kinds)
 	}
@@ -142,58 +142,15 @@ func TestTypedPublicAccountingAndFinalization(t *testing.T) {
 				p.turns[0] = withUsage(asstText("unusable"), &Usage{InputTokens: 10})
 			}
 			a := newTestAgent(t, p, AgentConfig{})
-			post := 0
-			checkpoints := 0
-			opts := []RunOption{WithPostRunHook(func(_ context.Context, r RunResult, e error) error {
-				post++
-				if r.Turns != 2 || r.Usage.InputTokens != 18 || e != nil {
-					t.Errorf("hook %+v %v", r, e)
-				}
-				return nil
-			}), WithCheckpointHook(func(context.Context, Checkpoint, error) error { checkpoints++; return nil })}
+			var opts []RunOption
 			if native {
 				opts = append(opts, WithNativeStructuredOutput())
 			}
 			_, r, e := RunTyped[personResult](context.Background(), a, "go", opts...)
-			if e != nil || r.Turns != 2 || r.ProviderAttempts != 2 || r.Usage.InputTokens != 18 || post != 1 || checkpoints != 2 {
-				t.Fatalf("%+v %v post %d checkpoints %d", r, e, post, checkpoints)
+			if e != nil || r.Turns != 2 || r.ProviderAttempts != 2 || r.Usage.InputTokens != 18 {
+				t.Fatalf("%+v %v", r, e)
 			}
 		})
-	}
-}
-
-func TestCheckpointCommitIsolationAndStop(t *testing.T) {
-	p := &optionsProvider{turns: []Message{asstTool("a", "echo", `{"msg":"hi"}`), asstText("should not run")}}
-	a := newTestAgent(t, p, AgentConfig{Tools: []Tool{Func("echo", "", func(context.Context, echoArgs) (string, error) { return "ok", nil })}})
-	s := a.NewSession()
-	storage := errors.New("storage")
-	hooks := 0
-	post := 0
-	_, e := s.Run(context.Background(), "go", WithCheckpointHook(func(ctx context.Context, c Checkpoint, _ error) error {
-		hooks++
-		if len(s.Messages()) != 3 || ctx.Err() != nil {
-			t.Error("not committed/detached")
-		}
-		c.Messages[1].Blocks[0].(ToolUseBlock).Input[0] = '!'
-		return storage
-	}), WithCheckpointHook(func(_ context.Context, c Checkpoint, _ error) error {
-		hooks++
-		if !json.Valid(c.Messages[1].ToolUses()[0].Input) {
-			t.Error("hook alias")
-		}
-		return context.Canceled
-	}), WithPostRunHook(func(_ context.Context, r RunResult, e error) error {
-		post++
-		if r.Status != RunFailed || !errors.Is(e, storage) {
-			t.Errorf("post %+v %v", r, e)
-		}
-		return nil
-	}))
-	if !errors.Is(e, storage) || hooks != 2 || post != 1 || p.calls != 1 {
-		t.Fatalf("%v %d %d %d", e, hooks, post, p.calls)
-	}
-	if _, e := json.Marshal(s.Messages()); e != nil {
-		t.Fatal(e)
 	}
 }
 

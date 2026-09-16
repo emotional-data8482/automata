@@ -46,8 +46,8 @@ func validLoopTransition(from, to loopState) bool {
 	return false
 }
 
-// loopMachine owns one internal execution phase. Public typed-run ownership is
-// intentionally separate; correction still starts another phase until Task 5.
+// loopMachine is the current internal turn driver. Runtime may replace or
+// reshape it as durable transition semantics become richer.
 type loopMachine struct {
 	loop       *Loop
 	ctx        context.Context
@@ -121,15 +121,31 @@ func (m *loopMachine) drive() (RunResult, error) {
 			m.result.Turns = m.cfg.scope.turns
 			m.result.ProviderAttempts = m.cfg.scope.providerAttempts
 			m.result.Usage = m.cfg.scope.usage
-			if e := m.cfg.scope.checkpoint(m.loop.messages, m.err); e != nil {
-				m.err = &checkpointFailure{executionErr: m.err}
-			}
+			m.cfg.scope.checkpoint(m.loop.messages)
 			m.cfg.scope.result = cloneRunResult(m.result)
 			next = loopStateDone
 		}
 		m.transition(next)
 	}
 	return m.result, m.err
+}
+
+func (m *loopMachine) persistTransition(kind string) error {
+	if m.cfg.durableTransition == nil {
+		return nil
+	}
+	result := cloneRunResult(m.result)
+	result.RunID = m.cfg.scope.id
+	result.Messages = m.loop.snapshot()
+	result.Diagnostics = append(result.Diagnostics, m.loop.diagnostics...)
+	result.Output = result.FinalMessage.Text()
+	result.Turns = m.cfg.scope.turns
+	result.ProviderAttempts = m.cfg.scope.providerAttempts
+	result.Usage = m.cfg.scope.usage
+	return m.cfg.durableTransition(context.WithoutCancel(m.ctx), durableLoopTransition{
+		Kind:   kind,
+		Result: result,
+	})
 }
 func (m *loopMachine) fail(err error) loopState { m.err = err; return loopStateFinish }
 func (m *loopMachine) start() loopState {
@@ -317,6 +333,12 @@ func (m *loopMachine) classifyResponse() loopState {
 		result.FinalMessage = cloneMessages([]Message{msg})[0]
 	}
 	m.response.Message = msg
+	// Runtime persists every accepted provider turn before the loop can
+	// dispatch its requested tools. This is an internal transition of the
+	// existing machine, not a competing execution loop.
+	if err := m.persistTransition("provider_accepted"); err != nil {
+		return m.fail(&durableTransitionFailure{cause: err})
+	}
 	if err := ctx.Err(); err != nil {
 		return m.failCompletion(StopCancelled, rawStopReason, errors.Join(err, response.completionErr))
 	}
@@ -404,6 +426,9 @@ func (m *loopMachine) executeTools() loopState {
 				})
 			}
 			l.messages = append(l.messages, results...)
+			if err := m.persistTransition("batch_committed"); err != nil {
+				return m.fail(&durableTransitionFailure{cause: err})
+			}
 			result.StopReason = StopEndTurn
 			log.InfoContext(ctx, "run complete via terminal tool", "tool", cfg.terminalTool, "steps", result.Steps)
 			return loopStateFinish
@@ -415,14 +440,15 @@ func (m *loopMachine) executeTools() loopState {
 	approverMessages := l.messages
 	results, fatalErr := l.executeToolBatch(ctx, toolUses, approverMessages, m.policy)
 	l.messages = append(l.messages, results...)
+	if err := m.persistTransition("batch_committed"); err != nil {
+		return m.fail(&durableTransitionFailure{executionErr: fatalErr, cause: err})
+	}
 	if fatalErr != nil {
 		span.RecordError(fatalErr)
 		span.SetStatus(fatalErr)
 		return m.fail(fatalErr)
 	}
-	if err := m.cfg.scope.checkpoint(l.messages, nil); err != nil {
-		return m.fail(&checkpointFailure{})
-	}
+	m.cfg.scope.checkpoint(l.messages)
 	m.step++
 	return loopStatePrepareTurn
 }

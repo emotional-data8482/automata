@@ -9,12 +9,12 @@
 //  2. Typed sessions. core.RunSessionTyped decodes each turn of a multi-turn
 //     Session into a validated Go struct, so an orchestrator's decisions are
 //     data rather than prose — and the conversation (sub-agent calls included)
-//     persists to JSON and resumes between turns.
+//     can be serialized to JSON and resumed between turns.
 //
 // The scenario is a support desk. An orchestrator triages one ticket by
 // delegating to a librarian sub-agent (knowledge base) and a diagnostician
 // sub-agent (service status), returns a validated Triage struct, is
-// checkpointed to disk and resumed from that file, then drafts the customer
+// written to disk and resumed from that file, then drafts the customer
 // reply as a second typed turn — a different result type on the same
 // conversation.
 //
@@ -101,12 +101,9 @@ func main() {
 	defer cancel()
 
 	// Run options shared by both typed turns. WithMaxCorrectionTurns bounds how
-	// many turns are spent feeding validation errors back to the model; the
-	// post-run hook checkpoints the transcript after each underlying run,
-	// including failures.
+	// many turns are spent feeding validation errors back to the model.
 	opts := []core.RunOption{
 		core.WithMaxCorrectionTurns(2),
-		core.WithCheckpointHook(checkpointTo(*statePath)),
 	}
 	if *native {
 		opts = append(opts, core.WithNativeStructuredOutput())
@@ -119,6 +116,9 @@ func main() {
 	seen := len(session.Messages())
 	triage, res, err := core.RunSessionTyped[Triage](ctx, session,
 		"Triage this ticket:\n\n"+ticket, opts...)
+	if writeErr := saveTranscript(*statePath, res.Messages); writeErr != nil {
+		exitf("save session: %v", writeErr)
+	}
 	if err != nil {
 		fail("triage", res, err)
 	}
@@ -149,6 +149,9 @@ func main() {
 		"Draft the reply we send to Priya. Use the triage you just produced — the "+
 			"sub-agents' findings are already in this conversation, so only call them "+
 			"again if something is genuinely missing.", opts...)
+	if writeErr := saveTranscript(*statePath, res.Messages); writeErr != nil {
+		exitf("save session: %v", writeErr)
+	}
 	if err != nil {
 		fail("reply", res, err)
 	}
@@ -160,18 +163,12 @@ func main() {
 		len(session.Messages()), meter.report())
 }
 
-// checkpointTo writes each changed canonical transcript boundary to path,
-// including tool turns, typed corrections, fallback, and partial failures. The hook's context keeps the
-// run's values but drops its deadline, so a checkpoint still completes when the
-// run was canceled; a real store should impose its own timeout.
-func checkpointTo(path string) core.CheckpointHook {
-	return func(_ context.Context, res core.Checkpoint, _ error) error {
-		blob, err := json.MarshalIndent(res.Messages, "", "  ")
-		if err != nil {
-			return err
-		}
-		return os.WriteFile(path, blob, 0o600)
+func saveTranscript(path string, messages []core.Message) error {
+	blob, err := json.MarshalIndent(messages, "", "  ")
+	if err != nil {
+		return err
 	}
+	return os.WriteFile(path, blob, 0o600)
 }
 
 func loadTranscript(path string) ([]core.Message, error) {

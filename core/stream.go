@@ -22,7 +22,7 @@ type partialBlock struct {
 	input     strings.Builder // tool_use input (partial JSON)
 }
 
-// RunStream runs the agent like [Agent.Run] but delivers a live event stream to
+// RunStream runs the agent directly like [Agent.Run] but delivers a live event stream to
 // onEvent as the run progresses: assistant content deltas ([StreamText]), each
 // tool call the model requests ([StreamToolCall]), and each tool result
 // ([StreamToolResult]). Switch on [StreamEvent.Kind] to handle each variant.
@@ -35,6 +35,9 @@ type partialBlock struct {
 // onEvent may be called from multiple goroutines (tool results are produced
 // concurrently), but RunStream serializes the calls, so the callback need not be
 // safe for concurrent use.
+//
+// RunStream is a process-local convenience and is not persistent.
+// [Runtime.RunStream] provides the durable lifecycle with a detachable view.
 func (a *Agent) RunStream(ctx context.Context, task string, onEvent func(StreamEvent), opts ...RunOption) (RunResult, error) {
 	cfg := a.newRunConfig(opts)
 	scope, err := a.beginRun(ctx, cfg, nil, nil, "stream")

@@ -1,6 +1,11 @@
 package core
 
-import "context"
+import (
+	"context"
+	"fmt"
+	"strings"
+	"time"
+)
 
 // PreSendHook fires once per turn, immediately before the provider invocation.
 // It receives the messages and tools to be sent and returns (possibly modified)
@@ -11,32 +16,45 @@ import "context"
 // Returning a non-nil error aborts the run.
 type PreSendHook func(context.Context, Request) (Request, error)
 
-// PostRunHook fires once after the public invocation, including typed phases
-// and validation, with cumulative accounting and a fully populated result.
-// For a [Session], the canonical transcript is committed before the hook runs,
-// and the session's run lock remains held until every hook has returned.
+// CommittedRunHook observes an execution result after Runtime has durably
+// committed it and before the run becomes terminal. Name identifies the hook
+// in persisted results. Timeout supplies each attempt's context deadline; zero
+// selects 30 seconds. Hook implementations must honor context cancellation.
 //
-// result and its messages are read-only snapshots. runErr is the original run
-// error, if any; it does not include errors returned by earlier post-run hooks.
-// Hooks run even after failures so callers can persist partial transcripts and
-// usage. The supplied context preserves values from the run context but has no
-// cancellation signal or deadline; persistence implementations should impose
-// their own timeout.
-//
-// Returning an error reports a post-run failure to the caller without
-// discarding result. If the run also failed, the errors are joined so both
-// remain discoverable with errors.Is and errors.As.
-type PostRunHook func(
-	ctx context.Context,
-	result RunResult,
-	runErr error,
-) error
+// A hook error is recorded in RunSnapshot.HookResults. It never changes the
+// execution result or its error. Runtime does not automatically retry hooks: a
+// process loss during delivery is an uncertain external effect and recovery
+// moves the run to RuntimeNeedsAttention.
+type CommittedRunHook struct {
+	Name    string
+	Timeout time.Duration
+	Handle  func(context.Context, RunSnapshot) error
+}
 
-// WithPostRunHook registers a hook for one run. Repeated options append hooks,
-// which are invoked in option order after the run boundary. Every hook runs
-// even if an earlier hook returns an error.
-func WithPostRunHook(hook PostRunHook) RunOption {
-	return func(c *runConfig) {
-		c.postRunHooks = append(c.postRunHooks, hook)
+// RunHookResult is the persisted outcome of one committed-run hook attempt.
+// An empty Error means the hook completed successfully.
+type RunHookResult struct {
+	Name  string `json:"name"`
+	Error string `json:"error,omitempty"`
+}
+
+func validateCommittedRunHooks(hooks []CommittedRunHook) ([]CommittedRunHook, error) {
+	seen := make(map[string]struct{}, len(hooks))
+	frozen := append([]CommittedRunHook(nil), hooks...)
+	for i, hook := range frozen {
+		if hook.Name == "" || strings.ContainsRune(hook.Name, '\x00') {
+			return nil, fmt.Errorf("runtime hook %d has an invalid name", i)
+		}
+		if hook.Handle == nil {
+			return nil, fmt.Errorf("runtime hook %q has no handler", hook.Name)
+		}
+		if hook.Timeout < 0 {
+			return nil, fmt.Errorf("runtime hook %q has a negative timeout", hook.Name)
+		}
+		if _, ok := seen[hook.Name]; ok {
+			return nil, fmt.Errorf("runtime hook name %q is duplicated", hook.Name)
+		}
+		seen[hook.Name] = struct{}{}
 	}
+	return frozen, nil
 }

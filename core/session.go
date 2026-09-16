@@ -5,7 +5,7 @@ import (
 	"sync"
 )
 
-// Session is a multi-turn conversation with an [Agent]: each Run or RunStream
+// Session is an in-process multi-turn conversation with an [Agent]: each Run or RunStream
 // continues where the previous one left off, and the full transcript — system
 // prompt, user tasks, assistant replies, tool calls and results — is always
 // available via [Session.Messages]. A plain [Agent.Run] is one-shot and
@@ -20,7 +20,9 @@ import (
 // external side effect while cancellation races its return, and a synthetic
 // canceled result does not imply that side effect was rolled back.
 //
-// Persistence is plain data: [Message] marshals to JSON, so store
+// Session remains useful as the conversation abstraction. This implementation
+// is process-local; Runtime-backed durable conversations will replace its
+// manual persistence path. Until then, [Message] marshals to JSON, so store
 // session.Messages() anywhere and rebuild with [Agent.ResumeSession]:
 //
 //	blob, _ := json.Marshal(session.Messages())

@@ -153,13 +153,13 @@ type TurnFinishedPayload struct {
 func (TurnFinishedPayload) runEventPayload() {}
 
 // CheckpointCommittedPayload is the payload for CheckpointCommitted.
-// After in-memory commit, before checkpoint hooks; turn-scoped (0 if no turn started).
+// After an in-memory conversation commit; turn-scoped (0 if no turn started).
 type CheckpointCommittedPayload struct{ Checkpoint Checkpoint }
 
 func (CheckpointCommittedPayload) runEventPayload() {}
 
 // RunFinishedPayload is the payload for RunFinished.
-// After post-run hooks and error aggregation; run-level (Turn 0).
+// After result finalization; run-level (Turn 0).
 type RunFinishedPayload struct {
 	Result RunResult
 	Err    error

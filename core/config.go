@@ -98,15 +98,6 @@ func WithObserver(o RunObserver) RunOption {
 	}
 }
 
-// WithCheckpointHook registers persistence at each changed canonical boundary.
-func WithCheckpointHook(h CheckpointHook) RunOption {
-	return func(c *runConfig) {
-		if h != nil {
-			c.checkpointHooks = append(c.checkpointHooks, h)
-		}
-	}
-}
-
 type frozenTool struct{ registeredTool }
 
 func (t frozenTool) Definition() ToolDefinition { return cloneToolDefinition(t.definition) }
