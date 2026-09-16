@@ -28,8 +28,11 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 MODULE="github.com/emotional-data8482/automata"
-# Published modules: bumped, tested, tidied, and tagged on every release.
-PUBLISHED=(tools extensions/claude extensions/openai extensions/tavily)
+# Published modules: bumped, tested, tidied, and tagged on every release. A
+# published module may keep a local automata replace while it depends on
+# unreleased core (so `go mod tidy` and `go get` work in it); the release drops
+# that replace and refuses to tag any other.
+PUBLISHED=(tools extensions/claude extensions/openai extensions/tavily extensions/sqlite)
 # Modules that ride along but are neither tagged nor tidied.
 RIDEALONG=(examples/claude examples/openai examples/deep_research)
 
@@ -110,6 +113,18 @@ for m in "${PUBLISHED[@]}" "${RIDEALONG[@]}"; do
     sed -i.bak -E "s|$MODULE v[0-9]+\.[0-9]+\.[0-9]+|$MODULE $NEW|" "$ROOT/$m/go.mod"
     rm -f "$ROOT/$m/go.mod.bak"
     echo "    bumped $m"
+  fi
+done
+
+# Consumers ignore replace directives in a dependency, and the GOWORK=off
+# published-pin check below would silently resolve through one.
+for m in "${PUBLISHED[@]}"; do
+  cp "$ROOT/$m/go.mod" "$ROOT/$m/go.mod.bak"
+  (cd "$ROOT/$m" && go mod edit -dropreplace="$MODULE")
+  cmp -s "$ROOT/$m/go.mod" "$ROOT/$m/go.mod.bak" || echo "    dropped automata replace in $m"
+  rm -f "$ROOT/$m/go.mod.bak"
+  if (cd "$ROOT/$m" && go mod edit -json) | grep -q '"Replace": \['; then
+    die "$m has replace directives; published modules must not"
   fi
 done
 
