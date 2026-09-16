@@ -60,6 +60,10 @@ func TestPersistentRuntimeReopensTerminalRun(t *testing.T) {
 	if snapshot.State != core.RuntimeTerminal || snapshot.Result.Output != "persisted" || snapshot.RunID != result.RunID {
 		t.Fatalf("reopened snapshot = %#v", snapshot)
 	}
+	// The transcript reassembles from append-only fact chunks across reopen.
+	if len(snapshot.Result.Messages) != 2 || snapshot.Result.Messages[1].Text() != "persisted" {
+		t.Fatalf("reopened transcript = %#v", snapshot.Result.Messages)
+	}
 	if err := reopened.Register("agent", "v1", agent); err != nil {
 		t.Fatal(err)
 	}

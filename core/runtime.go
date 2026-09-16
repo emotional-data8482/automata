@@ -13,12 +13,17 @@ import (
 	"time"
 )
 
-const runtimeEncodingVersion = 1
+// runtimeEncodingVersion is the storage encoding this core build reads and
+// writes. Version 2 moves run transcripts into append-only fact chunks and
+// introduces command receipts; version 1 stores were a pre-release prototype
+// and are rejected without rewrite.
+const runtimeEncodingVersion = 2
 
 const (
 	runtimeMetaBucket      = "runtime_meta"
 	runtimeRunsBucket      = "runtime_runs"
 	runtimeAdmissionBucket = "runtime_admissions"
+	runtimeFactsBucket     = "runtime_facts"
 )
 
 var (
@@ -82,6 +87,8 @@ type storedRuntimeRun struct {
 	State              RuntimeState    `json:"state"`
 	Generation         uint64          `json:"generation"`
 	Result             RunResult       `json:"result"`
+	TranscriptChunks   int             `json:"transcript_chunks"`
+	TranscriptMessages int             `json:"transcript_messages"`
 	Error              string          `json:"error,omitempty"`
 	ErrorKind          string          `json:"error_kind,omitempty"`
 	ErrorStopReason    StopReason      `json:"error_stop_reason,omitempty"`
@@ -467,7 +474,13 @@ func (r *Runtime) completeExecution(runID string, result RunResult, runErr, work
 	if err != nil || record.State == RuntimeNeedsAttention {
 		return err
 	}
-	return r.finishHooks(runID, r.invokeCommittedRunHooks(record))
+	// Committed-run hooks observe the record as committed, including its
+	// reassembled transcript.
+	full, err := r.load(context.Background(), runID)
+	if err != nil {
+		return err
+	}
+	return r.finishHooks(runID, r.invokeCommittedRunHooks(full))
 }
 
 func (r *Runtime) persistTransition(ctx context.Context, runID string, transition durableLoopTransition) error {
@@ -479,7 +492,11 @@ func (r *Runtime) persistTransition(ctx context.Context, runID string, transitio
 		if record.State != RuntimeRunning && record.State != RuntimeCancelRequested {
 			return fmt.Errorf("run %s cannot commit transition from %s", runID, record.State)
 		}
+		if err := appendTranscript(tx, runID, &record, transition.Result.Messages); err != nil {
+			return err
+		}
 		record.Result = cloneRunResult(transition.Result)
+		record.Result.Messages = nil
 		record.LastTransition = transition.Kind
 		record.Generation++
 		return putRuntimeRun(tx, record)
@@ -521,7 +538,11 @@ func (r *Runtime) finishExecution(runID string, result RunResult, runErr, worker
 		if err != nil {
 			return err
 		}
+		if err := appendTranscript(tx, runID, &record, result.Messages); err != nil {
+			return err
+		}
 		record.Result = cloneRunResult(result)
+		record.Result.Messages = nil
 		record.Generation++
 		switch {
 		case record.State == RuntimeCancelRequested:
@@ -591,7 +612,11 @@ func (r *Runtime) markAttentionWithResult(ctx context.Context, runID string, res
 		if err != nil {
 			return err
 		}
+		if err := appendTranscript(tx, runID, &record, result.Messages); err != nil {
+			return err
+		}
 		record.Result = cloneRunResult(result)
+		record.Result.Messages = nil
 		record.State = RuntimeNeedsAttention
 		record.AttentionReason = reason
 		record.Generation++
@@ -936,7 +961,7 @@ func (r *Runtime) load(ctx context.Context, runID string) (storedRuntimeRun, err
 	var record storedRuntimeRun
 	err := r.transaction(ctx, false, func(tx StoreTransaction) error {
 		var err error
-		record, err = getRuntimeRun(tx, runID)
+		record, err = loadRuntimeRun(tx, runID)
 		return err
 	})
 	return record, err
@@ -951,6 +976,64 @@ func getRuntimeRun(tx StoreTransaction, runID string) (storedRuntimeRun, error) 
 		return storedRuntimeRun{}, err
 	}
 	return decodeRuntimeRun(raw)
+}
+
+// transcriptFactKey orders transcript chunks by fixed-width hexadecimal
+// sequence so ascending key order is also chunk order.
+func transcriptFactKey(runID string, chunk int) string {
+	return fmt.Sprintf("%s/%016x", runID, chunk)
+}
+
+// appendTranscript persists the not-yet-stored suffix of an append-only run
+// transcript as one fact chunk and updates the record's transcript counts. The
+// run record itself stays compact: compact state changes never rewrite
+// committed history.
+func appendTranscript(tx StoreTransaction, runID string, record *storedRuntimeRun, messages []Message) error {
+	if len(messages) < record.TranscriptMessages {
+		return fmt.Errorf("run %s transcript shrank from %d to %d messages", runID, record.TranscriptMessages, len(messages))
+	}
+	delta := messages[record.TranscriptMessages:]
+	if len(delta) > 0 {
+		data, err := json.Marshal(delta)
+		if err != nil {
+			return fmt.Errorf("encode run %s transcript chunk: %w", runID, err)
+		}
+		if err := tx.Put(runtimeFactsBucket, transcriptFactKey(runID, record.TranscriptChunks), data); err != nil {
+			return err
+		}
+		record.TranscriptChunks++
+	}
+	record.TranscriptMessages = len(messages)
+	return nil
+}
+
+// loadRuntimeRun reads a run record and reassembles its transcript from the
+// run's append-only fact chunks.
+func loadRuntimeRun(tx StoreTransaction, runID string) (storedRuntimeRun, error) {
+	record, err := getRuntimeRun(tx, runID)
+	if err != nil {
+		return storedRuntimeRun{}, err
+	}
+	if record.TranscriptMessages == 0 {
+		return record, nil
+	}
+	messages := make([]Message, 0, record.TranscriptMessages)
+	err = tx.Scan(runtimeFactsBucket, runID+"/", func(_ string, raw []byte) error {
+		var chunk []Message
+		if err := json.Unmarshal(raw, &chunk); err != nil {
+			return fmt.Errorf("decode run %s transcript chunk: %w", runID, err)
+		}
+		messages = append(messages, chunk...)
+		return nil
+	})
+	if err != nil {
+		return storedRuntimeRun{}, err
+	}
+	if len(messages) != record.TranscriptMessages {
+		return storedRuntimeRun{}, fmt.Errorf("run %s transcript has %d stored messages but its record expects %d", runID, len(messages), record.TranscriptMessages)
+	}
+	record.Result.Messages = messages
+	return record, nil
 }
 
 func decodeRuntimeRun(raw []byte) (storedRuntimeRun, error) {
