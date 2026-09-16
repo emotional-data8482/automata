@@ -31,6 +31,7 @@ agents run inside a web server, not a notebook.
 | `extensions/claude` (module) | Anthropic provider (`core.StreamProvider`); thinking, images, prompt caching |
 | `extensions/openai` (module) | OpenAI Chat Completions provider (stdlib-only); any OpenAI-compatible base URL |
 | `extensions/tavily` (module) | Tavily backend for `tools.WebSearch` |
+| `extensions/sqlite` (module) | Optional persistent local store for `core.Runtime`; exclusive single-process ownership |
 | `retry`, `tracing` | Backoff policy and span interfaces used by core |
 | `examples/*` (modules) | Runnable demos, including a multi-agent deep-research TUI |
 
@@ -60,6 +61,18 @@ downstream, so they must require real tagged versions — while `examples/*`
 keep `replace` directives as dev conveniences and are never tagged.
 
 ## Quickstart
+
+For restartable execution, use the explicit durable lifecycle described in
+[docs/durable-runtime.md](docs/durable-runtime.md). Construct a
+`core.Runtime` with `extensions/sqlite`, register an immutable `Agent` revision,
+then submit and await a `RunHandle`. Use `core.NewEphemeralRuntime` only when
+loss on process exit is intentional. Storage failure never falls back to
+memory.
+
+The direct `Agent.Run`, session, and typed helpers shown below are currently
+process-local APIs; they are not persistent Runtime entry points. They are not
+protected as legacy surfaces and will be replaced or routed through Runtime as
+their durable equivalents land.
 
 ```go
 package main
@@ -140,7 +153,7 @@ Call reservations happen before `Approver`; approved calls then apply timeout,
 rate-limit wait, and execution (including any internal `WithToolRetry` attempts).
 A child may add stricter local limits, while timeouts/rate limiters/parallelism
 otherwise remain agent-local. See the
-[tool-execution project notes](planning/projects/tool-execution-safety/README.md)
+[tool-execution project notes](planning/archive/tool-execution-safety/README.md)
 for the complete accounting and composition decisions.
 
 ## Sessions and transcripts
@@ -167,29 +180,12 @@ sess = agent.ResumeSession(transcript)
 _ = draft
 ```
 
-Use a per-run post-run hook to checkpoint the transcript after the session has
-committed it. Hooks also run for failed and canceled runs, receiving the partial
-`RunResult` and the original run error:
-
-```go
-checkpoint := core.WithPostRunHook(func(ctx context.Context, res core.RunResult, runErr error) error {
- blob, err := json.Marshal(res.Messages)
- if err != nil {
-  return err
- }
- return os.WriteFile("session.json", blob, 0o600)
-})
-
-res, err := sess.Run(ctx, "Plan the next bounded cycle", checkpoint)
-```
-
-The hook context retains the run context's values but is detached from its
-cancellation and deadline so cancellation checkpoints can still complete. A
-storage implementation should apply its own timeout. If persistence fails, its
-error is returned (joined with the run error when both fail) without discarding
-the `RunResult`. This is a completed-run boundary checkpoint, not resumable
-execution inside an active provider turn or tool call; action-level idempotency
-should protect external side effects.
+For durable execution, use `Runtime`. The old callback-based checkpoint hook
+was removed because callback success is not proof of durable commit. Runtime
+instead supports named, timeout-bounded `CommittedRunHook`s that run after the
+execution result commits; their outcomes are persisted in `RunSnapshot` and do
+not rewrite the execution result. `Session` remains the process-local
+conversation API while runtime-backed continuation is integrated.
 
 ## Typed results
 
@@ -209,19 +205,19 @@ p, res, err := core.RunTyped[Person](ctx, agent, "Who is Ada Lovelace?")
 // p.Name == "Ada Lovelace"; res carries usage/steps/transcript.
 ```
 
-For a persistent coordinator, use `RunSessionTyped` to keep the conversation
-across typed decisions and JSON persistence:
+Use `RunSessionTyped` to keep a process-local conversation across typed
+decisions:
 
 ```go
 sess := agent.NewSession()
-first, _, err := core.RunSessionTyped[Person](ctx, sess, "Choose the first action", checkpoint)
+first, _, err := core.RunSessionTyped[Person](ctx, sess, "Choose the first action")
 
 blob, _ := json.Marshal(sess.Messages())
 var transcript []core.Message
 _ = json.Unmarshal(blob, &transcript)
 sess = agent.ResumeSession(transcript)
 
-next, res, err := core.RunSessionTyped[Person](ctx, sess, "Choose the next action", checkpoint)
+next, res, err := core.RunSessionTyped[Person](ctx, sess, "Choose the next action")
 _, _, _, _ = first, next, res, err
 ```
 
@@ -248,9 +244,8 @@ violations available via `errors.As(*core.InvalidStructuredOutputError)`. The
 The full sequence per typed call is bounded: 1 (initial) + correction budget +
 1 (forced fallback) provider turns at worst. Prose answers that already
 contain valid JSON (a fenced ```json block or a bare object) are parsed and
-validated with no extra provider turn. Post-run hooks fire after each
-underlying run (initial, every correction, the forced fallback), so
-checkpoint-based persistence sees each committed transcript.
+validated with no extra provider turn. Each phase commits its canonical
+transcript to the owning process-local Session.
 
 ### Provider-native structured output
 
