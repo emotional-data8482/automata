@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -93,6 +95,423 @@ func TestRuntimeCompletedAdmissionRetryReturnsStoredResult(t *testing.T) {
 	}
 }
 
+func TestRuntimeRunSharesToolBudgetWithConcurrentChildren(t *testing.T) {
+	child := testAgent(nestedBudgetProvider{})
+	var leafCalls atomic.Int64
+	child.RegisterTool(Func("leaf", "nested work", func(context.Context, struct{}) (string, error) {
+		leafCalls.Add(1)
+		return "leaf done", nil
+	}))
+
+	parent := testAgent(&scriptedProvider{turns: []Message{
+		AssistantMessage(toolUse("sub-1", "child", `{}`), toolUse("sub-2", "child", `{}`)),
+		asstText("parent done"),
+	}}).WithToolPolicy(ToolPolicy{MaxCalls: 3})
+	parent.RegisterTool(AsTool[struct{}](child, "child", "delegate"))
+
+	runtime := newTestRuntime(t)
+	if err := runtime.Register("parent", "v1", parent); err != nil {
+		t.Fatal(err)
+	}
+	result, err := runtime.Run(context.Background(), "parent", "v1", "go", SubmitOptions{})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if result.Output != "parent done" {
+		t.Errorf("output = %q", result.Output)
+	}
+	if got := leafCalls.Load(); got != 1 {
+		t.Fatalf("nested leaf calls = %d, want 1", got)
+	}
+}
+
+func TestRuntimeRunStreamSharesToolBudgetAndKeepsChildIdentity(t *testing.T) {
+	child := testAgent(nestedBudgetProvider{})
+	var leafCalls atomic.Int64
+	child.RegisterTool(Func("leaf", "nested work", func(context.Context, struct{}) (string, error) {
+		leafCalls.Add(1)
+		return "unexpected", nil
+	}))
+
+	parent := testAgent(&scriptedProvider{turns: []Message{
+		asstTool("sub-1", "child", `{}`),
+		asstText("parent done"),
+	}}).WithToolPolicy(ToolPolicy{MaxCalls: 1})
+	parent.RegisterTool(AsTool[struct{}](child, "child", "delegate"))
+
+	runtime := newTestRuntime(t)
+	if err := runtime.Register("parent", "v1", parent); err != nil {
+		t.Fatal(err)
+	}
+	var budgetEvent StreamEvent
+	result, err := runtime.RunStream(context.Background(), "parent", "v1", "go", func(event StreamEvent) {
+		if event.Kind == StreamToolResult && errors.Is(event.Err, ErrToolBudgetExhausted) {
+			budgetEvent = event
+		}
+	}, SubmitOptions{})
+	if err != nil {
+		t.Fatalf("RunStream: %v", err)
+	}
+	if result.Output != "parent done" {
+		t.Errorf("output = %q", result.Output)
+	}
+	if got := leafCalls.Load(); got != 0 {
+		t.Fatalf("leaf executed %d times, want 0", got)
+	}
+	if budgetEvent.Agent != "child" || budgetEvent.InvocationID != "sub-1" {
+		t.Errorf("nested budget tags = agent %q invocation %q", budgetEvent.Agent, budgetEvent.InvocationID)
+	}
+}
+
+func TestRuntimeRunStreamStartsAdmittedWorkAfterViewCancellation(t *testing.T) {
+	base := &memoryStore{buckets: make(map[string]map[string][]byte)}
+	view, cancel := context.WithCancel(context.Background())
+	store := &afterAdmissionStore{Store: base, after: cancel}
+	provider := &countingRuntimeProvider{}
+	runtime, err := NewRuntime(context.Background(), RuntimeConfig{Store: store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = runtime.Close() })
+	if err := runtime.Register("agent", "v1", testAgent(provider)); err != nil {
+		t.Fatal(err)
+	}
+
+	store.armed.Store(true)
+	result, err := runtime.RunStream(view, "agent", "v1", "work", nil, SubmitOptions{})
+	runID := onlyStoredRunID(t, base)
+	if !errors.Is(err, context.Canceled) || result.RunID != runID {
+		t.Errorf("detached stream = %#v, %v; want run %q and context cancellation", result, err, runID)
+	}
+
+	awaitCtx, awaitCancel := context.WithTimeout(context.Background(), time.Second)
+	defer awaitCancel()
+	completed, err := runtime.Handle(runID).Await(awaitCtx)
+	if err != nil || completed.Output != "done" || completed.RunID != runID {
+		t.Fatalf("admitted run did not complete = %#v, %v", completed, err)
+	}
+	if got := provider.calls.Load(); got != 1 {
+		t.Fatalf("provider calls = %d, want 1", got)
+	}
+}
+
+func TestRuntimeRunStreamStartsAdmittedWorkAfterSnapshotFailure(t *testing.T) {
+	base := &memoryStore{buckets: make(map[string]map[string][]byte)}
+	readErr := errors.New("injected attachment read failure")
+	store := &failReadAfterAdmissionStore{Store: base, err: readErr}
+	provider := &countingRuntimeProvider{}
+	runtime, err := NewRuntime(context.Background(), RuntimeConfig{Store: store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = runtime.Close() })
+	if err := runtime.Register("agent", "v1", testAgent(provider)); err != nil {
+		t.Fatal(err)
+	}
+
+	store.armed.Store(true)
+	result, err := runtime.RunStream(context.Background(), "agent", "v1", "work", nil, SubmitOptions{})
+	runID := onlyStoredRunID(t, base)
+	if !errors.Is(err, readErr) || result.RunID != runID {
+		t.Errorf("failed attachment = %#v, %v; want run %q and read error", result, err, runID)
+	}
+
+	awaitCtx, awaitCancel := context.WithTimeout(context.Background(), time.Second)
+	defer awaitCancel()
+	completed, err := runtime.Handle(runID).Await(awaitCtx)
+	if err != nil || completed.Output != "done" || completed.RunID != runID {
+		t.Fatalf("admitted run did not complete = %#v, %v", completed, err)
+	}
+	if got := provider.calls.Load(); got != 1 {
+		t.Fatalf("provider calls = %d, want 1", got)
+	}
+}
+
+func TestRuntimeRunStreamDisconnectRetainsIdentityWithoutDetachedRead(t *testing.T) {
+	base := &memoryStore{buckets: make(map[string]map[string][]byte)}
+	store := &failRuntimeReadsStore{Store: base, err: errors.New("injected detached read failure")}
+	provider := &countingBarrierRuntimeProvider{started: make(chan struct{}), release: make(chan struct{})}
+	runtime, err := NewRuntime(context.Background(), RuntimeConfig{Store: store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = runtime.Close() })
+	if err := runtime.Register("agent", "v1", testAgent(provider)); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(provider.unblock)
+
+	view, cancel := context.WithCancel(context.Background())
+	finished := make(chan BackgroundResult, 1)
+	go func() {
+		result, err := runtime.RunStream(view, "agent", "v1", "work", nil, SubmitOptions{})
+		finished <- BackgroundResult{Result: result, Err: err}
+	}()
+	waitForSignal(t, provider.started, "provider start")
+	store.failReads.Store(true)
+	cancel()
+
+	detached := waitForBackgroundResult(t, finished)
+	if !errors.Is(detached.Err, context.Canceled) || detached.Result.RunID == "" {
+		t.Fatalf("detached stream = %#v, %v; want admitted identity and context cancellation", detached.Result, detached.Err)
+	}
+	if got := store.failedReads.Load(); got != 0 {
+		t.Fatalf("detached storage reads = %d, want 0", got)
+	}
+
+	store.failReads.Store(false)
+	provider.unblock()
+	awaitCtx, awaitCancel := context.WithTimeout(context.Background(), time.Second)
+	defer awaitCancel()
+	completed, err := runtime.Handle(detached.Result.RunID).Await(awaitCtx)
+	if err != nil || completed.Output != "done" || completed.RunID != detached.Result.RunID {
+		t.Fatalf("admitted run did not complete = %#v, %v", completed, err)
+	}
+	if got := provider.calls.Load(); got != 1 {
+		t.Fatalf("provider calls = %d, want 1", got)
+	}
+}
+
+func TestRuntimeRunStreamDoesNotStartUnknownAdmissionOutcome(t *testing.T) {
+	base := &memoryStore{buckets: make(map[string]map[string][]byte)}
+	commitErr := errors.New("admission commit outcome unknown")
+	store := &unknownAdmissionStore{Store: base, err: commitErr}
+	provider := &countingRuntimeProvider{}
+	runtime, err := NewRuntime(context.Background(), RuntimeConfig{Store: store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = runtime.Close() })
+	if err := runtime.Register("agent", "v1", testAgent(provider)); err != nil {
+		t.Fatal(err)
+	}
+
+	store.armed.Store(true)
+	result, err := runtime.RunStream(context.Background(), "agent", "v1", "work", nil, SubmitOptions{})
+	if !errors.Is(err, commitErr) || result.RunID != "" {
+		t.Fatalf("unknown admission result = %#v, %v", result, err)
+	}
+	runID := onlyStoredRunID(t, base)
+	snapshot, err := runtime.Handle(runID).Snapshot(context.Background())
+	if err != nil || snapshot.State != RuntimeReady {
+		t.Fatalf("unknown admission snapshot = %#v, %v", snapshot, err)
+	}
+	if got := provider.calls.Load(); got != 0 {
+		t.Fatalf("provider calls = %d, want 0", got)
+	}
+}
+
+func TestRuntimeRunStreamDoesNotStartCanceledAdmission(t *testing.T) {
+	base := &memoryStore{buckets: make(map[string]map[string][]byte)}
+	provider := &countingRuntimeProvider{}
+	runtime, err := NewRuntime(context.Background(), RuntimeConfig{Store: base})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = runtime.Close() })
+	if err := runtime.Register("agent", "v1", testAgent(provider)); err != nil {
+		t.Fatal(err)
+	}
+	view, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	result, err := runtime.RunStream(view, "agent", "v1", "work", nil, SubmitOptions{})
+	if !errors.Is(err, context.Canceled) || result.RunID != "" {
+		t.Fatalf("canceled admission = %#v, %v", result, err)
+	}
+	if got := provider.calls.Load(); got != 0 {
+		t.Fatalf("provider calls = %d, want 0", got)
+	}
+	if got := storedRunCount(t, base); got != 0 {
+		t.Fatalf("stored runs = %d, want 0", got)
+	}
+}
+
+func TestRuntimeStaleStreamSchedulingDoesNotPoisonCompletedRun(t *testing.T) {
+	base := &memoryStore{buckets: make(map[string]map[string][]byte)}
+	store := &pauseReadStore{
+		Store:   base,
+		reached: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	provider := &countingBarrierRuntimeProvider{started: make(chan struct{}), release: make(chan struct{})}
+	runtime, err := NewRuntime(context.Background(), RuntimeConfig{Store: store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = runtime.Close() })
+	if err := runtime.Register("agent", "v1", testAgent(provider)); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(provider.unblock)
+	t.Cleanup(store.unblock)
+	options := SubmitOptions{Scope: "tenant", Key: "stale-stream"}
+	handle, err := runtime.Submit(context.Background(), "agent", "v1", "work", options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForSignal(t, provider.started, "provider start")
+
+	terminal, unsubscribe := runtime.subscribe(handle.ID())
+	defer unsubscribe()
+	store.pause.Store(true)
+	attached := make(chan BackgroundResult, 1)
+	go func() {
+		result, err := runtime.RunStream(context.Background(), "agent", "v1", "work", nil, options)
+		attached <- BackgroundResult{Result: result, Err: err}
+	}()
+	waitForSignal(t, store.reached, "stream snapshot")
+
+	provider.unblock()
+	waitForRuntimeTerminal(t, terminal)
+	first, err := handle.Await(context.Background())
+	if err != nil || first.Output != "done" {
+		t.Fatalf("original result = %#v, %v", first, err)
+	}
+	staleAttempt, unsubscribeStale := runtime.subscribe(handle.ID())
+	defer unsubscribeStale()
+	store.unblock()
+	reattached := waitForBackgroundResult(t, attached)
+	if reattached.Err != nil || reattached.Result.RunID != first.RunID || reattached.Result.Output != first.Output {
+		t.Fatalf("reattached result = %#v, %v; want %#v", reattached.Result, reattached.Err, first)
+	}
+	waitForRuntimeTerminal(t, staleAttempt)
+
+	again, err := handle.Await(context.Background())
+	if err != nil || !reflect.DeepEqual(again, first) {
+		t.Fatalf("later await = %#v, %v; want %#v", again, err, first)
+	}
+	if got := provider.calls.Load(); got != 1 {
+		t.Fatalf("provider calls = %d, want 1", got)
+	}
+	snapshot, err := handle.Snapshot(context.Background())
+	if err != nil || snapshot.State != RuntimeTerminal || snapshot.Result.Output != "done" {
+		t.Fatalf("terminal snapshot = %#v, %v", snapshot, err)
+	}
+}
+
+func TestRuntimeDuplicateSchedulingWhileLiveIsHarmless(t *testing.T) {
+	provider := &countingBarrierRuntimeProvider{started: make(chan struct{}), release: make(chan struct{})}
+	runtime := newTestRuntime(t)
+	if err := runtime.Register("agent", "v1", testAgent(provider)); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(provider.unblock)
+	handle, err := runtime.Submit(context.Background(), "agent", "v1", "work", SubmitOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForSignal(t, provider.started, "provider start")
+	runtime.start(handle.ID())
+	runtime.start(handle.ID())
+	provider.unblock()
+	awaitCtx, awaitCancel := context.WithTimeout(context.Background(), time.Second)
+	defer awaitCancel()
+	result, err := handle.Await(awaitCtx)
+	if err != nil || result.Output != "done" {
+		t.Fatalf("result = %#v, %v", result, err)
+	}
+	if got := provider.calls.Load(); got != 1 {
+		t.Fatalf("provider calls = %d, want 1", got)
+	}
+}
+
+func TestRuntimeClaimFailurePreservesRunIdentity(t *testing.T) {
+	claimErr := errors.New("injected claim failure")
+	base := &memoryStore{buckets: make(map[string]map[string][]byte)}
+	store := &failWritableTransactionStore{Store: base, failAt: 3, err: claimErr}
+	runtime, err := NewRuntime(context.Background(), RuntimeConfig{Store: store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = runtime.Close() })
+	if err := runtime.Register("agent", "v1", testAgent(&countingRuntimeProvider{})); err != nil {
+		t.Fatal(err)
+	}
+	handle, err := runtime.Submit(context.Background(), "agent", "v1", "work", SubmitOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	awaitCtx, awaitCancel := context.WithTimeout(context.Background(), time.Second)
+	defer awaitCancel()
+	result, err := handle.Await(awaitCtx)
+	if !errors.Is(err, claimErr) || result.RunID != handle.ID() {
+		t.Fatalf("claim failure = %#v, %v", result, err)
+	}
+}
+
+func TestRuntimeStaleSchedulingPreservesGenuineWorkerFailure(t *testing.T) {
+	finishErr := errors.New("injected finalization failure")
+	base := &memoryStore{buckets: make(map[string]map[string][]byte)}
+	store := &failWritableTransactionStore{Store: base, failAt: 6, err: finishErr}
+	provider := &countingRuntimeProvider{}
+	runtime, err := NewRuntime(context.Background(), RuntimeConfig{Store: store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = runtime.Close() })
+	if err := runtime.Register("agent", "v1", testAgent(provider)); err != nil {
+		t.Fatal(err)
+	}
+	options := SubmitOptions{Scope: "tenant", Key: "failed-finalization"}
+	handle, err := runtime.Submit(context.Background(), "agent", "v1", "work", options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstCtx, firstCancel := context.WithTimeout(context.Background(), time.Second)
+	defer firstCancel()
+	first, err := handle.Await(firstCtx)
+	if !errors.Is(err, finishErr) || first.RunID != handle.ID() || first.Output != "done" {
+		t.Fatalf("initial worker failure = %#v, %v", first, err)
+	}
+
+	view, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	attached, err := runtime.RunStream(view, "agent", "v1", "work", nil, options)
+	if !errors.Is(err, finishErr) || attached.RunID != first.RunID || attached.Output != first.Output {
+		t.Fatalf("reattached worker failure = %#v, %v; want %#v", attached, err, first)
+	}
+	againCtx, againCancel := context.WithTimeout(context.Background(), time.Second)
+	defer againCancel()
+	again, err := handle.Await(againCtx)
+	if !errors.Is(err, finishErr) || again.RunID != first.RunID || again.Output != first.Output {
+		t.Fatalf("later worker failure = %#v, %v; want %#v", again, err, first)
+	}
+	if got := provider.calls.Load(); got != 1 {
+		t.Fatalf("provider calls = %d, want 1", got)
+	}
+}
+
+func TestRuntimeInvalidPersistedStateIsAClaimFailure(t *testing.T) {
+	base := &memoryStore{buckets: make(map[string]map[string][]byte)}
+	runtime, err := NewRuntime(context.Background(), RuntimeConfig{Store: base})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = runtime.Close() })
+	if err := runtime.Register("agent", "v1", testAgent(&countingRuntimeProvider{})); err != nil {
+		t.Fatal(err)
+	}
+	record := storedRuntimeRun{
+		Version: runtimeEncodingVersion, RunID: "invalid-state", DefinitionID: "agent",
+		DefinitionRevision: "v1", Task: "work", State: RuntimeState("corrupt"),
+		Generation: 1, Result: RunResult{RunID: "invalid-state"},
+	}
+	if err := base.Transaction(context.Background(), true, func(tx StoreTransaction) error {
+		return putRuntimeRun(tx, record)
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	runtime.start(record.RunID)
+	awaitCtx, awaitCancel := context.WithTimeout(context.Background(), time.Second)
+	defer awaitCancel()
+	result, err := runtime.Handle(record.RunID).Await(awaitCtx)
+	if err == nil || result.RunID != record.RunID || !strings.Contains(err.Error(), "invalid state") {
+		t.Fatalf("invalid state claim = %#v, %v", result, err)
+	}
+}
+
 func TestRuntimeViewCancellationDoesNotCancelRun(t *testing.T) {
 	provider := &barrierRuntimeProvider{started: make(chan struct{}), release: make(chan struct{})}
 	runtime := newTestRuntime(t)
@@ -118,6 +537,49 @@ func TestRuntimeViewCancellationDoesNotCancelRun(t *testing.T) {
 	result, err := handle.Await(context.Background())
 	if err != nil || result.Output != "done" {
 		t.Fatalf("continued result = %#v, %v", result, err)
+	}
+}
+
+func TestRuntimeAwaitCancellationRetainsIdentityWithoutDetachedRead(t *testing.T) {
+	base := &memoryStore{buckets: make(map[string]map[string][]byte)}
+	store := &failRuntimeReadsStore{Store: base, err: errors.New("injected detached read failure")}
+	provider := &countingBarrierRuntimeProvider{started: make(chan struct{}), release: make(chan struct{})}
+	runtime, err := NewRuntime(context.Background(), RuntimeConfig{Store: store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = runtime.Close() })
+	if err := runtime.Register("agent", "v1", testAgent(provider)); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(provider.unblock)
+	handle, err := runtime.Submit(context.Background(), "agent", "v1", "work", SubmitOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForSignal(t, provider.started, "provider start")
+
+	view, cancel := context.WithCancel(context.Background())
+	cancel()
+	store.failReads.Store(true)
+	partial, err := handle.Await(view)
+	if !errors.Is(err, context.Canceled) || partial.RunID != handle.ID() {
+		t.Fatalf("detached await = %#v, %v; want admitted identity and context cancellation", partial, err)
+	}
+	if got := store.failedReads.Load(); got != 0 {
+		t.Fatalf("detached storage reads = %d, want 0", got)
+	}
+
+	store.failReads.Store(false)
+	provider.unblock()
+	awaitCtx, awaitCancel := context.WithTimeout(context.Background(), time.Second)
+	defer awaitCancel()
+	completed, err := handle.Await(awaitCtx)
+	if err != nil || completed.Output != "done" || completed.RunID != handle.ID() {
+		t.Fatalf("admitted run did not complete = %#v, %v", completed, err)
+	}
+	if got := provider.calls.Load(); got != 1 {
+		t.Fatalf("provider calls = %d, want 1", got)
 	}
 }
 
@@ -528,6 +990,32 @@ func (p *barrierRuntimeProvider) Invoke(context.Context, Request) (Response, err
 	return Response{Message: asstText("done"), StopReason: StopEndTurn}, nil
 }
 
+type countingRuntimeProvider struct{ calls atomic.Int32 }
+
+func (p *countingRuntimeProvider) Invoke(context.Context, Request) (Response, error) {
+	p.calls.Add(1)
+	return Response{Message: asstText("done"), StopReason: StopEndTurn}, nil
+}
+
+type countingBarrierRuntimeProvider struct {
+	started     chan struct{}
+	release     chan struct{}
+	startedOnce sync.Once
+	releaseOnce sync.Once
+	calls       atomic.Int32
+}
+
+func (p *countingBarrierRuntimeProvider) Invoke(context.Context, Request) (Response, error) {
+	p.calls.Add(1)
+	p.startedOnce.Do(func() { close(p.started) })
+	<-p.release
+	return Response{Message: asstText("done"), StopReason: StopEndTurn}, nil
+}
+
+func (p *countingBarrierRuntimeProvider) unblock() {
+	p.releaseOnce.Do(func() { close(p.release) })
+}
+
 type cancelRuntimeProvider struct{ started chan struct{} }
 
 func (p *cancelRuntimeProvider) Invoke(ctx context.Context, _ Request) (Response, error) {
@@ -551,11 +1039,168 @@ type failWritableTransactionStore struct {
 	Store
 	writes atomic.Int32
 	failAt int32
+	err    error
 }
 
 func (s *failWritableTransactionStore) Transaction(ctx context.Context, writable bool, fn func(StoreTransaction) error) error {
 	if writable && s.writes.Add(1) == s.failAt {
+		if s.err != nil {
+			return s.err
+		}
 		return errors.New("injected durable transition failure")
 	}
 	return s.Store.Transaction(ctx, writable, fn)
+}
+
+type afterAdmissionStore struct {
+	Store
+	armed atomic.Bool
+	after func()
+}
+
+func (s *afterAdmissionStore) Transaction(ctx context.Context, writable bool, fn func(StoreTransaction) error) error {
+	err := s.Store.Transaction(ctx, writable, fn)
+	if err == nil && writable && s.armed.CompareAndSwap(true, false) {
+		s.after()
+	}
+	return err
+}
+
+type failReadAfterAdmissionStore struct {
+	Store
+	armed    atomic.Bool
+	failRead atomic.Bool
+	err      error
+}
+
+func (s *failReadAfterAdmissionStore) Transaction(ctx context.Context, writable bool, fn func(StoreTransaction) error) error {
+	if !writable && s.failRead.CompareAndSwap(true, false) {
+		return s.err
+	}
+	err := s.Store.Transaction(ctx, writable, fn)
+	if err == nil && writable && s.armed.CompareAndSwap(true, false) {
+		s.failRead.Store(true)
+	}
+	return err
+}
+
+type failRuntimeReadsStore struct {
+	Store
+	failReads   atomic.Bool
+	failedReads atomic.Int32
+	err         error
+}
+
+func (s *failRuntimeReadsStore) Transaction(ctx context.Context, writable bool, fn func(StoreTransaction) error) error {
+	if !writable && s.failReads.Load() {
+		s.failedReads.Add(1)
+		return s.err
+	}
+	return s.Store.Transaction(ctx, writable, fn)
+}
+
+type unknownAdmissionStore struct {
+	Store
+	armed atomic.Bool
+	err   error
+}
+
+func (s *unknownAdmissionStore) Transaction(ctx context.Context, writable bool, fn func(StoreTransaction) error) error {
+	err := s.Store.Transaction(ctx, writable, fn)
+	if err == nil && writable && s.armed.CompareAndSwap(true, false) {
+		return s.err
+	}
+	return err
+}
+
+type pauseReadStore struct {
+	Store
+	pause       atomic.Bool
+	reached     chan struct{}
+	release     chan struct{}
+	releaseOnce sync.Once
+}
+
+func (s *pauseReadStore) Transaction(ctx context.Context, writable bool, fn func(StoreTransaction) error) error {
+	err := s.Store.Transaction(ctx, writable, fn)
+	if err == nil && !writable && s.pause.CompareAndSwap(true, false) {
+		close(s.reached)
+		select {
+		case <-s.release:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return err
+}
+
+func (s *pauseReadStore) unblock() {
+	s.releaseOnce.Do(func() { close(s.release) })
+}
+
+func onlyStoredRunID(t *testing.T, store Store) string {
+	t.Helper()
+	var ids []string
+	if err := store.Transaction(context.Background(), false, func(tx StoreTransaction) error {
+		return tx.Scan(runtimeRunsBucket, "", func(id string, _ []byte) error {
+			ids = append(ids, id)
+			return nil
+		})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(ids) != 1 {
+		t.Fatalf("stored run IDs = %v, want exactly one", ids)
+	}
+	return ids[0]
+}
+
+func storedRunCount(t *testing.T, store Store) int {
+	t.Helper()
+	count := 0
+	if err := store.Transaction(context.Background(), false, func(tx StoreTransaction) error {
+		return tx.Scan(runtimeRunsBucket, "", func(_ string, _ []byte) error {
+			count++
+			return nil
+		})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return count
+}
+
+func waitForSignal(t *testing.T, signal <-chan struct{}, name string) {
+	t.Helper()
+	select {
+	case <-signal:
+	case <-time.After(time.Second):
+		t.Fatalf("timed out waiting for %s", name)
+	}
+}
+
+func waitForRuntimeTerminal(t *testing.T, events <-chan runtimeStreamItem) {
+	t.Helper()
+	timer := time.NewTimer(time.Second)
+	defer timer.Stop()
+	for {
+		select {
+		case item := <-events:
+			if item.terminal {
+				return
+			}
+		case <-timer.C:
+			t.Fatal("timed out waiting for runtime completion")
+		}
+	}
+}
+
+func waitForBackgroundResult(t *testing.T, result <-chan BackgroundResult) BackgroundResult {
+	t.Helper()
+	select {
+	case value := <-result:
+		return value
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for background result")
+		return BackgroundResult{}
+	}
 }

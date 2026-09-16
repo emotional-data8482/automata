@@ -389,7 +389,6 @@ func (r *Runtime) start(runID string) {
 	}
 	ctx, cancel := context.WithCancel(r.ctx)
 	r.live[runID] = liveRuntimeRun{cancel: cancel}
-	delete(r.failures, runID)
 	r.wg.Add(1)
 	r.mu.Unlock()
 	go r.execute(ctx, runID)
@@ -403,11 +402,17 @@ func (r *Runtime) execute(workerCtx context.Context, runID string) {
 		delete(r.live, runID)
 		r.mu.Unlock()
 	}()
-	record, err := r.claim(workerCtx, runID)
+	record, claimed, err := r.claim(workerCtx, runID)
 	if err != nil {
 		r.setFailure(runID, err)
 		return
 	}
+	if !claimed {
+		return
+	}
+	r.mu.Lock()
+	delete(r.failures, runID)
+	r.mu.Unlock()
 	binding, err := r.binding(record.DefinitionID, record.DefinitionRevision)
 	if err != nil {
 		if markErr := r.markAttention(context.Background(), runID, record.Generation, err.Error()); markErr != nil {
@@ -442,7 +447,7 @@ func (r *Runtime) execute(workerCtx context.Context, runID string) {
 		return
 	}
 	cfg.scope = scope
-	result, runErr := binding.agent.runStream(execCtx, newLoop(binding.agent, nil), record.Task, func(event StreamEvent) {
+	result, runErr := binding.agent.runStream(scope.ctx, newLoop(binding.agent, nil), record.Task, func(event StreamEvent) {
 		r.publish(runID, event)
 	}, cfg)
 	result, runErr = scope.finalize(result, runErr)
@@ -481,15 +486,21 @@ func (r *Runtime) persistTransition(ctx context.Context, runID string, transitio
 	})
 }
 
-func (r *Runtime) claim(ctx context.Context, runID string) (storedRuntimeRun, error) {
+func (r *Runtime) claim(ctx context.Context, runID string) (storedRuntimeRun, bool, error) {
 	var claimed storedRuntimeRun
+	var didClaim bool
 	err := r.transaction(ctx, true, func(tx StoreTransaction) error {
 		record, err := getRuntimeRun(tx, runID)
 		if err != nil {
 			return err
 		}
-		if record.State != RuntimeReady {
-			return fmt.Errorf("run %s is not ready", runID)
+		switch record.State {
+		case RuntimeRunning, RuntimeCancelRequested, RuntimeFinalizing, RuntimeNeedsAttention, RuntimeTerminal:
+			return nil
+		case RuntimeReady:
+			// Claim below.
+		default:
+			return fmt.Errorf("run %s has invalid state %q", runID, record.State)
 		}
 		record.State = RuntimeRunning
 		record.Generation++
@@ -497,9 +508,10 @@ func (r *Runtime) claim(ctx context.Context, runID string) (storedRuntimeRun, er
 			return err
 		}
 		claimed = record
+		didClaim = true
 		return nil
 	})
-	return claimed, err
+	return claimed, didClaim, err
 }
 
 func (r *Runtime) finishExecution(runID string, result RunResult, runErr, workerErr error) (storedRuntimeRun, error) {
@@ -637,6 +649,9 @@ func (r *Runtime) setFailure(runID string, err error) {
 func (r *Runtime) failure(runID string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if _, live := r.live[runID]; live {
+		return nil
+	}
 	return r.failures[runID]
 }
 
@@ -726,8 +741,13 @@ func (r *Runtime) RunStream(ctx context.Context, definitionID, revision, task st
 	defer unsubscribe()
 	snapshot, err := h.Snapshot(ctx)
 	if err != nil {
-		return RunResult{}, err
+		// Admission has committed. Scheduling is owned by the Runtime and must
+		// not depend on whether this caller can attach its view. Do not issue a
+		// detached read here: the view context must bound this call.
+		r.start(h.runID)
+		return RunResult{RunID: h.runID}, err
 	}
+	snapshot.Result = resultWithRunID(snapshot.Result, h.runID)
 	if snapshot.State == RuntimeTerminal || snapshot.State == RuntimeNeedsAttention {
 		return h.Await(ctx)
 	}
@@ -742,7 +762,9 @@ func (r *Runtime) RunStream(ctx context.Context, definitionID, revision, task st
 				onEvent(item.event)
 			}
 		case <-ctx.Done():
-			snapshot, _ := h.Snapshot(context.Background())
+			// Return the last snapshot already obtained by this view. A detached
+			// storage read could outlive ctx and can lose the admitted identity if
+			// that read fails.
 			return snapshot.Result, ctx.Err()
 		}
 	}
@@ -839,34 +861,41 @@ func (h *RunHandle) Observe(ctx context.Context, onEvent func(StreamEvent)) erro
 func (h *RunHandle) Await(ctx context.Context) (RunResult, error) {
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
+	lastResult := RunResult{RunID: h.runID}
 	for {
 		if workerErr := h.runtime.failure(h.runID); workerErr != nil {
-			snapshot, _ := h.Snapshot(context.Background())
-			return snapshot.Result, workerErr
+			if snapshot, err := h.Snapshot(ctx); err == nil {
+				lastResult = resultWithRunID(snapshot.Result, h.runID)
+			}
+			return lastResult, workerErr
 		}
 		if err := ctx.Err(); err != nil {
-			snapshot, snapshotErr := h.Snapshot(context.Background())
-			if snapshotErr != nil {
-				return RunResult{RunID: h.runID}, err
-			}
-			return snapshot.Result, err
+			return lastResult, err
 		}
 		snapshot, err := h.Snapshot(ctx)
 		if err != nil {
-			return RunResult{}, err
+			return lastResult, err
 		}
+		lastResult = resultWithRunID(snapshot.Result, h.runID)
 		switch snapshot.State {
 		case RuntimeTerminal:
-			return snapshot.Result, snapshotError(snapshot)
+			return lastResult, snapshotError(snapshot)
 		case RuntimeNeedsAttention:
-			return snapshot.Result, fmt.Errorf("%w: %s", ErrRunNeedsAttention, snapshot.AttentionReason)
+			return lastResult, fmt.Errorf("%w: %s", ErrRunNeedsAttention, snapshot.AttentionReason)
 		}
 		select {
 		case <-ctx.Done():
-			return snapshot.Result, ctx.Err()
+			return lastResult, ctx.Err()
 		case <-ticker.C:
 		}
 	}
+}
+
+func resultWithRunID(result RunResult, runID string) RunResult {
+	if result.RunID == "" {
+		result.RunID = runID
+	}
+	return result
 }
 
 func (h *RunHandle) Cancel(ctx context.Context) error {
