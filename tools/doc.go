@@ -7,13 +7,18 @@
 // Everything composes with the existing core.Func schema machinery; the module
 // adds no dependencies beyond core itself.
 //
-// # Error and retry semantics
+// # Error, effect, and recovery semantics
 //
-// Errors returned by these tools follow the [core.Func] contract: the run
-// converts them to "error: <msg>" strings the model can recover from. The
-// agent loop additionally wraps execution in its retry policy, which by
-// default retries only errors implementing retry.Retryable — plain errors
-// fail fast. If you build your own tools around non-idempotent operations,
-// return plain (non-Retryable) errors so a transient-looking failure is never
-// re-executed.
+// Domain validation and ordinary I/O failures are returned as
+// [core.ErrorResult] values so the model can adapt. Parent cancellation remains
+// fatal. Core never retries tools implicitly; [core.WithToolRetry] is an
+// explicit opt-in and must not wrap non-idempotent work without a destination
+// idempotency strategy.
+//
+// ReadFile declares [core.ToolEffectReadOnly]. WriteFile declares
+// [core.ToolEffectMutating], reports an [core.EffectApplied] content-digest
+// receipt after a successful write, and installs a sandbox-root/path semantic
+// guard for durable Runtime execution. A crash after dispatch is still
+// uncertain until reconciled; local storage cannot prove what the filesystem
+// did.
 package tools

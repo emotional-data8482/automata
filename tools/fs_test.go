@@ -2,11 +2,14 @@ package tools
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/emotional-data8482/automata/core"
 )
 
 func TestReadWriteRoundtrip(t *testing.T) {
@@ -27,6 +30,17 @@ func TestReadWriteRoundtrip(t *testing.T) {
 	}
 	if got != "hello sandbox" {
 		t.Errorf("read = %q, want %q", got, "hello sandbox")
+	}
+}
+
+func TestWriteFileReportsAppliedEffect(t *testing.T) {
+	root := t.TempDir()
+	result, err := WriteFile(root).Execute(context.Background(), json.RawMessage(`{"path":"artifact.txt","content":"durable"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Effect.Status != core.EffectApplied || result.Effect.Receipt == "" {
+		t.Fatalf("write effect = %#v", result.Effect)
 	}
 }
 
