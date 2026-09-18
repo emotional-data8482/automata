@@ -31,7 +31,7 @@ func (s loopState) String() string {
 func validLoopTransition(from, to loopState) bool {
 	switch from {
 	case loopStateStart:
-		return to == loopStatePrepareTurn || to == loopStateFinish
+		return to == loopStatePrepareTurn || to == loopStateExecuteTools || to == loopStateFinish
 	case loopStatePrepareTurn:
 		return to == loopStateInvokeProvider || to == loopStateFinish
 	case loopStateInvokeProvider:
@@ -77,7 +77,7 @@ func (m *loopMachine) transition(next loopState) {
 		panic("provider request not prepared")
 	}
 
-	if m.state == loopStateExecuteTools {
+	if m.state == loopStateExecuteTools && !(m.cfg.durableBatch != nil && m.err != nil) {
 		msgs := m.loop.messages
 		if len(msgs) < len(m.calls) {
 			panic("tool results not committed")
@@ -142,10 +142,16 @@ func (m *loopMachine) persistTransition(kind string) error {
 	result.Turns = m.cfg.scope.turns
 	result.ProviderAttempts = m.cfg.scope.providerAttempts
 	result.Usage = m.cfg.scope.usage
-	return m.cfg.durableTransition(context.WithoutCancel(m.ctx), durableLoopTransition{
-		Kind:   kind,
-		Result: result,
-	})
+	transition := durableLoopTransition{Kind: kind, Result: result}
+	if kind == "provider_accepted" {
+		transition.EffectiveTools = make([]string, 0, len(m.loop.toolsByName))
+		for _, definition := range m.request.Tools {
+			if _, ok := m.loop.toolsByName[definition.Name]; ok {
+				transition.EffectiveTools = append(transition.EffectiveTools, definition.Name)
+			}
+		}
+	}
+	return m.cfg.durableTransition(context.WithoutCancel(m.ctx), transition)
 }
 func (m *loopMachine) fail(err error) loopState { m.err = err; return loopStateFinish }
 func (m *loopMachine) start() loopState {
@@ -167,7 +173,9 @@ func (m *loopMachine) start() loopState {
 	m.log, m.policy = log, policy
 	log.InfoContext(ctx, "starting run", "task", task, "max_steps", a.maxSteps, "mode", mode)
 
-	l.messages = append(l.messages, UserMessage(task))
+	if !cfg.resume {
+		l.messages = append(l.messages, UserMessage(task))
+	}
 
 	tools := append([]Tool(nil), a.tools...)
 	tools = append(tools, cfg.extraTools...)
@@ -180,7 +188,38 @@ func (m *loopMachine) start() loopState {
 	if err != nil {
 		return m.fail(err)
 	}
-	return loopStatePrepareTurn
+	if !cfg.resume {
+		return loopStatePrepareTurn
+	}
+	// The accepted provider call was already validated against the effective
+	// registry before it was persisted. Restore that exact selection without
+	// invoking request transforms again.
+	l.toolsByName = make(map[string]registeredTool, len(cfg.resumeTools))
+	for _, name := range cfg.resumeTools {
+		tool, ok := m.registry[name]
+		if !ok {
+			return m.fail(fmt.Errorf("durable continuation references unregistered tool %q", name))
+		}
+		l.toolsByName[name] = tool
+	}
+	if len(l.messages) == 0 {
+		return m.fail(errors.New("durable continuation has no transcript"))
+	}
+	last := l.messages[len(l.messages)-1]
+	if last.Role != "assistant" {
+		return loopStatePrepareTurn
+	}
+	m.calls = last.ToolUses()
+	m.result.FinalMessage = cloneMessages([]Message{last})[0]
+	if len(m.calls) > 0 {
+		return loopStateExecuteTools
+	}
+	if last.Text() == "" {
+		return m.fail(ErrEmptyResponse)
+	}
+	m.result.Output = last.Text()
+	m.result.StopReason = StopEndTurn
+	return loopStateFinish
 
 }
 func (m *loopMachine) prepareTurn() loopState {
@@ -374,11 +413,19 @@ func (m *loopMachine) classifyResponse() loopState {
 		}
 		result.Output = text
 		result.StopReason = StopEndTurn
+		if err := m.persistTransition("response_classified"); err != nil {
+			return m.fail(&durableTransitionFailure{cause: err})
+		}
 		span.SetAttributes(tracing.Int("steps", result.Steps))
 		log.InfoContext(ctx, "run complete", "steps", result.Steps)
 		return loopStateFinish
 	}
 
+	// This second boundary records that stop reason and message shape were
+	// validated. Recovery never dispatches tools from provider_accepted alone.
+	if err := m.persistTransition("batch_ready"); err != nil {
+		return m.fail(&durableTransitionFailure{cause: err})
+	}
 	return loopStateExecuteTools
 }
 func (m *loopMachine) executeTools() loopState {
@@ -438,7 +485,19 @@ func (m *loopMachine) executeTools() loopState {
 	// Snapshot messages for the approver — captures history up to and
 	// including the assistant message that requested these tool calls.
 	approverMessages := l.messages
-	results, fatalErr := l.executeToolBatch(ctx, toolUses, approverMessages, m.policy)
+	var results []Message
+	var fatalErr error
+	if cfg.durableBatch != nil {
+		results, fatalErr = cfg.durableBatch(ctx, l, toolUses, approverMessages, m.policy)
+	} else {
+		results, fatalErr = l.executeToolBatch(ctx, toolUses, approverMessages, m.policy)
+	}
+	if len(results) != len(toolUses) {
+		if fatalErr == nil {
+			fatalErr = errors.New("tool batch returned incomplete results")
+		}
+		return m.fail(fatalErr)
+	}
 	l.messages = append(l.messages, results...)
 	if err := m.persistTransition("batch_committed"); err != nil {
 		return m.fail(&durableTransitionFailure{executionErr: fatalErr, cause: err})

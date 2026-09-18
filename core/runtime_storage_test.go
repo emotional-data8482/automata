@@ -14,12 +14,12 @@ import (
 
 // --- encoding fixtures -------------------------------------------------------
 
-// Golden fixtures lock the version 2 record encoding and the admission digest
+// Golden fixtures lock the version 4 record encoding and the admission digest
 // rule. Changing either changes every persisted record and requires a new
 // encoding version, not a silent rewrite.
 func TestRuntimeRecordEncodingIsStable(t *testing.T) {
 	record := storedRuntimeRun{
-		Version: 2, RunID: "run-1", DefinitionID: "agent", DefinitionRevision: "v1",
+		Version: 4, RunID: "run-1", DefinitionID: "agent", DefinitionRevision: "v1",
 		Task: "work", Deadline: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC),
 		State: RuntimeRunning, Generation: 7,
 		Result:             RunResult{RunID: "run-1", Status: RunCompleted, Output: "done", Turns: 2},
@@ -34,14 +34,14 @@ func TestRuntimeRecordEncodingIsStable(t *testing.T) {
 	}
 	// RunResult persists with Go field names (it has no JSON tags); this
 	// fixture locks that encoding until T03's version decision is revisited.
-	want := `{"version":2,"run_id":"run-1","definition_id":"agent","definition_revision":"v1",` +
+	want := `{"version":4,"run_id":"run-1","definition_id":"agent","definition_revision":"v1",` +
 		`"task":"work","deadline":"2026-01-02T03:04:05Z","state":"running","generation":7,` +
 		`"result":{"RunID":"run-1","Status":"completed","Turns":2,"ProviderAttempts":0,` +
 		`"ProviderStopReason":"","RawProviderStopReason":"","Diagnostics":null,"Output":"done",` +
 		`"FinalMessage":{"role":""},"Messages":null,"Usage":{"InputTokens":0,"OutputTokens":0,` +
 		`"CacheCreationTokens":0,"CacheReadTokens":0},"Steps":0,"StopReason":"","RawStopReason":""},` +
 		`"transcript_chunks":3,"transcript_messages":9,"last_transition":"batch_committed",` +
-		`"hook_results":[{"name":"audit"}]}`
+		`"hook_results":[{"name":"audit"}],"tool_budget":{}}`
 	if string(data) != want {
 		t.Fatalf("record encoding drifted:\n got %s\nwant %s", data, want)
 	}
@@ -61,7 +61,7 @@ func TestRuntimeRecordEncodingIsStable(t *testing.T) {
 	if legacy.TranscriptChunks != 3 {
 		t.Fatalf("fixture decode = %#v", legacy)
 	}
-	bumped := strings.Replace(want, `"version":2`, `"version":99`, 1)
+	bumped := strings.Replace(want, `"version":4`, `"version":99`, 1)
 	if _, err := decodeRuntimeRun([]byte(bumped)); err == nil ||
 		!strings.Contains(err.Error(), "unsupported runtime run version 99") {
 		t.Fatalf("unsupported version = %v", err)
@@ -328,7 +328,7 @@ func TestRuntimeCancelReceiptSurvivesLaterCommits(t *testing.T) {
 // --- fault injection at every transaction boundary ---------------------------
 
 // Writable transactions for a plain run: initialize, admission, claim,
-// provider transition, finishExecution, finishHooks. Injecting a failure at
+// provider acceptance, response classification, finishExecution, finishHooks. Injecting a failure at
 // each boundary must preserve the run identity and produce a resolvable or
 // explicitly classified outcome.
 func TestRuntimeTransactionFaultsPreserveEvidenceAndRecover(t *testing.T) {
@@ -342,8 +342,10 @@ func TestRuntimeTransactionFaultsPreserveEvidenceAndRecover(t *testing.T) {
 		{failAt: 2, submitFails: true}, // admission commit outcome unknown
 		{failAt: 3, recordState: RuntimeReady, recoveredState: RuntimeTerminal},
 		{failAt: 4, recordState: RuntimeNeedsAttention, recoveredState: RuntimeNeedsAttention},
-		{failAt: 5, recordState: RuntimeRunning, recoveredState: RuntimeNeedsAttention},
-		{failAt: 6, recordState: RuntimeFinalizing, recoveredState: RuntimeNeedsAttention},
+		{failAt: 5, recordState: RuntimeNeedsAttention, recoveredState: RuntimeNeedsAttention},
+		// A classified final response is a safe continuation boundary in v3.
+		{failAt: 6, recordState: RuntimeRunning, recoveredState: RuntimeTerminal},
+		{failAt: 7, recordState: RuntimeFinalizing, recoveredState: RuntimeNeedsAttention},
 	} {
 		t.Run(fmt.Sprintf("faultAt%d", scenario.failAt), func(t *testing.T) {
 			base := &memoryStore{buckets: make(map[string]map[string][]byte)}

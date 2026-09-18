@@ -14,17 +14,21 @@ import (
 )
 
 // runtimeEncodingVersion is the storage encoding this core build reads and
-// writes. Version 2 moves run transcripts into append-only fact chunks and
-// introduces command receipts; version 1 stores were a pre-release prototype
-// and are rejected without rewrite.
-const runtimeEncodingVersion = 2
+// writes. Version 4 adds exact effective-tool recovery, lifecycle-attention
+// classification, and structured invocation errors to the durable batch and
+// reconciliation records. Earlier pre-release stores are rejected without
+// implicit rewrite.
+const runtimeEncodingVersion = 4
 
 const (
-	runtimeMetaBucket      = "runtime_meta"
-	runtimeRunsBucket      = "runtime_runs"
-	runtimeAdmissionBucket = "runtime_admissions"
-	runtimeFactsBucket     = "runtime_facts"
-	runtimeReceiptsBucket  = "runtime_receipts"
+	runtimeMetaBucket         = "runtime_meta"
+	runtimeRunsBucket         = "runtime_runs"
+	runtimeAdmissionBucket    = "runtime_admissions"
+	runtimeFactsBucket        = "runtime_facts"
+	runtimeReceiptsBucket     = "runtime_receipts"
+	runtimeBatchesBucket      = "runtime_batches"
+	runtimeInvocationsBucket  = "runtime_invocations"
+	runtimeEffectGuardsBucket = "runtime_effect_guards"
 )
 
 // runtimeRecoverPageSize bounds how many run records one recovery scan page
@@ -74,6 +78,7 @@ type RunSnapshot struct {
 	ErrorRawReason     string
 	AttentionReason    string
 	HookResults        []RunHookResult
+	ToolBatches        []ToolBatchSnapshot
 }
 
 type definitionBinding struct {
@@ -83,28 +88,34 @@ type definitionBinding struct {
 }
 
 type storedRuntimeRun struct {
-	Version            int             `json:"version"`
-	RunID              string          `json:"run_id"`
-	DefinitionID       string          `json:"definition_id"`
-	DefinitionRevision string          `json:"definition_revision"`
-	Task               string          `json:"task"`
-	Deadline           time.Time       `json:"deadline,omitempty"`
-	State              RuntimeState    `json:"state"`
-	Generation         uint64          `json:"generation"`
-	Result             RunResult       `json:"result"`
-	TranscriptChunks   int             `json:"transcript_chunks"`
-	TranscriptMessages int             `json:"transcript_messages"`
-	Error              string          `json:"error,omitempty"`
-	ErrorKind          string          `json:"error_kind,omitempty"`
-	ErrorStopReason    StopReason      `json:"error_stop_reason,omitempty"`
-	ErrorRawReason     string          `json:"error_raw_reason,omitempty"`
-	LastTransition     string          `json:"last_transition,omitempty"`
-	AttentionReason    string          `json:"attention_reason,omitempty"`
-	HookResults        []RunHookResult `json:"hook_results,omitempty"`
+	Version            int                 `json:"version"`
+	RunID              string              `json:"run_id"`
+	DefinitionID       string              `json:"definition_id"`
+	DefinitionRevision string              `json:"definition_revision"`
+	Task               string              `json:"task"`
+	Deadline           time.Time           `json:"deadline,omitempty"`
+	State              RuntimeState        `json:"state"`
+	Generation         uint64              `json:"generation"`
+	Result             RunResult           `json:"result"`
+	TranscriptChunks   int                 `json:"transcript_chunks"`
+	TranscriptMessages int                 `json:"transcript_messages"`
+	Error              string              `json:"error,omitempty"`
+	ErrorKind          string              `json:"error_kind,omitempty"`
+	ErrorStopReason    StopReason          `json:"error_stop_reason,omitempty"`
+	ErrorRawReason     string              `json:"error_raw_reason,omitempty"`
+	LastTransition     string              `json:"last_transition,omitempty"`
+	EffectiveTools     []string            `json:"effective_tools,omitempty"`
+	AttentionReason    string              `json:"attention_reason,omitempty"`
+	AttentionKind      string              `json:"attention_kind,omitempty"`
+	HookResults        []RunHookResult     `json:"hook_results,omitempty"`
+	PendingBatchID     string              `json:"pending_batch_id,omitempty"`
+	NextBatchOrdinal   int                 `json:"next_batch_ordinal,omitempty"`
+	ToolBudget         storedToolBudget    `json:"tool_budget"`
+	ToolBatches        []ToolBatchSnapshot `json:"-"`
 }
 
 // admissionPayload is the canonical admission identity payload. Its JSON
-// encoding is the version 2 digest rule: changing any field, tag, or encoding
+// encoding remains the version 2+ digest rule: changing any field, tag, or encoding
 // changes every persisted admission digest and requires a new encoding
 // version.
 type admissionPayload struct {
@@ -416,12 +427,34 @@ func (r *Runtime) Recover(ctx context.Context) error {
 			} else {
 				r.start(record.RunID)
 			}
-		case RuntimeRunning, RuntimeCancelRequested:
-			if err := r.markAttention(ctx, record.RunID, record.Generation, "previous owner stopped during execution"); err != nil {
+		case RuntimeRunning:
+			resumable, err := r.recoverToolBatch(ctx, record)
+			if err != nil {
 				return err
 			}
+			if resumable {
+				r.start(record.RunID)
+			} else if err := r.markAttention(ctx, record.RunID, record.Generation, "previous owner stopped during execution"); err != nil {
+				return err
+			}
+		case RuntimeCancelRequested:
+			// Classify interrupted dispatches for inspection, but finish the
+			// acknowledged cancellation instead of making it resumable.
+			if _, err := r.recoverToolBatch(ctx, record); err != nil {
+				return err
+			}
+		case RuntimeNeedsAttention:
+			if record.AttentionKind == "execution" && (record.PendingBatchID != "" || record.LastTransition == "batch_ready" || record.LastTransition == "response_classified" || record.LastTransition == "batch_committed") {
+				resumable, err := r.recoverToolBatch(ctx, record)
+				if err != nil {
+					return err
+				}
+				if resumable {
+					r.start(record.RunID)
+				}
+			}
 		case RuntimeFinalizing:
-			if err := r.markAttention(ctx, record.RunID, record.Generation, "previous owner stopped while delivering committed-run hooks; delivery outcome is unknown"); err != nil {
+			if err := r.markAttentionKind(ctx, record.RunID, record.Generation, "hooks", "previous owner stopped while delivering committed-run hooks; delivery outcome is unknown"); err != nil {
 				return err
 			}
 		}
@@ -478,10 +511,17 @@ func (r *Runtime) execute(workerCtx context.Context, runID string) {
 		execCtx, cancel = context.WithDeadline(workerCtx, record.Deadline)
 		defer cancel()
 	}
+	record, err = r.load(execCtx, runID)
+	if err != nil {
+		r.setFailure(runID, err)
+		return
+	}
 	cfg := binding.agent.newRunConfig(nil)
 	// Runtime observation is attached through RunHandle. Agent observers are
 	// synchronous direct-run instrumentation and do not participate here.
 	cfg.observers = nil
+	cfg.resume = record.TranscriptMessages > 0
+	cfg.resumeTools = append([]string(nil), record.EffectiveTools...)
 	var transitionErr error
 	cfg.durableTransition = func(ctx context.Context, transition durableLoopTransition) error {
 		err := r.persistTransition(ctx, runID, transition)
@@ -490,7 +530,11 @@ func (r *Runtime) execute(workerCtx context.Context, runID string) {
 		}
 		return err
 	}
-	scope, beginErr := binding.agent.beginRunWithID(execCtx, cfg, nil, nil, "runtime", runID)
+	cfg.durableBatch = func(ctx context.Context, l *loop, calls []ToolUseBlock, messages []Message, policy *toolPolicyState) ([]Message, error) {
+		return r.executeDurableToolBatch(ctx, runID, l, calls, messages, policy)
+	}
+	history := record.Result.Messages
+	scope, beginErr := binding.agent.beginRunWithID(execCtx, cfg, history, nil, "runtime", runID)
 	if beginErr != nil {
 		result, finishErr := scope.finalize(scope.result, beginErr)
 		if commitErr := r.completeExecution(runID, result, finishErr, workerCtx.Err()); commitErr != nil {
@@ -498,14 +542,35 @@ func (r *Runtime) execute(workerCtx context.Context, runID string) {
 		}
 		return
 	}
+	scope.result = cloneRunResult(record.Result)
+	scope.result.Messages = cloneMessages(history)
+	scope.turns = record.Result.Turns
+	scope.providerAttempts = record.Result.ProviderAttempts
+	scope.usage = record.Result.Usage
+	scope.checkpointMessages = cloneMessages(history)
+	scope.policy.restoreBudget(record.ToolBudget)
 	cfg.scope = scope
-	result, runErr := binding.agent.runStream(scope.ctx, newLoop(binding.agent, nil), record.Task, func(event StreamEvent) {
-		r.publish(runID, event)
-	}, cfg)
+	result := cloneRunResult(record.Result)
+	var runErr error
+	if record.LastTransition == "batch_committed" && record.Error != "" {
+		// The batch and its fatal outcome committed before the previous worker
+		// stopped. Only finalization remains; do not ask the provider to continue.
+		runErr = snapshotError(snapshotFromRecord(record))
+	} else {
+		result, runErr = binding.agent.runStream(scope.ctx, newLoop(binding.agent, history), record.Task, func(event StreamEvent) {
+			r.publish(runID, event)
+		}, cfg)
+	}
 	result, runErr = scope.finalize(result, runErr)
 	if transitionErr != nil {
 		if markErr := r.markAttentionWithResult(context.Background(), runID, result, "durable transition failed: "+transitionErr.Error()); markErr != nil {
 			r.setFailure(runID, errors.Join(transitionErr, markErr))
+		}
+		return
+	}
+	if errors.Is(runErr, errDurableBatchIncomplete) {
+		if markErr := r.markAttentionWithResult(context.Background(), runID, result, runErr.Error()); markErr != nil {
+			r.setFailure(runID, errors.Join(runErr, markErr))
 		}
 		return
 	}
@@ -519,6 +584,10 @@ func (r *Runtime) completeExecution(runID string, result RunResult, runErr, work
 	if err != nil || record.State == RuntimeNeedsAttention {
 		return err
 	}
+	return r.completeRunHooks(runID)
+}
+
+func (r *Runtime) completeRunHooks(runID string) error {
 	// Committed-run hooks observe the record as committed, including its
 	// reassembled transcript.
 	full, err := r.load(context.Background(), runID)
@@ -540,9 +609,17 @@ func (r *Runtime) persistTransition(ctx context.Context, runID string, transitio
 		if err := appendTranscript(tx, runID, &record, transition.Result.Messages); err != nil {
 			return err
 		}
+		if transition.Kind == "batch_committed" {
+			if err := commitPendingToolBatch(tx, &record); err != nil {
+				return err
+			}
+		}
 		record.Result = cloneRunResult(transition.Result)
 		record.Result.Messages = nil
 		record.LastTransition = transition.Kind
+		if transition.Kind == "provider_accepted" {
+			record.EffectiveTools = append([]string(nil), transition.EffectiveTools...)
+		}
 		record.Generation++
 		return putRuntimeRun(tx, record)
 	})
@@ -597,6 +674,7 @@ func (r *Runtime) finishExecution(runID string, result RunResult, runErr, worker
 		case workerErr != nil:
 			record.State = RuntimeNeedsAttention
 			record.AttentionReason = "worker stopped during execution"
+			record.AttentionKind = "execution"
 			setRuntimeError(&record, runErr)
 		default:
 			record.State = RuntimeFinalizing
@@ -652,21 +730,46 @@ func (r *Runtime) finishHooks(runID string, results []RunHookResult) error {
 }
 
 func (r *Runtime) markAttentionWithResult(ctx context.Context, runID string, result RunResult, reason string) error {
-	return r.transaction(ctx, true, func(tx StoreTransaction) error {
+	var cancelled bool
+	err := r.transaction(ctx, true, func(tx StoreTransaction) error {
 		record, err := getRuntimeRun(tx, runID)
 		if err != nil {
 			return err
+		}
+		if record.PendingBatchID != "" && len(result.Messages) > record.TranscriptMessages {
+			// A failed batch transition may leave complete results only in memory.
+			// Retain them atomically with the batch marker and fatal outcome, just
+			// as the original transition would, never as transcript-only progress.
+			if err := commitPendingToolBatch(tx, &record); err != nil {
+				return err
+			}
+			record.LastTransition = "batch_committed"
 		}
 		if err := appendTranscript(tx, runID, &record, result.Messages); err != nil {
 			return err
 		}
 		record.Result = cloneRunResult(result)
 		record.Result.Messages = nil
-		record.State = RuntimeNeedsAttention
-		record.AttentionReason = reason
+		cancelled = record.State == RuntimeCancelRequested
+		if cancelled {
+			// Uncertainty is retained on the invocation, but cannot undo the
+			// durable cancellation or allow reconciliation to restart the run.
+			record.State = RuntimeFinalizing
+			record.Result.Status = RunCancelled
+			record.AttentionReason = ""
+			setRuntimeError(&record, context.Canceled)
+		} else {
+			record.State = RuntimeNeedsAttention
+			record.AttentionReason = reason
+			record.AttentionKind = "execution"
+		}
 		record.Generation++
 		return putRuntimeRun(tx, record)
 	})
+	if err != nil || !cancelled {
+		return err
+	}
+	return r.completeRunHooks(runID)
 }
 
 func errorString(err error) string {
@@ -726,6 +829,10 @@ func (r *Runtime) failure(runID string) error {
 }
 
 func (r *Runtime) markAttention(ctx context.Context, runID string, generation uint64, reason string) error {
+	return r.markAttentionKind(ctx, runID, generation, "execution", reason)
+}
+
+func (r *Runtime) markAttentionKind(ctx context.Context, runID string, generation uint64, kind, reason string) error {
 	return r.transaction(ctx, true, func(tx StoreTransaction) error {
 		record, err := getRuntimeRun(tx, runID)
 		if err != nil {
@@ -736,6 +843,7 @@ func (r *Runtime) markAttention(ctx context.Context, runID string, generation ui
 		}
 		record.State = RuntimeNeedsAttention
 		record.AttentionReason = reason
+		record.AttentionKind = kind
 		record.Generation++
 		return putRuntimeRun(tx, record)
 	})
@@ -987,12 +1095,19 @@ func (h *RunHandle) Cancel(ctx context.Context) error {
 			Version: runtimeEncodingVersion, RunID: h.runID,
 			Generation: record.Generation, ObservedState: record.State,
 		}
+		if record.State == RuntimeReady || record.State == RuntimeNeedsAttention || record.State == RuntimeRunning {
+			if err := resolveReservedInvocations(tx, record); err != nil {
+				return err
+			}
+		}
 		switch record.State {
 		case RuntimeFinalizing, RuntimeTerminal:
 			return nil
 		case RuntimeReady, RuntimeNeedsAttention:
 			record.State = RuntimeTerminal
 			record.Result.Status = RunCancelled
+			record.AttentionReason = ""
+			record.AttentionKind = ""
 			setRuntimeError(&record, context.Canceled)
 		case RuntimeRunning:
 			record.State = RuntimeCancelRequested
@@ -1078,25 +1193,29 @@ func loadRuntimeRun(tx StoreTransaction, runID string) (storedRuntimeRun, error)
 	if err != nil {
 		return storedRuntimeRun{}, err
 	}
-	if record.TranscriptMessages == 0 {
-		return record, nil
-	}
-	messages := make([]Message, 0, record.TranscriptMessages)
-	err = tx.Scan(runtimeFactsBucket, runID+"/", func(_ string, raw []byte) error {
-		var chunk []Message
-		if err := json.Unmarshal(raw, &chunk); err != nil {
-			return fmt.Errorf("decode run %s transcript chunk: %w", runID, err)
+	if record.TranscriptMessages > 0 {
+		messages := make([]Message, 0, record.TranscriptMessages)
+		err = tx.Scan(runtimeFactsBucket, runID+"/", func(_ string, raw []byte) error {
+			var chunk []Message
+			if err := json.Unmarshal(raw, &chunk); err != nil {
+				return fmt.Errorf("decode run %s transcript chunk: %w", runID, err)
+			}
+			messages = append(messages, chunk...)
+			return nil
+		})
+		if err != nil {
+			return storedRuntimeRun{}, err
 		}
-		messages = append(messages, chunk...)
-		return nil
-	})
+		if len(messages) != record.TranscriptMessages {
+			return storedRuntimeRun{}, fmt.Errorf("run %s transcript has %d stored messages but its record expects %d", runID, len(messages), record.TranscriptMessages)
+		}
+		record.Result.Messages = messages
+	}
+	batches, err := loadToolBatchSnapshots(tx, runID)
 	if err != nil {
 		return storedRuntimeRun{}, err
 	}
-	if len(messages) != record.TranscriptMessages {
-		return storedRuntimeRun{}, fmt.Errorf("run %s transcript has %d stored messages but its record expects %d", runID, len(messages), record.TranscriptMessages)
-	}
-	record.Result.Messages = messages
+	record.ToolBatches = batches
 	return record, nil
 }
 
@@ -1128,6 +1247,7 @@ func snapshotFromRecord(record storedRuntimeRun) RunSnapshot {
 		ErrorRawReason:  record.ErrorRawReason,
 		AttentionReason: record.AttentionReason,
 		HookResults:     append([]RunHookResult(nil), record.HookResults...),
+		ToolBatches:     cloneToolBatchSnapshots(record.ToolBatches),
 	}
 }
 

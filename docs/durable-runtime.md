@@ -1,7 +1,7 @@
 # Durable runtime lifecycle
 
-`core.Runtime` is the T02 execution lifecycle. It admits a task before work,
-owns worker contexts independently from API/view contexts, and pins an
+`core.Runtime` is the durable execution lifecycle. It admits a task before
+work, owns worker contexts independently from API/view contexts, and pins an
 immutable `Agent` registration. `loopMachine` is its current internal turn
 driver, not a second public lifecycle; it can be replaced in place as the
 durable transition model grows.
@@ -45,7 +45,8 @@ register the matching executable binding before `Recover`.
 
 `SubmitOptions.Scope` plus `Key` is the external idempotency identity. An exact
 retry returns the original `RunHandle`; changed task, definition, revision, or
-deadline conflicts. T03 extends this command-receipt model to every control.
+deadline conflicts. Cancel and reconcile commands also retain exact durable
+receipts; waits and signals join this model in T05.
 
 ## Three lifetimes
 
@@ -88,13 +89,67 @@ Core owns bucket names and versioned encodings; adapters own database details.
 of the root module. It enforces one local owner with an OS advisory lock.
 
 On recovery, admitted-but-unstarted work can run after its exact binding is
-registered. Work found in `running` or `cancel_requested` state becomes
-`RuntimeNeedsAttention`. The existing loop commits an accepted provider turn
-before it can dispatch requested tools and records the complete canonical batch
-after execution. Those transitions retain partial evidence, but T02 does not
-pretend they are sufficient to replay arbitrary effects. T03 and T04 add
-receipts, resumable transition claims, per-invocation outcomes, and effect
-reconciliation.
+registered. Accepted provider turns and durable tool batches resume from their
+committed transcript. Each invocation has a stable operation ID, reservation,
+dispatch state, outcome, and effect report. Completed siblings are not rerun;
+reserved siblings may continue. A call found dispatched without a committed
+outcome becomes `ToolInvocationUncertain`, keeps the run in
+`RuntimeNeedsAttention`, and is never automatically replayed. The canonical
+transcript receives the complete batch in model request order only after every
+invocation has an authoritative outcome. A fatal batch outcome commits with
+that history; recovery finalizes the failure rather than continuing the model.
+
+## Tool effects and reconciliation
+
+`ToolResult.IsError`, a returned Go error, and external effect certainty are
+separate signals. A normal Go error does not by itself mean that a mutation is
+uncertain. Tools declare recovery behavior with `WithToolEffectPolicy`:
+
+- `ToolEffectReadOnly` defaults a completed call to `EffectNone`.
+- `ToolEffectMutating` requires every return path to provide an explicit
+  `EffectApplied`, `EffectNotApplied`, or `EffectUnknown` report. An applied
+  report may carry an opaque destination receipt, including when returned with
+  a Go error or a recoverable policy timeout.
+- Unwrapped legacy tools remain supported. Their completed calls are
+  `EffectUnreported`; a crash after dispatch is still uncertain and cannot be
+  retried automatically.
+
+Runtime puts a stable `ToolOperation` in the execution context. Use
+`ToolOperationFromContext` and pass its `IdempotencyKey` to destinations that
+support idempotent requests. This reduces ambiguity but does not make a local
+storage transaction atomic with an external service.
+
+For application-level duplicate protection, a mutating policy may supply a
+stable `Scope` and `SemanticKey`. Runtime derives the key from the validated,
+model-requested arguments, reserves it in model order, and rejects a later
+mutation while the first is applied or unresolved. T05 extends this binding to
+approval-modified actions. The guard is a backstop, not proof that two arbitrary
+payloads are semantically equivalent.
+
+Inspect `RunSnapshot.ToolBatches` to find an uncertain operation. After checking
+the destination authoritatively, call:
+
+```go
+err := handle.Reconcile(ctx, operationID, core.EffectResolution{
+    Result: core.TextResult("verified existing write"),
+    Effect: core.EffectReport{
+        Status:  core.EffectApplied,
+        Receipt: destinationReceipt,
+    },
+})
+```
+
+Reconciliation never executes the tool. It atomically records the model-facing
+result, effect evidence, and command receipt, then resumes remaining reserved
+siblings and the run. An exact retry returns the original outcome; a changed
+resolution returns `ErrReconciliationConflict`. Cancellation remains terminal
+when a tool reports uncertainty: late reconciliation retains the evidence but
+never resumes the canceled run.
+
+`tools.ReadFile` is a representative read-only binding. `tools.WriteFile` is a
+mutating binding with a content-digest receipt and sandbox-root/path semantic
+guard. Custom legacy bindings should be deliberately wrapped as read-only or
+mutating before relying on restart recovery.
 
 ## Transformation, observation, and history
 

@@ -104,6 +104,10 @@ func (t frozenTool) Definition() ToolDefinition { return cloneToolDefinition(t.d
 func (t frozenTool) Execute(ctx context.Context, args json.RawMessage) (ToolResult, error) {
 	return t.executor.Execute(ctx, args)
 }
+func (t frozenTool) toolEffectPolicy() ToolEffectPolicy {
+	policy, _ := effectPolicyFor(t.executor)
+	return policy
+}
 func freezeTools(ts []Tool, terminal string) ([]Tool, error) {
 	registry, defs, err := registerTools(ts, terminal)
 	if err != nil {

@@ -261,6 +261,9 @@ type Tool interface {
 type ToolResult struct {
 	Blocks  Blocks
 	IsError bool
+	// Effect reports authoritative external-effect evidence. Direct runs pass it
+	// through unchanged; Runtime persists it separately from model-facing blocks.
+	Effect EffectReport
 }
 
 // Text returns the concatenated text of all [TextBlock]s in the result.

@@ -38,6 +38,9 @@ func registerTools(tools []Tool, terminal string) (map[string]registeredTool, []
 			return nil, nil, fmt.Errorf("nil tool")
 		}
 		d := cloneToolDefinition(tool.Definition())
+		if _, err := effectPolicyFor(tool); err != nil {
+			return nil, nil, fmt.Errorf("tool %q effect policy: %w", d.Name, err)
+		}
 		if d.Name == "" {
 			return nil, nil, fmt.Errorf("tool name is empty")
 		}

@@ -81,7 +81,7 @@ func (l *loop) executeToolBatch(
 			return
 		}
 
-		result, err := l.executeTool(batchCtx, call, messages, policy, job.budget)
+		result, err := l.safelyExecuteTool(batchCtx, call, messages, policy, job.budget)
 		if err == nil {
 			outcomes <- toolBatchOutcome{
 				idx: job.idx,

@@ -438,6 +438,27 @@ func TestWithToolRetryPreservesResultTool(t *testing.T) {
 	}
 }
 
+func TestWithToolRetryDoesNotRepeatOrLoseUncertainEffect(t *testing.T) {
+	var calls atomic.Int32
+	tool := WithToolRetry(FuncResult("write", "write", func(context.Context, struct{}) (ToolResult, error) {
+		calls.Add(1)
+		result := TextResult("write accepted")
+		result.Effect = EffectReport{Status: EffectApplied, Receipt: "write-1"}
+		return result, &retryableToolErr{msg: "response lost"}
+	}), retry.Config{MaxAttempts: 3, InitialDelay: time.Millisecond, RetryUnknown: true})
+
+	result, err := tool.Execute(context.Background(), json.RawMessage("{}"))
+	if err == nil || err.Error() != "response lost" {
+		t.Fatalf("error = %v", err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("effectful handler called %d times, want 1", calls.Load())
+	}
+	if result.Effect.Status != EffectApplied || result.Effect.Receipt != "write-1" || result.Text() != "write accepted" {
+		t.Fatalf("effect result = %#v", result)
+	}
+}
+
 func TestWithToolRetryTextResult(t *testing.T) {
 	tool := WithToolRetry(Func("plain", "plain", func(context.Context, struct{}) (string, error) { return "ok", nil }), retry.Config{})
 	res, err := tool.Execute(context.Background(), json.RawMessage("{}"))

@@ -84,6 +84,12 @@ func newLoop(a *Agent, history []Message) *loop {
 // non-streaming retry differently (see terminalStreamError).
 type invokeFn func(ctx context.Context, log *slog.Logger, req Request) (Response, error)
 
+type durableToolDispatchContextKey struct{}
+
+func withDurableToolDispatch(ctx context.Context, dispatch func() error) context.Context {
+	return context.WithValue(ctx, durableToolDispatchContextKey{}, dispatch)
+}
+
 // RunResult is the outcome of a run. It is always populated as far as the run
 // progressed — including when the run returns an error — so callers can inspect
 // partial output, the transcript, usage, and steps even on failure.
@@ -142,10 +148,16 @@ type runConfig struct {
 	// executing it; the call's Input is recorded in the result. Used by typed
 	// runs; empty for ordinary runs.
 	terminalTool string
-	// durableTransition is installed only by Runtime. The existing loop calls
-	// it at safety-relevant boundaries before it can dispatch requested tools.
-	// Direct compatibility entry points leave it nil.
+	// durableTransition and durableBatch are installed only by Runtime. Direct
+	// compatibility entry points leave them nil.
 	durableTransition func(context.Context, durableLoopTransition) error
+	durableBatch      func(context.Context, *loop, []ToolUseBlock, []Message, *toolPolicyState) ([]Message, error)
+	// resume tells the machine that its loop already contains the canonical
+	// transcript of this run. It must not append the admitted task again.
+	resume bool
+	// resumeTools is the exact effective tool selection for the already
+	// accepted provider turn. Request transforms must not be rerun on recovery.
+	resumeTools []string
 	// maxCorrectionTurns bounds model-mediated correction turns in typed runs
 	// (see [WithMaxCorrectionTurns]). nil means the default of 1.
 	maxCorrectionTurns *int
@@ -156,8 +168,9 @@ type runConfig struct {
 }
 
 type durableLoopTransition struct {
-	Kind   string
-	Result RunResult
+	Kind           string
+	Result         RunResult
+	EffectiveTools []string
 }
 
 // RunOption customizes a single run. See [WithCallOptions] and [WithToolPolicy].
@@ -228,6 +241,21 @@ func (l *loop) snapshot() []Message {
 // This is also the pre-append choke point: a future per-result truncation or
 // summarization limiter (see planning/roadmap.md) runs here, after executeTool
 // returns and before the result becomes a transcript message.
+func (l *loop) safelyExecuteTool(
+	ctx context.Context,
+	call ToolUseBlock,
+	messages []Message,
+	policy *toolPolicyState,
+	budget toolBudgetUsage,
+) (result ToolResult, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("tool %q panicked: %v", call.Name, recovered)
+		}
+	}()
+	return l.executeTool(ctx, call, messages, policy, budget)
+}
+
 func (l *loop) executeTool(
 	ctx context.Context,
 	call ToolUseBlock,
@@ -340,6 +368,11 @@ func (l *loop) executeTool(
 	//
 	// Rich-result tools (see [ResultTool]) are preferred: their block content is
 	// carried through verbatim; string tools are wrapped with [TextResult].
+	if dispatch, ok := execCtx.Value(durableToolDispatchContextKey{}).(func() error); ok {
+		if err := dispatch(); err != nil {
+			return ToolResult{}, fmt.Errorf("persist tool dispatch: %w", err)
+		}
+	}
 	result, executeErr := tool.executor.Execute(execCtx, append(json.RawMessage(nil), call.Input...))
 	result = normalizeResult(result)
 	result.Blocks = cloneBlocks(result.Blocks)
@@ -351,6 +384,12 @@ func (l *loop) executeTool(
 	if policyResult, fatal, handled := l.handleToolExecutionFailure(
 		ctx, execCtx, call, limits.Timeout, "tool", executeErr, span, log,
 	); handled {
+		// Effect evidence is independent of failure policy. In particular, a
+		// recoverable tool timeout must not erase an authoritative receipt.
+		if fatal != nil && result.Effect.Status != EffectUnreported {
+			return result, fatal
+		}
+		policyResult.Effect = result.Effect
 		return policyResult, fatal
 	}
 

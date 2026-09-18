@@ -146,6 +146,42 @@ type toolBudgetUsage struct {
 	toolMax  int
 }
 
+type storedToolBudget struct {
+	Total   int            `json:"total,omitempty"`
+	PerTool map[string]int `json:"per_tool,omitempty"`
+}
+
+func (s *toolPolicyState) snapshotBudget() storedToolBudget {
+	budget := storedToolBudget{PerTool: make(map[string]int)}
+	s.scope.mu.Lock()
+	defer s.scope.mu.Unlock()
+	if len(s.scope.totals) > 0 {
+		budget.Total = s.scope.totals[len(s.scope.totals)-1].used
+	}
+	for name, counter := range s.perTool {
+		if counter.used > 0 {
+			budget.PerTool[name] = counter.used
+		}
+	}
+	if len(budget.PerTool) == 0 {
+		budget.PerTool = nil
+	}
+	return budget
+}
+
+func (s *toolPolicyState) restoreBudget(budget storedToolBudget) {
+	s.scope.mu.Lock()
+	defer s.scope.mu.Unlock()
+	for _, counter := range s.scope.totals {
+		counter.used = budget.Total
+	}
+	for name, used := range budget.PerTool {
+		if counter := s.perTool[name]; counter != nil {
+			counter.used = used
+		}
+	}
+}
+
 func newToolPolicyState(ctx context.Context, policy ToolPolicy) (context.Context, *toolPolicyState, error) {
 	policy = policy.clone()
 	if err := policy.validate(); err != nil {
