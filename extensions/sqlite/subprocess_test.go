@@ -31,6 +31,9 @@ func TestMain(m *testing.M) {
 	case "interrupted-owner":
 		runInterruptedOwnerChild()
 		os.Exit(0)
+	case "effect-dispatch-owner":
+		runEffectDispatchOwnerChild()
+		os.Exit(0)
 	}
 	os.Exit(m.Run())
 }
@@ -79,6 +82,75 @@ func runInterruptedOwnerChild() {
 	}
 	fmt.Println("running " + handle.ID())
 	select {} // Killed by the parent test process.
+}
+
+func runEffectDispatchOwnerChild() {
+	ctx := context.Background()
+	store, err := Open(ctx, os.Getenv("AUTOMATA_SQLITE_TEST_PATH"))
+	if err != nil {
+		fmt.Println("open-error: " + err.Error())
+		os.Exit(3)
+	}
+	runtime, err := core.NewRuntime(ctx, core.RuntimeConfig{Store: store})
+	if err != nil {
+		fmt.Println("runtime-error: " + err.Error())
+		os.Exit(3)
+	}
+	agent, err := core.New(effectDispatchProvider{}, core.AgentConfig{Tools: []core.Tool{effectOracleTool(os.Getenv("AUTOMATA_SQLITE_TEST_ORACLE"), true)}})
+	if err != nil {
+		fmt.Println("agent-error: " + err.Error())
+		os.Exit(3)
+	}
+	if err := runtime.Register("agent", "v1", agent); err != nil {
+		fmt.Println("register-error: " + err.Error())
+		os.Exit(3)
+	}
+	if _, err := runtime.Submit(ctx, "agent", "v1", "work", core.SubmitOptions{Scope: "subprocess", Key: "effect"}); err != nil {
+		fmt.Println("submit-error: " + err.Error())
+		os.Exit(3)
+	}
+	select {}
+}
+
+func effectOracleTool(path string, block bool) core.Tool {
+	tool := core.FuncResult("write_effect", "append one external effect", func(ctx context.Context, _ struct{}) (core.ToolResult, error) {
+		op, ok := core.ToolOperationFromContext(ctx)
+		if !ok {
+			return core.ToolResult{}, errors.New("missing durable operation identity")
+		}
+		file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+		if err != nil {
+			return core.ToolResult{}, err
+		}
+		if _, err := file.WriteString("write\n"); err != nil {
+			_ = file.Close()
+			return core.ToolResult{}, err
+		}
+		if err := file.Sync(); err != nil {
+			_ = file.Close()
+			return core.ToolResult{}, err
+		}
+		if err := file.Close(); err != nil {
+			return core.ToolResult{}, err
+		}
+		fmt.Println("effect " + op.ID)
+		if block {
+			select {}
+		}
+		result := core.TextResult("write already exists")
+		result.Effect = core.EffectReport{Status: core.EffectApplied, Receipt: op.ID}
+		return result, nil
+	})
+	return core.WithToolEffectPolicy(tool, core.ToolEffectPolicy{Kind: core.ToolEffectMutating})
+}
+
+type effectDispatchProvider struct{}
+
+func (effectDispatchProvider) Invoke(context.Context, core.Request) (core.Response, error) {
+	return core.Response{
+		Message:    core.AssistantMessage(core.ToolUseBlock{ID: "write-1", Name: "write_effect", Input: []byte(`{}`)}),
+		StopReason: core.StopToolUse,
+	}, nil
 }
 
 type blockingProvider struct{}
@@ -166,6 +238,78 @@ func TestSecondProcessCannotBecomeOwner(t *testing.T) {
 	// The child has exited by the time it printed its error.
 	_ = cmd.Wait()
 	t.Cleanup(func() {}) // already reaped; the cleanup kill is a no-op
+}
+
+func TestInterruptedDispatchedEffectRequiresReconciliation(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("flock-based ownership is unsupported on windows")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "runtime.sqlite")
+	oracle := filepath.Join(dir, "effects.log")
+	t.Setenv("AUTOMATA_SQLITE_TEST_ORACLE", oracle)
+
+	cmd, scanner := startSubprocess(t, "effect-dispatch-owner", path)
+	line := waitSubprocessLine(t, scanner, "effect ")
+	operationID := strings.TrimPrefix(line, "effect ")
+	if err := cmd.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	_ = cmd.Wait()
+
+	ctx := context.Background()
+	store, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := core.NewRuntime(ctx, core.RuntimeConfig{Store: store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	agent, err := core.New(staticProvider{}, core.AgentConfig{Tools: []core.Tool{effectOracleTool(oracle, false)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.Register("agent", "v1", agent); err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	handle, err := reopened.Submit(ctx, "agent", "v1", "work", core.SubmitOptions{Scope: "subprocess", Key: "effect"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := handle.Snapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.State != core.RuntimeNeedsAttention || len(snapshot.ToolBatches) != 1 ||
+		len(snapshot.ToolBatches[0].Invocations) != 1 ||
+		snapshot.ToolBatches[0].Invocations[0].State != core.ToolInvocationUncertain {
+		t.Fatalf("recovered effect snapshot = %#v", snapshot)
+	}
+	if snapshot.ToolBatches[0].Invocations[0].OperationID != operationID {
+		t.Fatalf("operation ID = %q, want %q", snapshot.ToolBatches[0].Invocations[0].OperationID, operationID)
+	}
+	if err := handle.Reconcile(ctx, operationID, core.EffectResolution{
+		Result: core.TextResult("verified existing write"),
+		Effect: core.EffectReport{Status: core.EffectApplied, Receipt: "oracle-write-1"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	result, err := handle.Await(ctx)
+	if err != nil || result.Output != "persisted" {
+		t.Fatalf("reconciled run = %#v, %v", result, err)
+	}
+	data, err := os.ReadFile(oracle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(string(data), "write\n"); got != 1 {
+		t.Fatalf("external effect count = %d, want 1", got)
+	}
 }
 
 func TestInterruptedOwnerRunBecomesAttention(t *testing.T) {
