@@ -3,10 +3,13 @@ package sqlite
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/emotional-data8482/automata/core"
 )
@@ -73,6 +76,105 @@ func TestPersistentRuntimeReopensTerminalRun(t *testing.T) {
 	}
 }
 
+func TestDurableApprovalReopensAndLostResponseIsIdempotent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "approval.sqlite")
+	var writes atomic.Int64
+	tool := core.FuncResult("write", "write", func(context.Context, struct {
+		Path string `json:"path"`
+	}) (core.ToolResult, error) {
+		writes.Add(1)
+		result := core.TextResult("written")
+		result.Effect = core.EffectReport{Status: core.EffectApplied, Receipt: "write-1"}
+		return result, nil
+	})
+	tool = core.WithToolEffectPolicy(tool, core.ToolEffectPolicy{Kind: core.ToolEffectMutating})
+	tool = core.WithDurableWait(tool, core.DurableWaitPolicy{
+		Kind: core.WaitApproval,
+		Target: func(raw json.RawMessage) (string, error) {
+			var input struct {
+				Path string `json:"path"`
+			}
+			if err := json.Unmarshal(raw, &input); err != nil {
+				return "", err
+			}
+			return input.Path, nil
+		},
+	})
+	agent, err := core.New(approvalProvider{}, core.AgentConfig{Tools: []core.Tool{tool}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	authorizer := core.ApprovalAuthorizerFunc(func(context.Context, core.ApprovalAuthorization) error { return nil })
+	store, err := Open(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := core.NewRuntime(context.Background(), core.RuntimeConfig{Store: store, Authorizer: authorizer})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Register("writer", "v1", agent); err != nil {
+		t.Fatal(err)
+	}
+	handle, err := runtime.Submit(context.Background(), "writer", "v1", "write", core.SubmitOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wait core.WaitSnapshot
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		snapshot, snapshotErr := handle.Snapshot(context.Background())
+		if snapshotErr != nil {
+			t.Fatal(snapshotErr)
+		}
+		if snapshot.State == core.RuntimeWaiting && len(snapshot.Waits) == 1 {
+			wait = snapshot.Waits[0]
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if wait.ID == "" {
+		t.Fatal("run did not persist approval wait")
+	}
+	if err := runtime.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err = Open(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := core.NewRuntime(context.Background(), core.RuntimeConfig{Store: store, Authorizer: authorizer})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if err := reopened.Register("writer", "v1", agent); err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.Recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	handle = reopened.Handle(handle.ID())
+	resolution := core.WaitResolution{Decision: core.Allow, Actor: "host-user", ActionDigest: wait.ActionDigest}
+	if err := handle.ResolveWait(context.Background(), wait.ID, resolution); err != nil {
+		t.Fatal(err)
+	}
+	result, err := handle.Await(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Output != "complete" || writes.Load() != 1 {
+		t.Fatalf("result = %#v, writes = %d", result, writes.Load())
+	}
+	if err := handle.ResolveWait(context.Background(), wait.ID, resolution); err != nil {
+		t.Fatalf("lost-response retry: %v", err)
+	}
+	if writes.Load() != 1 {
+		t.Fatalf("duplicate resolution repeated write: %d", writes.Load())
+	}
+}
+
 func TestUnsupportedSchemaIsRejectedWithoutRewrite(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "runtime.sqlite")
 	store, err := Open(context.Background(), path)
@@ -121,6 +223,17 @@ func TestExclusiveLocalOwner(t *testing.T) {
 	if _, err := Open(context.Background(), path); !errors.Is(err, ErrOwned) {
 		t.Fatalf("second owner = %v", err)
 	}
+}
+
+type approvalProvider struct{}
+
+func (approvalProvider) Invoke(_ context.Context, request core.Request) (core.Response, error) {
+	for _, message := range request.Messages {
+		if message.Role == "tool" {
+			return core.Response{Message: core.AssistantMessage(core.TextBlock{Text: "complete"}), StopReason: core.StopEndTurn}, nil
+		}
+	}
+	return core.Response{Message: core.AssistantMessage(core.ToolUseBlock{ID: "write-1", Name: "write", Input: json.RawMessage(`{"path":"report.txt"}`)}), StopReason: core.StopToolUse}, nil
 }
 
 type staticProvider struct{}
