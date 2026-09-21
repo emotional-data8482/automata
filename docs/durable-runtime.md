@@ -45,8 +45,8 @@ register the matching executable binding before `Recover`.
 
 `SubmitOptions.Scope` plus `Key` is the external idempotency identity. An exact
 retry returns the original `RunHandle`; changed task, definition, revision, or
-deadline conflicts. Cancel and reconcile commands also retain exact durable
-receipts; waits and signals join this model in T05.
+deadline conflicts. Cancel, reconcile, and wait-resolution commands retain
+historical durable outcomes, including after later run transitions.
 
 ## Three lifetimes
 
@@ -150,6 +150,68 @@ never resumes the canceled run.
 mutating binding with a content-digest receipt and sandbox-root/path semantic
 guard. Custom legacy bindings should be deliberately wrapped as read-only or
 mutating before relying on restart recovery.
+
+## Durable questions and approvals
+
+`WithDurableWait` suspends a Runtime tool invocation without retaining its
+worker. A question answer becomes the tool result; the wrapped question tool is
+never executed. An approval instead gates dispatch of the wrapped tool. Direct
+`Agent.Run` calls remain process-local and execute the wrapped tool normally.
+
+Approvals bind the operation ID, tool, canonical arguments, resource target,
+definition revision, policy context, and expiry into `WaitSnapshot.ActionDigest`.
+The host must configure `RuntimeConfig.Authorizer`; an actor string in a
+resolution is audit context, never proof of authority. Runtime calls the
+authorizer when accepting an allow decision and again immediately before the
+atomic dispatch transition. Modification is deliberately unsupported: a changed
+action needs a new model invocation and approval.
+
+A minimal host flow is:
+
+```go
+write := core.WithDurableWait(writeTool, core.DurableWaitPolicy{
+    Kind:          core.WaitApproval,
+    PolicyContext: "files-v3",
+    ExpiresAfter:  15 * time.Minute,
+    Target: func(raw json.RawMessage) (string, error) {
+        var in struct{ Path string `json:"path"` }
+        if err := json.Unmarshal(raw, &in); err != nil { return "", err }
+        return in.Path, nil
+    },
+})
+
+agent, err := core.New(provider, core.AgentConfig{Tools: []core.Tool{write}})
+if err != nil { return err }
+
+runtime, err := core.NewRuntime(ctx, core.RuntimeConfig{
+    Store: store,
+    Authorizer: core.ApprovalAuthorizerFunc(func(ctx context.Context,
+        check core.ApprovalAuthorization) error {
+        // Authenticate outside core and consult current policy here.
+        return currentPolicy.Authorize(ctx, check.Actor, check.Target)
+    }),
+})
+// Register the same definition revision, then recover after every restart.
+_ = runtime.Register("writer", "v3", agent)
+_ = runtime.Recover(ctx)
+
+snapshot, _ := handle.Snapshot(ctx)
+wait := snapshot.Waits[0] // render wait.Prompt/Target in the host UI
+err = handle.ResolveWait(ctx, wait.ID, core.WaitResolution{
+    Decision:     core.Allow,
+    Actor:        authenticatedSubject,
+    ActionDigest: wait.ActionDigest,
+})
+```
+
+For a question use `WaitQuestion` and resolve with a valid JSON `Answer` instead
+of a decision. After `Runtime.Close`, reopen the same store, register the same
+binding, call `Recover`, inspect the same wait, and resolve it. If the HTTP/CLI
+response is lost, submit the identical `ResolveWait` again: it returns the
+stored outcome even if the run has since completed. A different answer or
+approval returns `ErrWaitConflict`; stale action digests, expired waits, revoked
+authority, and cancellation never dispatch the mutation. `RunSnapshot.Waits`
+keeps those races inspectable.
 
 ## Transformation, observation, and history
 
