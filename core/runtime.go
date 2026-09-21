@@ -14,11 +14,9 @@ import (
 )
 
 // runtimeEncodingVersion is the storage encoding this core build reads and
-// writes. Version 4 adds exact effective-tool recovery, lifecycle-attention
-// classification, and structured invocation errors to the durable batch and
-// reconciliation records. Earlier pre-release stores are rejected without
-// implicit rewrite.
-const runtimeEncodingVersion = 4
+// writes. Version 5 adds durable question and approval waits. Earlier
+// pre-release stores are rejected without implicit rewrite.
+const runtimeEncodingVersion = 5
 
 const (
 	runtimeMetaBucket         = "runtime_meta"
@@ -29,6 +27,7 @@ const (
 	runtimeBatchesBucket      = "runtime_batches"
 	runtimeInvocationsBucket  = "runtime_invocations"
 	runtimeEffectGuardsBucket = "runtime_effect_guards"
+	runtimeWaitsBucket        = "runtime_waits"
 )
 
 // runtimeRecoverPageSize bounds how many run records one recovery scan page
@@ -49,6 +48,7 @@ type RuntimeState string
 const (
 	RuntimeReady           RuntimeState = "ready"
 	RuntimeRunning         RuntimeState = "running"
+	RuntimeWaiting         RuntimeState = "waiting"
 	RuntimeCancelRequested RuntimeState = "cancel_requested"
 	RuntimeFinalizing      RuntimeState = "finalizing"
 	RuntimeNeedsAttention  RuntimeState = "needs_attention"
@@ -56,8 +56,9 @@ const (
 )
 
 type RuntimeConfig struct {
-	Store Store
-	Hooks []CommittedRunHook
+	Store      Store
+	Hooks      []CommittedRunHook
+	Authorizer ApprovalAuthorizer
 }
 
 type SubmitOptions struct {
@@ -79,6 +80,7 @@ type RunSnapshot struct {
 	AttentionReason    string
 	HookResults        []RunHookResult
 	ToolBatches        []ToolBatchSnapshot
+	Waits              []WaitSnapshot
 }
 
 type definitionBinding struct {
@@ -112,6 +114,7 @@ type storedRuntimeRun struct {
 	NextBatchOrdinal   int                 `json:"next_batch_ordinal,omitempty"`
 	ToolBudget         storedToolBudget    `json:"tool_budget"`
 	ToolBatches        []ToolBatchSnapshot `json:"-"`
+	Waits              []WaitSnapshot      `json:"-"`
 }
 
 // admissionPayload is the canonical admission identity payload. Its JSON
@@ -154,7 +157,8 @@ type admissionRecord struct {
 }
 
 type liveRuntimeRun struct {
-	cancel context.CancelFunc
+	cancel  context.CancelFunc
+	restart bool
 }
 
 type runtimeStreamItem struct {
@@ -179,6 +183,7 @@ type Runtime struct {
 	closeErr    error
 	bindings    map[string]definitionBinding
 	hooks       []CommittedRunHook
+	authorizer  ApprovalAuthorizer
 	live        map[string]liveRuntimeRun
 	failures    map[string]error
 	subscribers map[string]map[uint64]chan runtimeStreamItem
@@ -198,12 +203,17 @@ func NewRuntime(ctx context.Context, config RuntimeConfig) (*Runtime, error) {
 		return nil, err
 	}
 	workerCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	authorizer := config.Authorizer
+	if nilDependency(authorizer) {
+		authorizer = nil
+	}
 	r := &Runtime{
 		store:       config.Store,
 		ctx:         workerCtx,
 		cancel:      cancel,
 		bindings:    make(map[string]definitionBinding),
 		hooks:       hooks,
+		authorizer:  authorizer,
 		live:        make(map[string]liveRuntimeRun),
 		failures:    make(map[string]error),
 		subscribers: make(map[string]map[uint64]chan runtimeStreamItem),
@@ -254,6 +264,15 @@ func (r *Runtime) initialize(ctx context.Context) error {
 func (r *Runtime) Register(definitionID, revision string, agent *Agent) error {
 	if definitionID == "" || revision == "" || agent == nil || strings.ContainsRune(definitionID, '\x00') || strings.ContainsRune(revision, '\x00') {
 		return fmt.Errorf("definition id, revision, and agent are required")
+	}
+	for _, tool := range agent.tools {
+		policy, configured, err := waitPolicyFor(tool)
+		if err != nil {
+			return err
+		}
+		if configured && policy.Kind == WaitApproval && r.authorizer == nil {
+			return errors.New("durable approval requires a runtime authorizer")
+		}
 	}
 	key := bindingKey(definitionID, revision)
 	r.mu.Lock()
@@ -427,6 +446,21 @@ func (r *Runtime) Recover(ctx context.Context) error {
 			} else {
 				r.start(record.RunID)
 			}
+		case RuntimeWaiting:
+			finalized, err := r.expireWaitingDeadline(ctx, record.RunID)
+			if err != nil {
+				return err
+			}
+			if finalized {
+				continue
+			}
+			ready, err := r.expireRunWaits(ctx, record.RunID)
+			if err != nil {
+				return err
+			}
+			if ready {
+				r.start(record.RunID)
+			}
 		case RuntimeRunning:
 			resumable, err := r.recoverToolBatch(ctx, record)
 			if err != nil {
@@ -468,7 +502,9 @@ func (r *Runtime) start(runID string) {
 		r.mu.Unlock()
 		return
 	}
-	if _, ok := r.live[runID]; ok {
+	if live, ok := r.live[runID]; ok {
+		live.restart = true
+		r.live[runID] = live
 		r.mu.Unlock()
 		return
 	}
@@ -480,12 +516,27 @@ func (r *Runtime) start(runID string) {
 }
 
 func (r *Runtime) execute(workerCtx context.Context, runID string) {
-	defer r.wg.Done()
-	defer r.publishTerminal(runID)
+	logicalComplete := true
 	defer func() {
 		r.mu.Lock()
+		live := r.live[runID]
 		delete(r.live, runID)
+		restart := live.restart && !r.closing && !r.closed
+		var nextCtx context.Context
+		if restart {
+			var cancel context.CancelFunc
+			nextCtx, cancel = context.WithCancel(r.ctx)
+			r.live[runID] = liveRuntimeRun{cancel: cancel}
+			r.wg.Add(1)
+		}
 		r.mu.Unlock()
+		if logicalComplete {
+			r.publishTerminal(runID)
+		}
+		if restart {
+			go r.execute(nextCtx, runID)
+		}
+		r.wg.Done()
 	}()
 	record, claimed, err := r.claim(workerCtx, runID)
 	if err != nil {
@@ -566,6 +617,10 @@ func (r *Runtime) execute(workerCtx context.Context, runID string) {
 		if markErr := r.markAttentionWithResult(context.Background(), runID, result, "durable transition failed: "+transitionErr.Error()); markErr != nil {
 			r.setFailure(runID, errors.Join(transitionErr, markErr))
 		}
+		return
+	}
+	if errors.Is(runErr, errDurableWaiting) {
+		logicalComplete = false
 		return
 	}
 	if errors.Is(runErr, errDurableBatchIncomplete) {
@@ -1095,15 +1150,18 @@ func (h *RunHandle) Cancel(ctx context.Context) error {
 			Version: runtimeEncodingVersion, RunID: h.runID,
 			Generation: record.Generation, ObservedState: record.State,
 		}
-		if record.State == RuntimeReady || record.State == RuntimeNeedsAttention || record.State == RuntimeRunning {
+		if record.State == RuntimeReady || record.State == RuntimeWaiting || record.State == RuntimeNeedsAttention || record.State == RuntimeRunning {
 			if err := resolveReservedInvocations(tx, record); err != nil {
+				return err
+			}
+			if err := cancelRunWaits(tx, record.RunID); err != nil {
 				return err
 			}
 		}
 		switch record.State {
 		case RuntimeFinalizing, RuntimeTerminal:
 			return nil
-		case RuntimeReady, RuntimeNeedsAttention:
+		case RuntimeReady, RuntimeWaiting, RuntimeNeedsAttention:
 			record.State = RuntimeTerminal
 			record.Result.Status = RunCancelled
 			record.AttentionReason = ""
@@ -1216,6 +1274,13 @@ func loadRuntimeRun(tx StoreTransaction, runID string) (storedRuntimeRun, error)
 		return storedRuntimeRun{}, err
 	}
 	record.ToolBatches = batches
+	waits, err := loadRunWaits(tx, runID)
+	if err != nil {
+		return storedRuntimeRun{}, err
+	}
+	for _, wait := range waits {
+		record.Waits = append(record.Waits, waitSnapshot(wait))
+	}
 	return record, nil
 }
 
@@ -1248,6 +1313,7 @@ func snapshotFromRecord(record storedRuntimeRun) RunSnapshot {
 		AttentionReason: record.AttentionReason,
 		HookResults:     append([]RunHookResult(nil), record.HookResults...),
 		ToolBatches:     cloneToolBatchSnapshots(record.ToolBatches),
+		Waits:           append([]WaitSnapshot(nil), record.Waits...),
 	}
 }
 

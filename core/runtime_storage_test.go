@@ -14,12 +14,12 @@ import (
 
 // --- encoding fixtures -------------------------------------------------------
 
-// Golden fixtures lock the version 4 record encoding and the admission digest
+// Golden fixtures lock the version 5 record encoding and the admission digest
 // rule. Changing either changes every persisted record and requires a new
 // encoding version, not a silent rewrite.
 func TestRuntimeRecordEncodingIsStable(t *testing.T) {
 	record := storedRuntimeRun{
-		Version: 4, RunID: "run-1", DefinitionID: "agent", DefinitionRevision: "v1",
+		Version: 5, RunID: "run-1", DefinitionID: "agent", DefinitionRevision: "v1",
 		Task: "work", Deadline: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC),
 		State: RuntimeRunning, Generation: 7,
 		Result:             RunResult{RunID: "run-1", Status: RunCompleted, Output: "done", Turns: 2},
@@ -34,7 +34,7 @@ func TestRuntimeRecordEncodingIsStable(t *testing.T) {
 	}
 	// RunResult persists with Go field names (it has no JSON tags); this
 	// fixture locks that encoding until T03's version decision is revisited.
-	want := `{"version":4,"run_id":"run-1","definition_id":"agent","definition_revision":"v1",` +
+	want := `{"version":5,"run_id":"run-1","definition_id":"agent","definition_revision":"v1",` +
 		`"task":"work","deadline":"2026-01-02T03:04:05Z","state":"running","generation":7,` +
 		`"result":{"RunID":"run-1","Status":"completed","Turns":2,"ProviderAttempts":0,` +
 		`"ProviderStopReason":"","RawProviderStopReason":"","Diagnostics":null,"Output":"done",` +
@@ -61,7 +61,7 @@ func TestRuntimeRecordEncodingIsStable(t *testing.T) {
 	if legacy.TranscriptChunks != 3 {
 		t.Fatalf("fixture decode = %#v", legacy)
 	}
-	bumped := strings.Replace(want, `"version":4`, `"version":99`, 1)
+	bumped := strings.Replace(want, `"version":5`, `"version":99`, 1)
 	if _, err := decodeRuntimeRun([]byte(bumped)); err == nil ||
 		!strings.Contains(err.Error(), "unsupported runtime run version 99") {
 		t.Fatalf("unsupported version = %v", err)

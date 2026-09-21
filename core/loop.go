@@ -191,7 +191,7 @@ func (l *loop) run(ctx context.Context, task, mode string, cfg runConfig, invoke
 	return m.drive()
 }
 
-func canceledToolResult(cause error) string {
+func canceledToolResult(_ error) string {
 	return "canceled: tool batch aborted"
 }
 
@@ -199,7 +199,7 @@ func canceledToolResult(cause error) string {
 // compatibility inference only when an older custom provider supplied no
 // reason at all. A nonempty unrecognized value is preserved as raw diagnostic
 // data and becomes StopUnknown.
-func normalizeResponseStop(response Response, toolUses []ToolUseBlock) (StopReason, string) {
+func normalizeResponseStop(response Response, _ []ToolUseBlock) (StopReason, string) {
 	reason := response.StopReason
 	raw := response.RawStopReason
 
@@ -308,7 +308,11 @@ func (l *loop) executeTool(
 		tracing.Bool("policy.rate_limited", limits.RateLimiter != nil),
 	)
 
-	decision, err := a.approver.Approve(ctx, cloneBlock(call).(ToolUseBlock), cloneMessages(messages))
+	decision := Decision{Outcome: Allow}
+	var err error
+	if approved, _ := ctx.Value(durableApprovalContextKey{}).(bool); !approved {
+		decision, err = a.approver.Approve(ctx, cloneBlock(call).(ToolUseBlock), cloneMessages(messages))
+	}
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(err)
@@ -333,6 +337,10 @@ func (l *loop) executeTool(
 			return l.invalidArguments(call, err), nil
 		}
 	}
+	// Durable approval applies only to this exact outer dispatch. Do not let
+	// the marker authorize tools invoked by the wrapped tool (for example, a
+	// process-local child agent).
+	ctx = context.WithValue(ctx, durableApprovalContextKey{}, false)
 
 	execCtx := ctx
 	cancel := func() {}

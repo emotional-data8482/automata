@@ -108,6 +108,10 @@ func (t frozenTool) toolEffectPolicy() ToolEffectPolicy {
 	policy, _ := effectPolicyFor(t.executor)
 	return policy
 }
+func (t frozenTool) durableWaitPolicy() DurableWaitPolicy {
+	policy, _, _ := waitPolicyFor(t.executor)
+	return policy
+}
 func freezeTools(ts []Tool, terminal string) ([]Tool, error) {
 	registry, defs, err := registerTools(ts, terminal)
 	if err != nil {
@@ -115,7 +119,11 @@ func freezeTools(ts []Tool, terminal string) ([]Tool, error) {
 	}
 	out := make([]Tool, len(defs))
 	for i, d := range defs {
-		out[i] = frozenTool{registry[d.Name]}
+		registered := registry[d.Name]
+		if _, _, err := waitPolicyFor(registered.executor); err != nil {
+			return nil, fmt.Errorf("tool %q: %w", d.Name, err)
+		}
+		out[i] = frozenTool{registered}
 	}
 	return out, nil
 }

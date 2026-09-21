@@ -48,6 +48,12 @@ type Approver interface {
 	Approve(ctx context.Context, call ToolUseBlock, messages []Message) (Decision, error)
 }
 
+type durableApprovalContextKey struct{}
+
+func withDurableApproval(ctx context.Context) context.Context {
+	return context.WithValue(ctx, durableApprovalContextKey{}, true)
+}
+
 // AllowAll is the default Approver. It permits every call unconditionally.
 var AllowAll Approver = allowAll{}
 

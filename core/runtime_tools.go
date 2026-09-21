@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 )
 
 var (
@@ -45,6 +46,7 @@ type storedToolInvocation struct {
 	EffectKind      ToolEffectKind      `json:"effect_kind,omitempty"`
 	GuardKey        string              `json:"guard_key,omitempty"`
 	GuardDisplay    string              `json:"guard_display,omitempty"`
+	WaitID          string              `json:"wait_id,omitempty"`
 }
 
 type storedEffectGuard struct {
@@ -139,6 +141,7 @@ func loadToolBatchSnapshots(tx StoreTransaction, runID string) ([]ToolBatchSnaps
 				Effect:      invocation.Effect,
 				Error:       invocation.Error,
 				GuardKey:    invocation.GuardDisplay,
+				WaitID:      invocation.WaitID,
 			})
 		}
 		snapshots = append(snapshots, snapshot)
@@ -186,6 +189,16 @@ func (r *Runtime) prepareDurableBatch(ctx context.Context, runID string, l *loop
 		record, err := getRuntimeRun(tx, runID)
 		if err != nil {
 			return err
+		}
+		// Cancellation and terminal ownership are authoritative at the same
+		// boundary that creates reservations and waits. The transaction is
+		// deliberately detached from the worker context so it can observe the
+		// committed command, but it must never reverse that command.
+		if record.State == RuntimeCancelRequested || record.State == RuntimeFinalizing || record.State == RuntimeTerminal {
+			return context.Canceled
+		}
+		if record.State != RuntimeRunning {
+			return fmt.Errorf("run cannot prepare a tool batch from %s", record.State)
 		}
 		if record.PendingBatchID != "" {
 			batch, err = getStoredToolBatch(tx, runID, record.PendingBatchID)
@@ -263,6 +276,13 @@ func (r *Runtime) prepareDurableBatch(ctx context.Context, runID string, l *loop
 					}
 				}
 			}
+			if invocation.State == ToolInvocationReserved {
+				if registered, known := l.toolsByName[call.Name]; known && validateToolArguments(registered.definition.InputSchema, call.Input) == nil {
+					if err := r.createInvocationWait(tx, record, &invocation, registered.executor); err != nil {
+						return err
+					}
+				}
+			}
 			invocations[i] = invocation
 		}
 		if err := putStoredJSON(tx, runtimeBatchesBucket, batchStorageKey(runID, batch.BatchID), batch); err != nil {
@@ -276,6 +296,12 @@ func (r *Runtime) prepareDurableBatch(ctx context.Context, runID string, l *loop
 		record.PendingBatchID = batch.BatchID
 		record.NextBatchOrdinal++
 		record.ToolBudget = policy.snapshotBudget()
+		for _, invocation := range invocations {
+			if invocation.WaitID != "" && invocation.State == ToolInvocationReserved {
+				record.State = RuntimeWaiting
+				break
+			}
+		}
 		record.Generation++
 		return putRuntimeRun(tx, record)
 	})
@@ -294,6 +320,31 @@ func (r *Runtime) beginToolDispatch(ctx context.Context, invocation storedToolIn
 		}
 		if invocation.State != ToolInvocationReserved {
 			return nil
+		}
+		if invocation.WaitID != "" {
+			wait, err := getStoredWait(tx, invocation.RunID, invocation.WaitID)
+			if err != nil {
+				return err
+			}
+			if wait.Kind == WaitApproval {
+				if wait.State != WaitResolved || wait.Resolution.Decision != Allow || wait.ActionDigest != approvalActionDigest(wait) || wait.Resolution.ActionDigest != wait.ActionDigest {
+					return ErrWaitStale
+				}
+				if !wait.ExpiresAt.IsZero() && !time.Now().UTC().Before(wait.ExpiresAt) {
+					if err := expireWait(tx, &wait, time.Now().UTC()); err != nil {
+						return err
+					}
+					raw, err := tx.Get(runtimeInvocationsBucket, invocationStorageKey(invocation.RunID, invocation.BatchID, invocation.Ordinal))
+					if err != nil {
+						return err
+					}
+					return json.Unmarshal(raw, &invocation)
+				}
+				wait.State = WaitConsumed
+				if err := putStoredWait(tx, wait); err != nil {
+					return err
+				}
+			}
 		}
 		if invocation.GuardKey != "" {
 			rawGuard, err := tx.Get(runtimeEffectGuardsBucket, invocation.GuardKey)
@@ -406,6 +457,9 @@ func emitStoredToolResult(l *loop, invocation storedToolInvocation, err error) {
 func (r *Runtime) executeDurableToolBatch(ctx context.Context, runID string, l *loop, calls []ToolUseBlock, messages []Message, policy *toolPolicyState) ([]Message, error) {
 	batch, invocations, created, err := r.prepareDurableBatch(ctx, runID, l, calls, policy)
 	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, err
+		}
 		return nil, fmt.Errorf("%w: prepare tool batch: %v", errDurableBatchIncomplete, err)
 	}
 	if len(invocations) != len(calls) || batch.Count != len(calls) {
@@ -418,6 +472,23 @@ func (r *Runtime) executeDurableToolBatch(ctx context.Context, runID string, l *
 			if invocation.State == ToolInvocationCompleted && (invocation.GuardKey != "" || invocation.Fatal) {
 				emitStoredToolResult(l, invocation, invocationError(invocation))
 			}
+		}
+	}
+
+	for _, invocation := range invocations {
+		if invocation.WaitID == "" || invocation.State != ToolInvocationReserved {
+			continue
+		}
+		var wait storedWait
+		if err := r.transaction(context.WithoutCancel(ctx), false, func(tx StoreTransaction) error {
+			var err error
+			wait, err = getStoredWait(tx, runID, invocation.WaitID)
+			return err
+		}); err != nil {
+			return nil, fmt.Errorf("%w: inspect durable wait: %v", errDurableBatchIncomplete, err)
+		}
+		if wait.State == WaitPending {
+			return nil, errDurableWaiting
 		}
 	}
 
@@ -466,8 +537,12 @@ func (r *Runtime) executeDurableToolBatch(ctx context.Context, runID string, l *
 				current := invocation
 				dispatchAttempted := false
 				dispatched := false
+				var authorityErr error
 				op := ToolOperation{ID: current.OperationID, RunID: runID, BatchID: batch.BatchID, Invocation: current.Ordinal, IdempotencyKey: current.OperationID}
 				execCtx := withToolOperation(batchCtx, op)
+				if current.WaitID != "" {
+					execCtx = withDurableApproval(execCtx)
+				}
 				execCtx = withDurableToolDispatch(execCtx, func() error {
 					// Nested process-local tools may inherit this context until T07 turns
 					// children into durable runs. Only the outer binding owns this dispatch.
@@ -475,7 +550,24 @@ func (r *Runtime) executeDurableToolBatch(ctx context.Context, runID string, l *
 						return nil
 					}
 					dispatchAttempted = true
-					updated, didDispatch, err := r.beginToolDispatch(ctx, current)
+					// This check is intentionally inside the dispatch callback: approval,
+					// timeout, and rate-limit work above may block. No host callback is held
+					// inside the following storage transaction.
+					if err := r.revalidateApproval(execCtx, runID, current); err != nil {
+						// Parent cancellation remains fatal. A tool-owned deadline that
+						// elapses during authorization is a recoverable, not-applied
+						// pre-dispatch outcome like other tool policy timeouts.
+						if parentErr := ctx.Err(); parentErr != nil {
+							return parentErr
+						}
+						if policyErr := execCtx.Err(); policyErr != nil {
+							authorityErr = policyErr
+						} else if errors.Is(err, ErrApprovalUnauthorized) || errors.Is(err, ErrApprovalActionMismatch) || errors.Is(err, ErrWaitStale) || errors.Is(err, ErrWaitExpired) {
+							authorityErr = err
+						}
+						return err
+					}
+					updated, didDispatch, err := r.beginToolDispatch(execCtx, current)
 					if err != nil {
 						return err
 					}
@@ -488,6 +580,18 @@ func (r *Runtime) executeDurableToolBatch(ctx context.Context, runID string, l *
 				})
 				result, executeErr := l.safelyExecuteTool(execCtx, call, messages, policy, current.Budget)
 				if dispatchAttempted && !dispatched {
+					if authorityErr != nil {
+						canonical := ErrorResult("denied: " + authorityErr.Error())
+						returned := canonical
+						returned.Effect = EffectReport{Status: EffectNotApplied}
+						if completeErr := r.completeToolInvocation(ctx, current, returned, nil, canonical, false); completeErr != nil {
+							recordWorkErr(completeErr)
+						} else {
+							current.Result = canonical
+							emitStoredToolResult(l, current, authorityErr)
+						}
+						continue
+					}
 					if current.State == ToolInvocationCompleted {
 						emitStoredToolResult(l, current, invocationError(current))
 						continue

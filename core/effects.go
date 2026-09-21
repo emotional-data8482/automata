@@ -99,6 +99,10 @@ type effectPolicyTool struct {
 }
 
 func (t *effectPolicyTool) toolEffectPolicy() ToolEffectPolicy { return t.policy }
+func (t *effectPolicyTool) durableWaitPolicy() DurableWaitPolicy {
+	policy, _, _ := waitPolicyFor(t.Tool)
+	return policy
+}
 
 // WithToolEffectPolicy attaches an explicit durable effect contract to a Tool.
 // Invalid policies are rejected when the tool is registered for a run.
@@ -168,6 +172,7 @@ type ToolInvocationSnapshot struct {
 	Effect      EffectReport
 	Error       string
 	GuardKey    string
+	WaitID      string
 }
 
 // ToolBatchSnapshot describes one durable model tool-request batch.

@@ -68,6 +68,10 @@ func (t *retryTool) toolEffectPolicy() ToolEffectPolicy {
 	policy, _ := effectPolicyFor(t.Tool)
 	return policy
 }
+func (t *retryTool) durableWaitPolicy() DurableWaitPolicy {
+	policy, _, _ := waitPolicyFor(t.Tool)
+	return policy
+}
 
 type nonRetryableToolEffectError struct{ cause error }
 
@@ -86,6 +90,10 @@ type legacyErrorTool struct{ Tool }
 
 func (t *legacyErrorTool) toolEffectPolicy() ToolEffectPolicy {
 	policy, _ := effectPolicyFor(t.Tool)
+	return policy
+}
+func (t *legacyErrorTool) durableWaitPolicy() DurableWaitPolicy {
+	policy, _, _ := waitPolicyFor(t.Tool)
 	return policy
 }
 
