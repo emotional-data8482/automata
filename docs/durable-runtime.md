@@ -355,11 +355,12 @@ transcript, effects, and receipts: `ToolInvocationSnapshot.ChildRunID` and
 A child that needs attention, or a terminal child whose subtree still has an
 uncertain effect or an unsettled run, blocks the parent in
 `RuntimeNeedsAttention` with `Attention.Kind == AttentionChild`. The parent's
-`Attention.BlockingRunID` identifies the pending child responsible for the
-current attention; inspect that child's snapshot to act on its own evidence.
-Reconciling the child's
-operation (or the child otherwise settling cleanly) lets the parent consume the
-outcome and continue without replaying child work.
+`Attention.BlockingRunID` identifies the immediate pending child responsible
+for the current attention, not necessarily the descendant that needs action.
+Inspect that child's snapshot: child attention may only mean a canceled subtree
+is settling without host intervention. When an operation needs reconciliation,
+reconciling it (or the child otherwise settling cleanly) lets the parent consume
+the outcome and continue without replaying child work.
 
 ### Caps and accounting
 

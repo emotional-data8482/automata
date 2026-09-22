@@ -822,6 +822,16 @@ func TestRuntimeDurableChildAttentionBlocksParentAndLaterUnblocks(t *testing.T) 
 	if _, err := runtime.Handle(parentID).Await(context.Background()); !errors.Is(err, ErrRunNeedsAttention) {
 		t.Fatalf("Await = %v, want ErrRunNeedsAttention", err)
 	}
+	if err := runtime.Recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	stillBlocked, err := runtime.Handle(parentID).Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stillBlocked.Attention == nil || stillBlocked.Attention.BlockingRunID != childResult.RunID {
+		t.Fatalf("recovered parent attention = %#v, want child %s", stillBlocked.Attention, childResult.RunID)
+	}
 	// The host resolves the child authoritatively; the child settles cleanly.
 	if err := runtime.transaction(context.Background(), true, func(tx StoreTransaction) error {
 		record, err := getRuntimeRun(tx, childResult.RunID)
@@ -1138,8 +1148,16 @@ func TestRuntimeDurableCanceledChildWakesParentAfterDescendantSettles(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	if blocked.State != RuntimeNeedsAttention || blocked.Attention == nil || blocked.Attention.Kind != AttentionChild {
-		t.Fatalf("parent = %s %#v, want child attention while the descendant is unsettled", blocked.State, blocked.Attention)
+	if blocked.State != RuntimeNeedsAttention || blocked.Attention == nil || blocked.Attention.Kind != AttentionChild ||
+		blocked.Attention.BlockingRunID != childID {
+		t.Fatalf("parent = %s %#v, want child %s attention while descendant settles", blocked.State, blocked.Attention, childID)
+	}
+	settlingChild, err := runtime.Handle(childID).Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if settlingChild.State != RuntimeTerminal || settlingChild.Accounting.Tree.Unsettled == 0 {
+		t.Fatalf("canceled child = %s accounting %#v, want terminal with unsettled descendant", settlingChild.State, settlingChild.Accounting)
 	}
 
 	grandchildProvider.unblock()
@@ -1159,8 +1177,8 @@ func TestRuntimeDurableCanceledChildWakesParentAfterDescendantSettles(t *testing
 	if !projection.IsError || !strings.Contains(projection.Text(), "did not complete") {
 		t.Fatalf("canceled child projection = %#v", projection)
 	}
-	if final.Accounting.Tree.Unsettled != 0 {
-		t.Fatalf("unsettled descendants = %d", final.Accounting.Tree.Unsettled)
+	if final.Accounting.Tree.Unsettled != 0 || final.Attention != nil {
+		t.Fatalf("parent after settlement: attention %#v, unsettled descendants %d", final.Attention, final.Accounting.Tree.Unsettled)
 	}
 }
 
@@ -2427,12 +2445,12 @@ func TestRuntimeDurableFinalizingChildWithoutHookDeliveryCompletesParent(t *test
 	}
 }
 
-// Child attention clears once no pending child still blocks: after the
-// attention child is canceled and consumed, the parent returns to waiting on
-// its remaining sibling and later completes.
+// Child attention follows the blocking sibling. Once both attention children
+// are canceled and consumed, the parent waits for its remaining sibling and
+// later completes without stale attention.
 func TestRuntimeDurableChildAttentionClearsWhenSiblingsRemainPending(t *testing.T) {
 	parent := testAgent(&scriptedProvider{turns: []Message{
-		AssistantMessage(toolUse("c1", "delegate", `{"topic":"a"}`), toolUse("c2", "delegate", `{"topic":"b"}`)),
+		AssistantMessage(toolUse("c1", "delegate", `{"topic":"a"}`), toolUse("c2", "delegate", `{"topic":"b"}`), toolUse("c3", "delegate", `{"topic":"c"}`)),
 		asstText("parent done"),
 	}})
 	newSharedChildDefinition(parent)
@@ -2456,9 +2474,11 @@ func TestRuntimeDurableChildAttentionClearsWhenSiblingsRemainPending(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	first, second := snapshot.ToolBatches[0].Invocations[0].ChildRunID, snapshot.ToolBatches[0].Invocations[1].ChildRunID
+	first, second, third := snapshot.ToolBatches[0].Invocations[0].ChildRunID,
+		snapshot.ToolBatches[0].Invocations[1].ChildRunID, snapshot.ToolBatches[0].Invocations[2].ChildRunID
 	waitForRunState(t, runtime, first, RuntimeWaiting)
-	secondSnapshot := waitForRunState(t, runtime, second, RuntimeWaiting)
+	waitForRunState(t, runtime, second, RuntimeWaiting)
+	thirdSnapshot := waitForRunState(t, runtime, third, RuntimeWaiting)
 	firstRecord, err := runtimeRecord(runtime, first)
 	if err != nil {
 		t.Fatal(err)
@@ -2466,19 +2486,41 @@ func TestRuntimeDurableChildAttentionClearsWhenSiblingsRemainPending(t *testing.
 	if err := runtime.markAttention(context.Background(), first, firstRecord.Generation, "stuck"); err != nil {
 		t.Fatal(err)
 	}
-	if blocked := waitForRunState(t, runtime, handle.ID(), RuntimeNeedsAttention); blocked.Attention == nil || blocked.Attention.Kind != AttentionChild {
-		t.Fatalf("parent attention = %#v", blocked.Attention)
+	blocked := waitForRunState(t, runtime, handle.ID(), RuntimeNeedsAttention)
+	if blocked.Attention == nil || blocked.Attention.Kind != AttentionChild || blocked.Attention.BlockingRunID != first {
+		t.Fatalf("parent attention = %#v, want first child %s", blocked.Attention, first)
+	}
+	secondRecord, err := runtimeRecord(runtime, second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.markAttention(context.Background(), second, secondRecord.Generation, "also stuck"); err != nil {
+		t.Fatal(err)
 	}
 	if err := runtime.Handle(first).Cancel(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	waitForRunState(t, runtime, handle.ID(), RuntimeWaiting)
-	if err := runtime.Handle(second).ResolveWait(context.Background(), secondSnapshot.Waits[0].ID, WaitResolution{Answer: json.RawMessage(`"yes"`), Decision: Allow}); err != nil {
+	blocked = waitForRunState(t, runtime, handle.ID(), RuntimeNeedsAttention)
+	if blocked.Attention == nil || blocked.Attention.Kind != AttentionChild || blocked.Attention.BlockingRunID != second {
+		t.Fatalf("parent attention after first child settled = %#v, want second child %s", blocked.Attention, second)
+	}
+	if err := runtime.Handle(second).Cancel(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	waiting := waitForRunState(t, runtime, handle.ID(), RuntimeWaiting)
+	if waiting.Attention != nil {
+		t.Fatalf("parent waiting on third child retains attention %#v", waiting.Attention)
+	}
+	if err := runtime.Handle(third).ResolveWait(context.Background(), thirdSnapshot.Waits[0].ID, WaitResolution{Answer: json.RawMessage(`"yes"`), Decision: Allow}); err != nil {
 		t.Fatal(err)
 	}
 	result, err := awaitRun(t, runtime, handle.ID())
 	if err != nil || result.Output != "parent done" {
 		t.Fatalf("parent = %q, %v", result.Output, err)
+	}
+	final, err := handle.Snapshot(context.Background())
+	if err != nil || final.State != RuntimeTerminal || final.Attention != nil {
+		t.Fatalf("terminal parent = %#v, %v", final, err)
 	}
 }
 

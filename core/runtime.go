@@ -142,8 +142,10 @@ const (
 	AttentionChild     AttentionKind = "child"
 )
 
-// RunAttention describes a run needing host intervention. BlockingRunID names
-// the pending child whose state blocks a parent in child attention.
+// RunAttention describes why a run cannot continue normally. Child attention
+// may be advisory while a canceled subtree settles without host action.
+// BlockingRunID names the immediate pending child blocking a parent, not
+// necessarily the descendant that needs action; inspect that child's snapshot.
 type RunAttention struct {
 	Kind          AttentionKind
 	Reason        string
