@@ -38,6 +38,12 @@ func TestMain(m *testing.M) {
 	case "structured-correction-owner":
 		runStructuredCorrectionOwnerChild()
 		os.Exit(0)
+	case "child-wait-owner":
+		runChildWaitOwner()
+	case "child-lost-wake-owner":
+		runChildLostWakeOwner()
+	case "child-cancel-owner":
+		runChildCancelOwner()
 	}
 	os.Exit(m.Run())
 }
