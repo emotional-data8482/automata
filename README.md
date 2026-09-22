@@ -190,10 +190,13 @@ conversation API while runtime-backed continuation is integrated.
 ## Typed results
 
 `core.RunTyped[T]` returns the agent's final answer decoded into a Go struct.
-It injects a hidden tool whose JSON schema is derived from `T` and ends the run
-when the model calls it; if the model answers in prose instead, it first tries
-to parse an embedded payload, and only forces the tool on one more turn as a
-last resort. The agent's regular tools still work alongside it.
+The typed helpers use the same structured-output engine as
+`AgentConfig.StructuredOutput`: the accepted payload is validated, stored on
+`RunResult.StructuredOutput`, and then decoded into `T`. For an agent without a
+declared output contract, the helper derives a JSON schema from `T` and uses the
+hidden `automata_structured_output` tool; if the model answers in prose, core
+first tries to parse an embedded payload and only forces the tool on one more
+turn as a last resort. The agent's regular tools still work alongside it.
 
 ```go
 type Person struct {
@@ -205,8 +208,10 @@ p, res, err := core.RunTyped[Person](ctx, agent, "Who is Ada Lovelace?")
 // p.Name == "Ada Lovelace"; res carries usage/steps/transcript.
 ```
 
-Use `RunSessionTyped` to keep a process-local conversation across typed
-decisions:
+If the agent already declares `AgentConfig.StructuredOutput`, typed helpers
+reuse that pinned schema instead of injecting another terminal tool; choose a Go
+result type compatible with the declaration. Use `RunSessionTyped` to keep a
+process-local conversation across typed decisions:
 
 ```go
 sess := agent.NewSession()
@@ -241,23 +246,34 @@ still produces an invalid payload — the run returns an error matching
 violations available via `errors.As(*core.InvalidStructuredOutputError)`. The
 `RunResult` is still populated as far as the run got.
 
+Raw declared schemas, typed helper schemas, tool input schemas, and native
+output schemas share one supported contract. Core enforces object properties,
+required fields, arrays, enum, nullable single-type unions, and selected string
+and numeric bounds; unsupported assertion keywords such as `$ref`, `oneOf`, and
+`const` are rejected instead of ignored. Provider-facing annotations and native
+metadata such as `title`, `description`, `format`, and OpenAI `strict` are
+preserved for adapters while core enforces its documented subset.
+
 The full sequence per typed call is bounded: 1 (initial) + correction budget +
 1 (forced fallback) provider turns at worst. Prose answers that already
 contain valid JSON (a fenced ```json block or a bare object) are parsed and
 validated with no extra provider turn. Each phase commits its canonical
-transcript to the owning process-local Session.
+transcript to the owning process-local Session. For durable correction and
+effect preservation, declare the output contract on the Agent and run it through
+`Runtime`; direct typed helpers remain process-local transitional APIs.
 
 ### Provider-native structured output
 
 By default the hidden tool is the provider-neutral mechanism. Pass
-`core.WithNativeStructuredOutput()` to opt into provider-native schema
-enforcement when the provider supports it — the OpenAI Chat Completions
-extension maps the schema onto `response_format: json_schema` (strict variant
-when the schema has no free-form objects), and the Claude extension maps it
-onto `output_config.format`. Providers without native support silently use the
-hidden-tool path, so the option is safe to set unconditionally. Native
-responses are parsed from the reply text and validated by the same validator;
-an unusable native payload falls back to the hidden-tool path once.
+`core.WithNativeStructuredOutput()` or set `StructuredOutput.Native` to opt into
+provider-native schema enforcement when the provider supports it — the OpenAI
+Chat Completions extension maps the schema onto `response_format: json_schema`
+(strict variant when the schema has no free-form objects), and the Claude
+extension maps it onto `output_config.format`. Providers without native support
+silently use the hidden-tool path, so the option is safe to set
+unconditionally. Native responses are parsed from the reply text and validated
+by the same validator; an unusable native payload corrects within the run's
+bounded correction budget.
 
 ### Tool name
 
@@ -374,6 +390,14 @@ researcher.RegisterTool(tools.WebSearch(tavily.New(os.Getenv("TAVILY_API_KEY")))
 ## Examples
 
 - `examples/claude` — minimal tool-using agent.
+- `examples/durable_typed` — credential-free fake-provider Runtime demo showing
+  a mutating tool, an invalid structured payload, correction to a typed domain
+  value, and one external write:
+
+  ```sh
+  go run ./examples/durable_typed
+  ```
+
 - `examples/typed_agents` — sub-agents registered as typed tools (`AsToolFunc`,
   and `RunTyped` wrapped in a `Func` for a typed-in/typed-out child) driving a
   `RunSessionTyped` triage session that checkpoints to JSON and resumes between

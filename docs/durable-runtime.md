@@ -213,6 +213,77 @@ approval returns `ErrWaitConflict`; stale action digests, expired waits, revoked
 authority, and cancellation never dispatch the mutation. `RunSnapshot.Waits`
 keeps those races inspectable.
 
+## Declared structured output
+
+A definition can require its final answer as validated structured data:
+
+```go
+agent, err := core.New(provider, core.AgentConfig{
+    Tools: []core.Tool{write},
+    StructuredOutput: &core.StructuredOutputConfig{
+        Schema: json.RawMessage(`{
+            "type":"object",
+            "properties":{"summary":{"type":"string"}},
+            "required":["summary"]}`),
+        Native: true,        // request provider-native enforcement when supported
+        MaxCorrections: 1,   // bounded in-run correction turns
+    },
+})
+```
+
+The declaration is frozen with the agent, so a Runtime definition revision pins
+both the executable binding and its output contract. `New` validates `Schema`
+against the one supported schema contract shared by tool inputs,
+`CallOptions.OutputSchema`, typed helper values, and declared final outputs.
+Core enforces the documented subset (`type`, `enum`, object properties,
+required fields, arrays, selected string and numeric bounds) and rejects
+unsupported assertion keywords (`oneOf`, `$ref`, `const`, `uniqueItems`, and
+similar) explicitly instead of silently weakening validation. Annotation and
+provider-native metadata (for example `title`, `description`, `format`,
+OpenAI's `strict`, and `$defs`) pass through unchanged for providers that use
+them, while core still enforces only the subset documented in
+`core/schemacontract.go`.
+
+At run time the hidden `automata_structured_output` tool collects the payload
+(or, with `Native` and a provider that supports native structured output, the
+schema travels via `CallOptions.OutputSchema` and the final response text is
+validated). Runtime can also recover a committed provider-accepted native/prose
+assistant turn by reclassifying its already accepted text; it does not replay a
+provider turn or dispatch tools merely to reinterpret that structured payload.
+Every payload is checked before it becomes the run's accepted output; the
+validated value is reported as `RunResult.StructuredOutput` (and in
+`RunSnapshot.Result.StructuredOutput`), deliberately separate from the
+model-facing `Output` text, `FinalMessage` blocks, provider-native `RawBlock`
+history, and durable effect receipts exposed in `ToolBatchSnapshot`.
+
+An invalid payload does not fail the run while correction budget remains:
+Runtime commits the violations as model-visible evidence, increments a
+persisted correction-turn count, and asks the model again inside the same run
+and the same budgets. Tool turns the model already completed are never replayed
+to fix formatting, and a newly proposed duplicate mutation is rejected by the
+configured semantic guard. The correction count persists with the transition
+that re-dispatches the correction, so a restarted run continues with its
+original correction, turn, tool, and provider budgets; with the budget
+exhausted the run fails with `ErrInvalidStructuredOutput` (error kind
+`invalid_structured_output`) while retaining accepted receipts and partial
+evidence. When the run's turn limit ends correction with an invalid payload
+still pending, the error kind is `max_steps_invalid_structured_output` and
+`errors.Is` matches both `ErrMaxStepsExceeded` and `ErrInvalidStructuredOutput`.
+A known recovery limitation is that restarting after the correction transition
+but before turn-limit classification can report plain `max_steps`: the in-memory
+invalid-cause marker is not restored, although correction counts, violation
+history, budgets, and effect receipts remain persisted.
+
+The direct typed facade shares this engine: [RunTyped]/[RunSessionTyped]
+decode the accepted `RunResult.StructuredOutput` payload after the loop
+finishes. If an Agent already declares [AgentConfig.StructuredOutput], typed
+helpers reuse that pinned declaration instead of installing a second hidden
+tool; choose a Go result type compatible with the declared schema or decoding
+will fail after the run. Direct `Agent.Run` runs of a declared definition also
+enforce the same contract through the same loop, but direct Agent, Session, and
+typed helper entry points remain process-local. Only Runtime promises durable
+admission, persisted correction counts, recovery, and effect preservation.
+
 ## Transformation, observation, and history
 
 - `PreSendHook` remains an immutable request transformation supplied by the
@@ -237,5 +308,5 @@ mutex is not a durable concurrency primitive.
 `Agent.Run`, `Agent.RunStream`, `Session`, `RunTyped`, and `RunSessionTyped` are
 currently direct, process-local entry points. `Session` is still the useful
 conversation concept; T07 moves that concept onto committed Runtime history
-rather than discarding it. T06 moves typed correction into the same lifecycle.
-New durable code should start with `Runtime`.
+rather than discarding it. T06 moves typed correction into the same lifecycle
+for declared output contracts. New durable code should start with `Runtime`.
