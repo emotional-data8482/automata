@@ -3,6 +3,7 @@ package sqlite
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -33,6 +34,9 @@ func TestMain(m *testing.M) {
 		os.Exit(0)
 	case "effect-dispatch-owner":
 		runEffectDispatchOwnerChild()
+		os.Exit(0)
+	case "structured-correction-owner":
+		runStructuredCorrectionOwnerChild()
 		os.Exit(0)
 	}
 	os.Exit(m.Run())
@@ -110,6 +114,108 @@ func runEffectDispatchOwnerChild() {
 		os.Exit(3)
 	}
 	select {}
+}
+
+func runStructuredCorrectionOwnerChild() {
+	ctx := context.Background()
+	store, err := Open(ctx, os.Getenv("AUTOMATA_SQLITE_TEST_PATH"))
+	if err != nil {
+		fmt.Println("open-error: " + err.Error())
+		os.Exit(3)
+	}
+	runtime, err := core.NewRuntime(ctx, core.RuntimeConfig{Store: store})
+	if err != nil {
+		fmt.Println("runtime-error: " + err.Error())
+		os.Exit(3)
+	}
+	agent, err := structuredCorrectionAgent(os.Getenv("AUTOMATA_SQLITE_TEST_ORACLE"), &structuredCorrectionProvider{})
+	if err != nil {
+		fmt.Println("agent-error: " + err.Error())
+		os.Exit(3)
+	}
+	if err := runtime.Register("agent", "v1", agent); err != nil {
+		fmt.Println("register-error: " + err.Error())
+		os.Exit(3)
+	}
+	if _, err := runtime.Submit(ctx, "agent", "v1", "produce summary", core.SubmitOptions{Scope: "subprocess", Key: "structured"}); err != nil {
+		fmt.Println("submit-error: " + err.Error())
+		os.Exit(3)
+	}
+	select {} // Killed by the parent test process after the correction commits.
+}
+
+// structuredCorrectionAgent builds the declared structured-output definition
+// shared by the killed owner and the reopening parent; only the provider
+// script differs (the provider is not part of the binding identity).
+func structuredCorrectionAgent(oracle string, p core.Provider) (*core.Agent, error) {
+	write := core.FuncResult("write", "write a report", func(_ context.Context, input struct {
+		Path string `json:"path"`
+	}) (core.ToolResult, error) {
+		file, err := os.OpenFile(oracle, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+		if err != nil {
+			return core.ToolResult{}, err
+		}
+		if _, err := file.WriteString("write\n"); err != nil {
+			_ = file.Close()
+			return core.ToolResult{}, err
+		}
+		if err := file.Sync(); err != nil {
+			_ = file.Close()
+			return core.ToolResult{}, err
+		}
+		_ = file.Close()
+		result := core.TextResult("written")
+		result.Effect = core.EffectReport{Status: core.EffectApplied, Receipt: "write-1"}
+		return result, nil
+	})
+	write = core.WithToolEffectPolicy(write, core.ToolEffectPolicy{
+		Kind: core.ToolEffectMutating, Scope: "docs",
+		SemanticKey: func(raw json.RawMessage) (string, error) {
+			var in struct {
+				Path string `json:"path"`
+			}
+			if err := json.Unmarshal(raw, &in); err != nil {
+				return "", err
+			}
+			return in.Path, nil
+		},
+	})
+	return core.New(p, core.AgentConfig{
+		Tools: []core.Tool{write},
+		StructuredOutput: &core.StructuredOutputConfig{
+			Schema:         json.RawMessage(`{"type":"object","properties":{"summary":{"type":"string"}},"required":["summary"]}`),
+			MaxCorrections: 2,
+		},
+	})
+}
+
+// structuredCorrectionProvider scripts the killed owner: one accepted write,
+// one invalid structured payload whose correction commits, then block so the
+// parent kills the process before the corrected turn.
+type structuredCorrectionProvider struct{ calls int }
+
+func (p *structuredCorrectionProvider) Invoke(_ context.Context, _ core.Request) (core.Response, error) {
+	switch p.calls {
+	case 0:
+		p.calls++
+		return core.Response{
+			Message:    core.AssistantMessage(core.ToolUseBlock{ID: "write-1", Name: "write", Input: json.RawMessage(`{"path":"report.txt"}`)}),
+			StopReason: core.StopToolUse,
+		}, nil
+	case 1:
+		p.calls++
+		return core.Response{
+			Message: core.AssistantMessage(core.ToolUseBlock{
+				ID: "call-1", Name: "automata_structured_output", Input: json.RawMessage(`{"summary":5}`),
+			}),
+			StopReason: core.StopToolUse,
+		}, nil
+	default:
+		// The correction evidence committed atomically with the transcript;
+		// report that and wait to be killed.
+		fmt.Println("correction-committed")
+		select {}
+	}
 }
 
 func effectOracleTool(path string, block bool) core.Tool {
@@ -360,5 +466,114 @@ func TestInterruptedOwnerRunBecomesAttention(t *testing.T) {
 	}
 	if _, err := handle.Await(ctx); !errors.Is(err, core.ErrRunNeedsAttention) {
 		t.Fatalf("await = %v", err)
+	}
+}
+
+// structuredReopenProvider drives the reopened run: it proposes the duplicate
+// write alone (rejected by the semantic guard without dispatch) and then the
+// valid structured payload.
+type structuredReopenProvider struct{ calls int }
+
+func (p *structuredReopenProvider) Invoke(_ context.Context, _ core.Request) (core.Response, error) {
+	switch p.calls {
+	case 0:
+		p.calls++
+		return core.Response{
+			Message:    core.AssistantMessage(core.ToolUseBlock{ID: "write-2", Name: "write", Input: json.RawMessage(`{"path":"report.txt"}`)}),
+			StopReason: core.StopToolUse,
+		}, nil
+	case 1:
+		p.calls++
+		return core.Response{
+			Message: core.AssistantMessage(core.ToolUseBlock{
+				ID: "call-2", Name: "automata_structured_output", Input: json.RawMessage(`{"summary":"done"}`),
+			}),
+			StopReason: core.StopToolUse,
+		}, nil
+	default:
+		return core.Response{}, errors.New("no script for turn")
+	}
+}
+
+// TestStructuredCorrectionSurvivesProcessKill kills the owner after the
+// invalid structured payload's correction evidence committed, reopens the
+// store, and proves the same run continues inside the original budgets: the
+// duplicate write is rejected by the configured guard, the accepted receipt is
+// retained, and the valid payload becomes the run's structured output.
+func TestStructuredCorrectionSurvivesProcessKill(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("flock-based ownership is unsupported on windows")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "runtime.sqlite")
+	oracle := filepath.Join(dir, "effects.log")
+	t.Setenv("AUTOMATA_SQLITE_TEST_ORACLE", oracle)
+
+	cmd, scanner := startSubprocess(t, "structured-correction-owner", path)
+	waitSubprocessLine(t, scanner, "correction-committed")
+	if err := cmd.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	_ = cmd.Wait()
+
+	ctx := context.Background()
+	store, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := core.NewRuntime(ctx, core.RuntimeConfig{Store: store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	agent, err := structuredCorrectionAgent(oracle, &structuredReopenProvider{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.Register("agent", "v1", agent); err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	handle, err := reopened.Submit(ctx, "agent", "v1", "produce summary", core.SubmitOptions{Scope: "subprocess", Key: "structured"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := handle.Await(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(result.StructuredOutput) != `{"summary":"done"}` || result.Status != core.RunCompleted {
+		t.Fatalf("reopened result = %#v", result)
+	}
+	if result.Turns != 4 {
+		t.Fatalf("turns = %d, want 4 cumulative provider turns across restart", result.Turns)
+	}
+	data, err := os.ReadFile(oracle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(string(data), "write\n"); got != 1 {
+		t.Fatalf("external effect count = %d, want 1 (guard rejected the duplicate)", got)
+	}
+	snapshot, err := handle.Snapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt := ""
+	denied := false
+	for _, batch := range snapshot.ToolBatches {
+		for _, invocation := range batch.Invocations {
+			if invocation.Effect.Status == core.EffectApplied {
+				receipt = invocation.Effect.Receipt
+			}
+			if strings.Contains(invocation.Result.Text(), "denied: semantic mutation already applied or unresolved") {
+				denied = true
+			}
+		}
+	}
+	if receipt != "write-1" || !denied {
+		t.Fatalf("receipt = %q, duplicate denied = %v; batches = %#v", receipt, denied, snapshot.ToolBatches)
 	}
 }
