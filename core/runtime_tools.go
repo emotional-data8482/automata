@@ -740,6 +740,19 @@ func (r *Runtime) recoverToolBatch(ctx context.Context, record storedRuntimeRun)
 			}
 			return false, r.completeExecution(record.RunID, full.Result, context.Canceled, nil)
 		}
+		if record.LastTransition == "provider_accepted" {
+			full, err := r.load(ctx, record.RunID)
+			if err != nil {
+				return false, err
+			}
+			messages := full.Result.Messages
+			if len(messages) > 0 {
+				last := messages[len(messages)-1]
+				if last.Role == "assistant" && len(last.ToolUses()) == 0 {
+					return true, r.makeRunReady(ctx, record.RunID, record.Generation)
+				}
+			}
+		}
 		if record.LastTransition == "batch_ready" || record.LastTransition == "response_classified" || record.LastTransition == "batch_committed" {
 			return true, r.makeRunReady(ctx, record.RunID, record.Generation)
 		}

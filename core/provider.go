@@ -119,11 +119,12 @@ type StreamProvider interface {
 // StructuredOutputProvider is an optional interface a Provider implements to
 // advertise native, schema-enforced structured output. When a typed run opts
 // in with [WithNativeStructuredOutput] and the run's provider implements this
-// interface, [RunTyped]/[RunSessionTyped] send the schema derived from T via
-// [CallOptions.OutputSchema] instead of injecting the hidden structured-output
-// tool, and the provider's response text is parsed and validated like any
-// other structured payload. The hidden-tool path remains the default and the
-// fallback; providers only implementing [Provider] are unaffected.
+// interface and reports support, [RunTyped]/[RunSessionTyped] send the schema
+// derived from T via [CallOptions.OutputSchema] instead of injecting the
+// hidden structured-output tool, and the provider's response text is parsed
+// and validated like any other structured payload. Supported native invalid
+// payloads correct within the run's structured-output budget. Providers only
+// implementing [Provider], or reporting no support, use the hidden-tool path.
 //
 // Support is advertised per provider, not per model: if a specific model
 // rejects schema enforcement, the provider surfaces that as an invocation

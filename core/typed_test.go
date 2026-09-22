@@ -108,8 +108,8 @@ func TestRunTypedDecodeErrorCorrects(t *testing.T) {
 	}
 }
 
-// TestRunTypedDecodeErrorBudgetExhausted pins that malformed JSON keeps its
-// syntax-error cause on the typed error once corrections run out.
+// TestRunTypedDecodeErrorBudgetExhausted pins that wrong-shaped payloads keep
+// shared schema violation detail on the typed error once corrections run out.
 func TestRunTypedDecodeErrorBudgetExhausted(t *testing.T) {
 	provider := &scriptedProvider{turns: []Message{
 		asstTool("s1", structuredOutputToolName, `{"name":"x","age":"not-a-number"}`),
@@ -122,11 +122,11 @@ func TestRunTypedDecodeErrorBudgetExhausted(t *testing.T) {
 		t.Fatalf("err = %v, want ErrInvalidStructuredOutput", err)
 	}
 	var typed *InvalidStructuredOutputError
-	if !errors.As(err, &typed) || typed.Cause == nil {
-		t.Fatalf("errors.As = %v, want InvalidStructuredOutputError with decode cause", err)
+	if !errors.As(err, &typed) || len(typed.Violations) == 0 {
+		t.Fatalf("errors.As = %v, want InvalidStructuredOutputError with violations", err)
 	}
-	if !strings.Contains(typed.Cause.Error(), "decode structured output") {
-		t.Errorf("cause = %v, want decode error", typed.Cause)
+	if !strings.Contains(typed.Violations[0], "age") || !strings.Contains(typed.Violations[0], "expected integer") {
+		t.Errorf("violations = %v, want age integer violation", typed.Violations)
 	}
 	if len(res.Messages) == 0 || res.Steps == 0 {
 		t.Errorf("RunResult not populated alongside the error: %+v", res)
@@ -185,8 +185,8 @@ func TestRunTypedWrongTypeRejected(t *testing.T) {
 	}
 }
 
-// TestRunTypedCorrectionPromptListsViolations pins the correction turn's user
-// message: the violation list plus the instruction to call the tool again.
+// TestRunTypedCorrectionPromptListsViolations pins the correction evidence fed
+// back to the model: the violation list plus the instruction to call the tool again.
 func TestRunTypedCorrectionPromptListsViolations(t *testing.T) {
 	provider := &capturingProvider{turns: []Message{
 		asstTool("s1", structuredOutputToolName, `{"name":"Ada"}`),
@@ -201,11 +201,15 @@ func TestRunTypedCorrectionPromptListsViolations(t *testing.T) {
 		t.Fatalf("provider saw %d requests, want 2", len(provider.received))
 	}
 	second := provider.received[1]
-	lastUser := second[len(second)-1]
-	if lastUser.Role != "user" {
-		t.Fatalf("last message of correction turn = %q, want user", lastUser.Role)
+	last := second[len(second)-1]
+	if last.Role != "tool" {
+		t.Fatalf("last message of correction turn = %q, want tool result evidence", last.Role)
 	}
-	text := lastUser.Text()
+	resultBlock, ok := last.Blocks[0].(ToolResultBlock)
+	if !ok {
+		t.Fatalf("last correction evidence block = %T, want ToolResultBlock", last.Blocks[0])
+	}
+	text := Message{Blocks: resultBlock.Content}.Text()
 	if !strings.Contains(text, "age") || !strings.Contains(text, "missing required field") {
 		t.Errorf("correction prompt does not name the violation: %q", text)
 	}
@@ -522,12 +526,12 @@ func TestRunTypedNativeModeSupportedProvider(t *testing.T) {
 	}
 }
 
-// TestRunTypedNativeModeInvalidPayloadFallsBack pins the one-retry rule: an
-// unusable native payload falls back to the hidden-tool path exactly once.
+// TestRunTypedNativeModeInvalidPayloadFallsBack pins the shared native correction
+// path: an unusable native payload is corrected in prose inside the same run.
 func TestRunTypedNativeModeInvalidPayloadFallsBack(t *testing.T) {
 	provider := &nativeCapturingProvider{turns: []Message{
 		asstText("I cannot produce that."), // no JSON
-		asstTool("s2", structuredOutputToolName, `{"name":"Ada","age":36}`),
+		asstText(`{"name":"Ada","age":36}`),
 	}}
 	agent := testAgent(provider)
 
@@ -539,7 +543,7 @@ func TestRunTypedNativeModeInvalidPayloadFallsBack(t *testing.T) {
 		t.Errorf("decoded = %+v", got)
 	}
 	if provider.calls != 2 {
-		t.Errorf("provider calls = %d, want 2 (native + fallback)", provider.calls)
+		t.Errorf("provider calls = %d, want 2 (native + correction)", provider.calls)
 	}
 }
 

@@ -63,7 +63,7 @@ func validateCallOptions(o CallOptions) error {
 	}
 	if o.OutputSchema != nil {
 		var schema map[string]any
-		if err := json.Unmarshal(o.OutputSchema, &schema); err != nil {
+		if err := decodeSchemaRaw(o.OutputSchema, &schema); err != nil {
 			return fmt.Errorf("output schema: %w", err)
 		}
 		if schema == nil {

@@ -3,7 +3,9 @@ package core
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"reflect"
 )
 
@@ -51,7 +53,7 @@ func registerTools(tools []Tool, terminal string) (map[string]registeredTool, []
 			return nil, nil, fmt.Errorf("duplicate tool %q", d.Name)
 		}
 		var schema map[string]any
-		if err := json.Unmarshal(d.InputSchema, &schema); err != nil {
+		if err := decodeSchemaRaw(d.InputSchema, &schema); err != nil {
 			return nil, nil, fmt.Errorf("tool %q schema: %w", d.Name, err)
 		}
 		if schema == nil || schema["type"] != "object" {
@@ -132,12 +134,29 @@ func cloneRequest(req Request) Request {
 	return req
 }
 
+// decodeSchemaRaw decodes a raw schema with json.Number preservation so
+// numeric assertions keep their exact literals through contract compilation.
+// Exactly one top-level JSON value is accepted: a second Decode must reach
+// io.EOF, so trailing garbage and concatenated values are rejected.
+func decodeSchemaRaw(raw json.RawMessage, out *map[string]any) error {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	if err := dec.Decode(out); err != nil {
+		return err
+	}
+	var extra any
+	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+		return errors.New("schema must contain exactly one JSON value")
+	}
+	return nil
+}
+
 func validateToolArguments(schema, input json.RawMessage) error {
 	if !json.Valid(input) {
 		return fmt.Errorf("arguments must be valid JSON")
 	}
 	var s map[string]any
-	if err := json.Unmarshal(schema, &s); err != nil {
+	if err := decodeSchemaRaw(schema, &s); err != nil {
 		return err
 	}
 	var value any
@@ -145,6 +164,12 @@ func validateToolArguments(schema, input json.RawMessage) error {
 	decoder.UseNumber()
 	if err := decoder.Decode(&value); err != nil {
 		return err
+	}
+	// Exactly one top-level JSON value: a second Decode must reach io.EOF,
+	// rejecting trailing garbage and concatenated values.
+	var extra any
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		return fmt.Errorf("arguments must contain exactly one JSON value")
 	}
 	return validateSchemaValue(s, value, "arguments")
 }

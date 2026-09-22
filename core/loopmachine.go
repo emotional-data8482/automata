@@ -37,7 +37,10 @@ func validLoopTransition(from, to loopState) bool {
 	case loopStateInvokeProvider:
 		return to == loopStateClassifyResponse || to == loopStateFinish
 	case loopStateClassifyResponse:
-		return to == loopStateExecuteTools || to == loopStateFinish
+		// Structured-output correction turns re-enter the turn cycle directly
+		// after classification: the violations result or correction prompt is
+		// committed, then the run asks the model again within its budgets.
+		return to == loopStateExecuteTools || to == loopStatePrepareTurn || to == loopStateFinish
 	case loopStateExecuteTools:
 		return to == loopStatePrepareTurn || to == loopStateFinish
 	case loopStateFinish:
@@ -143,6 +146,7 @@ func (m *loopMachine) persistTransition(kind string) error {
 	result.ProviderAttempts = m.cfg.scope.providerAttempts
 	result.Usage = m.cfg.scope.usage
 	transition := durableLoopTransition{Kind: kind, Result: result}
+	transition.StructuredCorrections = m.structuredCorrections()
 	if kind == "provider_accepted" {
 		transition.EffectiveTools = make([]string, 0, len(m.loop.toolsByName))
 		for _, definition := range m.request.Tools {
@@ -154,6 +158,21 @@ func (m *loopMachine) persistTransition(kind string) error {
 	return m.cfg.durableTransition(context.WithoutCancel(m.ctx), transition)
 }
 func (m *loopMachine) fail(err error) loopState { m.err = err; return loopStateFinish }
+
+// structuredFinalReady reports that a validated structured payload already
+// committed for this run and only finalization remains.
+func (m *loopMachine) structuredFinalReady() bool {
+	return m.cfg.structuredOutput != nil && len(m.result.StructuredOutput) > 0
+}
+
+// structuredCorrections returns the run's cumulative correction-turn count
+// for durable persistence.
+func (m *loopMachine) structuredCorrections() int {
+	if m.cfg.structuredOutput == nil {
+		return 0
+	}
+	return m.cfg.structuredOutput.correctionsUsed
+}
 func (m *loopMachine) start() loopState {
 	l, ctx, task, mode, cfg := m.loop, m.ctx, m.task, m.mode, m.cfg
 	a := l.agent
@@ -205,6 +224,12 @@ func (m *loopMachine) start() loopState {
 	if len(l.messages) == 0 {
 		return m.fail(errors.New("durable continuation has no transcript"))
 	}
+	if m.structuredFinalReady() {
+		// The validated structured output committed atomically with its
+		// transcript; only finalization remains.
+		m.result.StopReason = StopEndTurn
+		return loopStateFinish
+	}
 	last := l.messages[len(l.messages)-1]
 	if last.Role != "assistant" {
 		return loopStatePrepareTurn
@@ -214,6 +239,11 @@ func (m *loopMachine) start() loopState {
 	if len(m.calls) > 0 {
 		return loopStateExecuteTools
 	}
+	if m.cfg.structuredOutput != nil {
+		// Declared structured output: validate the final text (native
+		// enforcement or prose extraction) and correct within the same run.
+		return m.structuredProseOutcome(last.Text())
+	}
 	if last.Text() == "" {
 		return m.fail(ErrEmptyResponse)
 	}
@@ -222,6 +252,76 @@ func (m *loopMachine) start() loopState {
 	return loopStateFinish
 
 }
+
+// structuredProseOutcome validates a final assistant text (provider-native
+// enforcement or prose extraction) for a declared structured-output contract
+// and either finishes the run, schedules a bounded correction turn inside the
+// same run, or fails with [InvalidStructuredOutputError]. Incomplete provider
+// outcomes never reach here: classifyResponse rejects them first.
+func (m *loopMachine) structuredProseOutcome(text string) loopState {
+	l, ctx, log, span := m.loop, m.ctx, m.log, m.span
+	state := m.cfg.structuredOutput
+	toolName := ""
+	if !state.native {
+		toolName = structuredOutputToolName
+	}
+	var invalid *InvalidStructuredOutputError
+	for _, cand := range extractJSONCandidates(text) {
+		if !json.Valid(cand) {
+			continue
+		}
+		_, violations := state.validate(cand)
+		if len(violations) == 0 {
+			m.result.StructuredOutput = append(json.RawMessage(nil), cand...)
+			m.result.Output = text
+			m.result.StopReason = StopEndTurn
+			if err := m.persistTransition("response_classified"); err != nil {
+				return m.fail(&durableTransitionFailure{cause: err})
+			}
+			span.SetAttributes(tracing.Int("steps", m.result.Steps))
+			log.InfoContext(ctx, "run complete via structured output", "steps", m.result.Steps)
+			return loopStateFinish
+		}
+		invalid = &InvalidStructuredOutputError{Violations: violations}
+	}
+	if state.correctionsUsed < state.maxCorrections {
+		state.correctionsUsed++
+		state.lastInvalid = invalid
+		if state.lastInvalid == nil {
+			state.lastInvalid = &InvalidStructuredOutputError{Cause: errors.New("model did not produce structured output")}
+		}
+		if toolName != "" {
+			state.forceToolChoice = true
+		}
+		prompt := structuredMissingPrompt(toolName)
+		if invalid != nil {
+			prompt = correctionPrompt(invalid, toolName)
+		}
+		l.messages = append(l.messages, UserMessage(prompt))
+		// The correction state and its transcript evidence commit atomically
+		// before the correction turn is dispatched.
+		if err := m.persistTransition("response_classified"); err != nil {
+			return m.fail(&durableTransitionFailure{cause: err})
+		}
+		log.InfoContext(ctx, "structured output failed validation; requesting correction",
+			"correction", state.correctionsUsed, "budget", state.maxCorrections)
+		m.step++
+		return loopStatePrepareTurn
+	}
+	if invalid == nil {
+		invalid = &InvalidStructuredOutputError{Cause: errors.New("model did not produce structured output")}
+	}
+	m.result.Output = text
+	m.result.StopReason = StopEndTurn
+	if err := m.persistTransition("response_classified"); err != nil {
+		return m.fail(&durableTransitionFailure{cause: err})
+	}
+	span.RecordError(invalid)
+	span.SetStatus(invalid)
+	log.WarnContext(ctx, "structured output correction budget exhausted", "steps", m.result.Steps)
+	return m.fail(invalid)
+}
+
 func (m *loopMachine) prepareTurn() loopState {
 	l, ctx, a, result, step, log, span := m.loop, m.ctx, m.loop.agent, &m.result, m.step, m.log, m.span
 	_, _, _, _, _, _, _ = l, ctx, a, result, step, log, span
@@ -232,6 +332,9 @@ func (m *loopMachine) prepareTurn() loopState {
 	}
 	if m.cfg.scope.turns >= m.cfg.scope.config.maxTurns {
 		err := fmt.Errorf("%w (%d)", ErrMaxStepsExceeded, a.maxSteps)
+		if state := m.cfg.structuredOutput; state != nil && state.lastInvalid != nil {
+			err = errors.Join(err, state.lastInvalid)
+		}
 		span.SetStatus(err)
 		log.WarnContext(ctx, "exceeded max steps", "max_steps", a.maxSteps)
 		result.StopReason = StopMaxSteps
@@ -291,6 +394,10 @@ func (m *loopMachine) prepareTurn() loopState {
 		hookSpan.End()
 	}
 
+	if state := m.cfg.structuredOutput; state != nil && state.forceToolChoice && m.cfg.terminalTool != "" {
+		req.Options.ToolChoice = &ToolChoice{Mode: ToolChoiceTool, Name: m.cfg.terminalTool}
+		req.Options.ThinkingBudget = 0
+	}
 	if err := validateCallOptions(req.Options); err != nil {
 		return m.fail(err)
 	}
@@ -408,6 +515,12 @@ func (m *loopMachine) classifyResponse() loopState {
 		// neither text nor tool calls (e.g. thinking only) is an empty
 		// response — usually a provider bug or safety filter.
 		text := msg.Text()
+		if m.cfg.structuredOutput != nil {
+			// Declared structured output: validate the final text and correct
+			// within the same run. Incomplete provider outcomes never reach
+			// here; the switch above rejects them first.
+			return m.structuredProseOutcome(text)
+		}
 		if text == "" {
 			return m.fail(ErrEmptyResponse)
 		}
@@ -445,11 +558,12 @@ func (m *loopMachine) executeTools() loopState {
 	// still receives a synthetic result so the transcript stays well-formed.
 	if cfg.terminalTool != "" {
 		terminalFound := false
+		var input json.RawMessage
 		for _, call := range toolUses {
 			if call.Name != cfg.terminalTool || terminalFound {
 				continue
 			}
-			input := call.Input
+			input = call.Input
 			if len(input) == 0 {
 				input = json.RawMessage("{}")
 			}
@@ -457,12 +571,37 @@ func (m *loopMachine) executeTools() loopState {
 			terminalFound = true
 		}
 		if terminalFound {
+			state := m.cfg.structuredOutput
+			var violations []string
+			corrected := false
+			terminalContent := "ok"
+			if state != nil {
+				_, violations = state.validate(input)
+				switch {
+				case len(violations) == 0:
+					m.result.StructuredOutput = append(json.RawMessage(nil), input...)
+				case state.correctionsUsed < state.maxCorrections:
+					state.correctionsUsed++
+					corrected = true
+					state.lastInvalid = &InvalidStructuredOutputError{Violations: violations}
+					state.forceToolChoice = true
+					terminalContent = correctionPrompt(state.lastInvalid, structuredOutputToolName)
+				default:
+					terminalContent = (&InvalidStructuredOutputError{Violations: violations}).Error()
+				}
+			}
 			results := make([]Message, len(toolUses))
 			for i, call := range toolUses {
-				content := "ok"
+				content := terminalContent
 				isError := false
 				if call.Name != cfg.terminalTool {
-					content = fmt.Sprintf("not executed: run completed by terminal tool %q", cfg.terminalTool)
+					if corrected {
+						content = fmt.Sprintf("not executed: structured output from terminal tool %q failed validation; correction requested", cfg.terminalTool)
+					} else {
+						content = fmt.Sprintf("not executed: run completed by terminal tool %q", cfg.terminalTool)
+					}
+					isError = true
+				} else if len(violations) > 0 {
 					isError = true
 				}
 				blocks := Blocks{TextBlock{Text: content}}
@@ -476,9 +615,23 @@ func (m *loopMachine) executeTools() loopState {
 			if err := m.persistTransition("batch_committed"); err != nil {
 				return m.fail(&durableTransitionFailure{cause: err})
 			}
-			result.StopReason = StopEndTurn
-			log.InfoContext(ctx, "run complete via terminal tool", "tool", cfg.terminalTool, "steps", result.Steps)
-			return loopStateFinish
+			if len(violations) == 0 {
+				m.result.StopReason = StopEndTurn
+				log.InfoContext(ctx, "run complete via terminal tool", "tool", cfg.terminalTool, "steps", result.Steps)
+				return loopStateFinish
+			}
+			invalid := &InvalidStructuredOutputError{Violations: violations}
+			if corrected {
+				// Correction state and violation evidence committed atomically
+				// above; the next turn is bounded by the persisted budgets.
+				m.step++
+				return loopStatePrepareTurn
+			}
+			span.RecordError(invalid)
+			span.SetStatus(invalid)
+			log.WarnContext(ctx, "structured output correction budget exhausted", "steps", result.Steps)
+			m.result.StopReason = StopEndTurn
+			return m.fail(invalid)
 		}
 	}
 

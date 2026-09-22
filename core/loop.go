@@ -123,6 +123,14 @@ type RunResult struct {
 	// provider spellings such as OpenAI "length" and Anthropic "max_tokens".
 	RawStopReason string
 
+	// StructuredOutput is the validated final structured payload when the
+	// run's definition declares a required structured output (see
+	// [StructuredOutputConfig]). It stays separate from the model-facing
+	// Output text and FinalMessage blocks, and from durable effect receipts.
+	// It is empty for ordinary runs. omitempty keeps absent payloads out of
+	// persisted records so a decoded empty value stays truly absent.
+	StructuredOutput json.RawMessage `json:",omitempty"`
+
 	// terminalToolInput holds the raw JSON arguments of a terminal-tool call
 	// (see runConfig.terminalTool). Unexported: only [RunTyped] and
 	// [RunSessionTyped] read it.
@@ -165,12 +173,21 @@ type runConfig struct {
 	// enforcement when the provider supports it (see
 	// [WithNativeStructuredOutput]).
 	nativeStructuredOutput bool
+	// structuredOutput carries the declared final-output contract installed
+	// from AgentConfig.StructuredOutput (see installStructuredOutput). The
+	// validated payload lands in RunResult.StructuredOutput, and correction
+	// turns run inside the same run within the persisted budgets.
+	structuredOutput *structuredOutputState
 }
 
 type durableLoopTransition struct {
 	Kind           string
 	Result         RunResult
 	EffectiveTools []string
+	// StructuredCorrections is the run's cumulative correction-turn count for
+	// declared structured-output contracts. Runtime persists it atomically
+	// with the transition's transcript so correction state survives restart.
+	StructuredCorrections int
 }
 
 // RunOption customizes a single run. See [WithCallOptions] and [WithToolPolicy].

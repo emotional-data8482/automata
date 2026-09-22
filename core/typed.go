@@ -1,10 +1,12 @@
 package core
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"reflect"
 	"strings"
 )
@@ -80,11 +82,13 @@ func WithMaxCorrectionTurns(n int) RunOption {
 // [StructuredOutputProvider] and reports support, the schema derived from T is
 // sent via [CallOptions.OutputSchema] and the hidden structured-output tool is
 // not injected. The response text is parsed and validated with the same
-// validator as the tool path; if the provider returns an unusable payload, the
-// run falls back to the hidden-tool path once (no further retries).
+// validator as the tool path; if a supported native provider returns an
+// unusable payload, the run asks the provider to correct it within the same
+// structured-output correction budget.
 //
-// Providers that do not implement the capability interface silently use the
-// hidden-tool path, so the option is safe to set unconditionally.
+// Providers that do not implement the capability interface or report no
+// support use the hidden-tool path, so the option is safe to set
+// unconditionally.
 func WithNativeStructuredOutput() RunOption {
 	return func(c *runConfig) { c.nativeStructuredOutput = true }
 }
@@ -95,215 +99,209 @@ func RunTyped[T any](ctx context.Context, a *Agent, task string, opts ...RunOpti
 	return RunSessionTyped[T](ctx, a.NewSession(), task, opts...)
 }
 
-// RunSessionTyped continues session and decodes the agent's final answer into
-// T. It works by injecting a hidden "automata_structured_output" tool whose
-// JSON schema is derived from T (via the same reflection as [Func]); when the
-// model calls that tool, the run ends and its arguments are decoded into T.
-//
-// The returned value is guaranteed to satisfy the same schema that was
-// advertised to the model: every payload is validated against T before it is
-// returned, so a model that omits a required field or sends a wrong-typed value
-// can never surface as a silently zero-filled T. Instead:
-//
-//  1. The initial run ends with a structured tool call → the payload is
-//     validated and returned (one turn, no extra cost).
-//  2. Validation fails → the violations are fed back to the model as a new
-//     user turn on the same session and it is asked to call the tool correctly
-//     (bounded by [WithMaxCorrectionTurns], default 1).
-//  3. The model answers in prose → any JSON it embedded (a fenced ```json
-//     block or a bare object) is extracted and validated first; a valid
-//     payload is returned with no extra provider turn.
-//  4. Nothing usable so far → one forced structured-output turn
-//     (tool_choice, thinking disabled) runs as the final backstop. Its
-//     payload is validated too; a forced-turn failure is terminal.
-//
-// When correction attempts are exhausted without a valid payload, an
-// [InvalidStructuredOutputError] (matching [ErrInvalidStructuredOutput] via
-// errors.Is) is returned with the per-field violations; malformed JSON wraps
-// the syntax error as the error's Cause. The [RunResult] is returned alongside
-// T (populated as far as the run got, even on error) so callers still see
-// cumulative usage, turns, and the transcript.
+// RunSessionTyped continues session and decodes the agent's final structured
+// answer into T. It is a typed authoring adapter over the same structured-output
+// engine used by [AgentConfig.StructuredOutput]: the schema derived from T is
+// installed for this run, correction turns are handled by the loop, and the
+// accepted [RunResult.StructuredOutput] payload is decoded after the run
+// completes. If the agent definition already declares a structured-output
+// contract, that pinned declaration is used instead of injecting a second hidden
+// tool.
 func RunSessionTyped[T any](ctx context.Context, session *Session, task string, opts ...RunOption) (value T, result RunResult, runErr error) {
 	session.runMu.Lock()
 	defer session.runMu.Unlock()
 
-	cfg := session.agent.newRunConfig(opts)
-	scope, err := session.agent.beginRun(ctx, cfg, session.Messages(), session.commit, "typed")
-	defer func() { result, runErr = scope.finish(result, runErr) }()
-	if err != nil {
-		return value, scope.result, err
-	}
-	phase := func(task string, options ...RunOption) (RunResult, error) {
-		return session.runPhase(scope, task, session.agent.newRunConfig(options))
-	}
-
-	var zero T
-
-	// Read the typed-run knobs from the options. These have no agent-level
-	// defaults, so applying them to a zero runConfig is sufficient.
 	var knobs runConfig
 	for _, opt := range opts {
 		if opt != nil {
 			opt(&knobs)
 		}
 	}
-	correctionBudget := 1
+	maxCorrections := 1
 	if knobs.maxCorrectionTurns != nil {
-		correctionBudget = *knobs.maxCorrectionTurns
+		maxCorrections = *knobs.maxCorrectionTurns
 	}
 
-	tool := Func(structuredOutputToolName,
-		"Return the final answer as structured data. Call this exactly once, with the complete result.",
-		func(_ context.Context, v T) (string, error) { return "ok", nil })
-
-	// inject makes the tool visible to the model and marks it terminal.
-	inject := func(c *runConfig) {
-		c.extraTools = append(c.extraTools, tool)
-		c.terminalTool = structuredOutputToolName
-	}
-	force := func(c *runConfig) {
-		c.options.ToolChoice = &ToolChoice{Mode: ToolChoiceTool, Name: structuredOutputToolName}
-		c.options.ThinkingBudget = 0
-		c.options.OutputSchema = nil
-	}
-	base := append([]RunOption{inject}, opts...)
-	forced := append(append([]RunOption{inject}, opts...), force)
-	forcedPrompt := fmt.Sprintf("Now return the final answer by calling the %s tool.", structuredOutputToolName)
-
-	// Collision safety: the hidden tool is namespaced, but a user tool that
-	// deliberately occupies the same name would be silently shadowed (the loop
-	// indexes agent tools by name; the terminal tool is matched by name alone).
-	// Fail fast instead of guessing which registration wins.
-	for _, t := range session.agent.tools {
-		if t.Definition().Name == structuredOutputToolName {
-			return zero, RunResult{}, fmt.Errorf(
-				"typed run: registered tool %q collides with the hidden structured-output tool; rename it",
-				structuredOutputToolName)
-		}
-	}
-
-	// Native mode: when requested and supported, the provider enforces the
-	// schema and the hidden tool is skipped entirely.
-	if knobs.nativeStructuredOutput {
-		if p, ok := session.agent.provider.(StructuredOutputProvider); ok && p.SupportsNativeStructuredOutput() {
-			return runTypedNative[T](ctx, session, phase, task, opts, forced, forcedPrompt)
-		}
-		session.agent.log.DebugContext(ctx, "native structured output requested but provider does not support it; using hidden tool")
-	}
-
-	res, err := phase(task, base...)
-	if err != nil {
-		return zero, res, err
-	}
-
-	corrections := 0
-	var invalid *InvalidStructuredOutputError
-	for {
-		if len(res.terminalToolInput) > 0 {
-			val, derr := decodeAndValidate[T](res.terminalToolInput)
-			if derr == nil {
-				return val, res, nil
-			}
-			invalid = derr
-		} else {
-			// The model answered in prose. Try to extract a payload before
-			// paying for a forced turn; extraction failure degrades to the
-			// forced fallback exactly as before.
-			invalid = nil
-			for _, cand := range extractJSONCandidates(res.FinalMessage.Text()) {
-				if !json.Valid(cand) {
-					continue // broken JSON: treat as extraction failure
-				}
-				val, derr := decodeAndValidate[T](cand)
-				if derr == nil {
-					return val, res, nil
-				}
-				invalid = derr // valid JSON, wrong shape: correctable
+	cfg := session.agent.newRunConfig(opts)
+	if session.agent.structuredOutput == nil {
+		for _, tool := range session.agent.tools {
+			if tool.Definition().Name == structuredOutputToolName {
+				return value, RunResult{}, fmt.Errorf("typed run: %q is reserved for structured output; rename the tool", structuredOutputToolName)
 			}
 		}
-
-		if invalid == nil || corrections >= correctionBudget {
-			break
-		}
-		corrections++
-		session.agent.log.InfoContext(ctx, "structured output failed validation; requesting correction",
-			"violations", len(invalid.Violations), "correction", corrections, "budget", correctionBudget)
-		res, err = phase(correctionPrompt(invalid), base...)
+		contract, err := validateStructuredOutputDeclaration(&StructuredOutputConfig{
+			Schema:         typedRootSchema[T](),
+			Native:         knobs.nativeStructuredOutput,
+			MaxCorrections: maxCorrections,
+		})
 		if err != nil {
-			if errors.Is(err, ErrMaxStepsExceeded) {
-				err = errors.Join(err, invalid)
-			}
-			return zero, res, err
+			return value, RunResult{}, err
 		}
+		session.agent.installStructuredOutputContract(&cfg, contract)
 	}
 
-	if invalid != nil {
-		return zero, res, invalid
-	}
-
-	// The forced fallback: thinking disabled (forced tool choice + thinking is
-	// rejected by Anthropic). Its output is the last resort and is not
-	// corrected further.
-	res, err = phase(forcedPrompt, forced...)
+	scope, err := session.agent.beginRun(ctx, cfg, session.Messages(), session.commit, "typed")
 	if err != nil {
-		return zero, res, err
+		return value, scope.result, err
 	}
-	if len(res.terminalToolInput) == 0 {
-		return zero, res, fmt.Errorf("model did not produce structured output")
+	result, runErr = session.runPhase(scope, task, cfg)
+	result, runErr = scope.finish(result, runErr)
+	if runErr != nil {
+		return value, result, runErr
 	}
-	val, derr := decodeAndValidate[T](res.terminalToolInput)
+	if len(result.StructuredOutput) == 0 {
+		return value, result, fmt.Errorf("model did not produce structured output")
+	}
+	decoded, derr := decodeAndValidate[T](result.StructuredOutput)
 	if derr != nil {
-		return zero, res, derr
+		return value, result, derr
 	}
-	return val, res, nil
+	return decoded, result, nil
 }
 
-// runTypedNative implements the provider-native structured-output path: the
-// schema travels via CallOptions.OutputSchema, and the response text is parsed
-// and validated like any other payload. An unusable native payload falls back
-// to the hidden-tool path exactly once.
-func runTypedNative[T any](ctx context.Context, session *Session, phase func(string, ...RunOption) (RunResult, error), task string, opts, forced []RunOption, forcedPrompt string) (T, RunResult, error) {
-	var zero T
-	nativeInject := func(c *runConfig) {
-		c.options.OutputSchema = typedRootSchema[T]()
-	}
-	session.agent.log.DebugContext(ctx, "using provider-native structured output")
+// StructuredOutputConfig declares a required validated final output for an
+// Agent definition. The declaration is frozen with the agent, so a Runtime
+// definition revision pins both the executable binding and its output
+// contract. Every payload is validated against Schema by the shared supported
+// schema contract before it becomes the run's accepted output; unsupported
+// assertion keywords are rejected explicitly at construction.
+type StructuredOutputConfig struct {
+	// Schema is a JSON-schema object describing the accepted final output. It
+	// must be in the supported subset shared with tool input schemas; see the
+	// contract documentation in schemacontract.go.
+	Schema json.RawMessage
+	// Native requests provider-native enforcement: when the run's provider
+	// implements [StructuredOutputProvider] and reports support, Schema is
+	// sent via [CallOptions.OutputSchema] and the hidden structured-output
+	// tool is not injected. The final response text is validated the same way,
+	// and supported native invalid payloads correct within the run's own
+	// budgets. Providers without support use the hidden-tool path.
+	Native bool
+	// MaxCorrections bounds how many correction turns the run may spend
+	// feeding violations back to the model. Each correction is a full provider
+	// turn inside the same run; zero disables correction (an invalid payload
+	// fails the run immediately). Correction state is durable for [Runtime]
+	// runs and survives restart.
+	MaxCorrections int
+}
 
-	res, err := phase(task, append([]RunOption{nativeInject}, opts...)...)
+// structuredOutputContract is the frozen compiled declaration owned by an
+// Agent. The compiled contract is read-only and safe for concurrent runs.
+type structuredOutputContract struct {
+	config   StructuredOutputConfig
+	contract schemaContract
+}
+
+// structuredOutputState is the per-run working state of a declared contract.
+type structuredOutputState struct {
+	contract        schemaContract
+	maxCorrections  int
+	correctionsUsed int
+	native          bool
+	lastInvalid     *InvalidStructuredOutputError
+	forceToolChoice bool
+}
+
+// validate checks one raw payload against the contract and returns the decoded
+// value plus path-qualified violations. Exactly one top-level JSON value is
+// accepted: a second Decode must reach io.EOF, so the terminal payload cannot
+// carry trailing garbage or concatenated values.
+func (s *structuredOutputState) validate(raw json.RawMessage) (any, []string) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var value any
+	if err := dec.Decode(&value); err != nil {
+		return nil, []string{"payload is not valid JSON: " + err.Error()}
+	}
+	var extra any
+	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+		return nil, []string{"payload must contain exactly one JSON value"}
+	}
+	return value, s.contract.validate(value, "")
+}
+
+// validateStructuredOutputDeclaration validates and freezes a declared
+// structured-output contract. The schema is deep-copied so later caller
+// mutation cannot change frozen definitions.
+func validateStructuredOutputDeclaration(config *StructuredOutputConfig) (*structuredOutputContract, error) {
+	if config == nil {
+		return nil, nil
+	}
+	if len(config.Schema) == 0 {
+		return nil, errors.New("structured output requires a schema")
+	}
+	var schema map[string]any
+	if err := decodeSchemaRaw(config.Schema, &schema); err != nil {
+		return nil, fmt.Errorf("structured output schema: %w", err)
+	}
+	if schema == nil || schema["type"] != "object" {
+		return nil, errors.New("structured output schema must be an object schema")
+	}
+	contract, err := compileSchemaContract(schema)
 	if err != nil {
-		return zero, res, err
+		return nil, fmt.Errorf("structured output schema: %w", err)
 	}
-
-	val, nativeErr := decodeNativePayload[T](res.FinalMessage.Text())
-	if nativeErr == nil {
-		return val, res, nil
-	} else {
-		session.agent.log.InfoContext(ctx, "native structured output payload unusable; falling back to hidden tool",
-			"err", nativeErr.Error())
+	if config.MaxCorrections < 0 {
+		return nil, errors.New("structured output correction budget cannot be negative")
 	}
+	return &structuredOutputContract{
+		config:   StructuredOutputConfig{Schema: append(json.RawMessage(nil), config.Schema...), Native: config.Native, MaxCorrections: config.MaxCorrections},
+		contract: contract,
+	}, nil
+}
 
-	// One retry on the hidden-tool path; do not loop.
-	res, err = phase(forcedPrompt, forced...)
-	if err != nil {
-		if errors.Is(err, ErrMaxStepsExceeded) {
-			err = errors.Join(err, nativeErr)
+// structuredOutputTool is the hidden terminal tool injected for declared
+// structured-output runs. It is never executed: its call is validated and
+// either ends the run or feeds violations back to the model.
+type structuredOutputTool struct{ schema json.RawMessage }
+
+func (t structuredOutputTool) Definition() ToolDefinition {
+	return ToolDefinition{
+		Name:        structuredOutputToolName,
+		Description: "Return the final answer as structured data. Call this exactly once, with the complete result.",
+		InputSchema: t.schema,
+	}
+}
+
+func (structuredOutputTool) Execute(context.Context, json.RawMessage) (ToolResult, error) {
+	return TextResult("ok"), nil
+}
+
+// installStructuredOutput resolves the declared contract into per-run state:
+// either provider-native enforcement via CallOptions.OutputSchema, or the
+// hidden structured-output terminal tool.
+func (a *Agent) installStructuredOutput(cfg *runConfig) {
+	a.installStructuredOutputContract(cfg, a.structuredOutput)
+}
+
+func (a *Agent) installStructuredOutputContract(cfg *runConfig, declared *structuredOutputContract) {
+	if declared == nil {
+		return
+	}
+	state := &structuredOutputState{contract: declared.contract, maxCorrections: declared.config.MaxCorrections}
+	native := false
+	if declared.config.Native {
+		if p, ok := a.provider.(StructuredOutputProvider); ok && p.SupportsNativeStructuredOutput() {
+			cfg.options.OutputSchema = append(json.RawMessage(nil), declared.config.Schema...)
+			native = true
+		} else {
+			a.log.DebugContext(context.Background(), "native structured output requested but provider does not support it; using hidden tool")
 		}
-		return zero, res, err
 	}
-	if len(res.terminalToolInput) == 0 {
-		return zero, res, fmt.Errorf("model did not produce structured output")
+	state.native = native
+	if !native {
+		cfg.extraTools = append(cfg.extraTools, structuredOutputTool{schema: declared.config.Schema})
+		cfg.terminalTool = structuredOutputToolName
 	}
-	val, derr := decodeAndValidate[T](res.terminalToolInput)
-	if derr != nil {
-		return zero, res, derr
-	}
-	return val, res, nil
+	cfg.structuredOutput = state
 }
 
 // correctionPrompt builds the fixed user message presented to the model when
 // its structured output fails validation. The template is deliberately stable:
-// it is asserted in tests and models are prompted against it.
-func correctionPrompt(err *InvalidStructuredOutputError) string {
+// it is asserted in tests and models are prompted against it. An empty tool
+// name (provider-native runs) asks for the corrected payload as the final
+// message instead of a tool call.
+func correctionPrompt(err *InvalidStructuredOutputError, toolName string) string {
 	var b strings.Builder
 	b.WriteString("Your previous structured output was invalid:\n")
 	if len(err.Violations) > 0 {
@@ -317,8 +315,21 @@ func correctionPrompt(err *InvalidStructuredOutputError) string {
 		b.WriteString(err.Error())
 		b.WriteString("\n")
 	}
-	b.WriteString(fmt.Sprintf("Call the %s tool again with a corrected payload that fixes every listed violation. Do not omit any required field.", structuredOutputToolName))
+	if toolName != "" {
+		b.WriteString(fmt.Sprintf("Call the %s tool again with a corrected payload that fixes every listed violation. Do not omit any required field.", toolName))
+	} else {
+		b.WriteString("Return a corrected payload that fixes every listed violation as your entire final message. Do not omit any required field.")
+	}
 	return b.String()
+}
+
+// structuredMissingPrompt asks the model to produce the structured payload
+// when its final answer contained no usable JSON candidate.
+func structuredMissingPrompt(toolName string) string {
+	if toolName != "" {
+		return fmt.Sprintf("Return the final answer by calling the %s tool with the complete structured result.", toolName)
+	}
+	return "Return the final answer as structured data: a single JSON object matching the required schema, as your entire final message."
 }
 
 // typedRootSchema returns the JSON schema (the same object buildSchema

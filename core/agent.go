@@ -24,6 +24,7 @@ type Agent struct {
 	approver           Approver
 	defaultCallOptions CallOptions
 	toolPolicy         ToolPolicy
+	structuredOutput   *structuredOutputContract
 
 	preSendHooks []PreSendHook
 	observers    []RunObserver
@@ -49,6 +50,11 @@ type AgentConfig struct {
 	ToolPolicy         ToolPolicy
 	PreSendHooks       []PreSendHook
 	Observers          []RunObserver
+	// StructuredOutput, when set, requires the final answer as validated
+	// structured data (see [StructuredOutputConfig]). The declaration is
+	// frozen with the agent; direct runs and [Runtime] runs of the definition
+	// enforce the same contract, and only Runtime promises durability.
+	StructuredOutput *StructuredOutputConfig
 }
 
 // New validates and freezes reusable configuration before any run is admitted.
@@ -72,12 +78,17 @@ func New(p Provider, config AgentConfig) (*Agent, error) {
 	if err != nil {
 		return nil, err
 	}
+	declared, err := validateStructuredOutputDeclaration(config.StructuredOutput)
+	if err != nil {
+		return nil, err
+	}
 	a := &Agent{provider: p, systemPrompt: config.SystemPrompt, tools: frozen,
 		maxSteps: config.MaxTurns, retryCfg: retry.DefaultConfig(), tracer: config.Tracer,
 		log: config.Logger, approver: config.Approver,
 		defaultCallOptions: cloneCallOptions(config.DefaultCallOptions), toolPolicy: config.ToolPolicy.clone(),
-		preSendHooks: append([]PreSendHook(nil), config.PreSendHooks...),
-		observers:    append([]RunObserver(nil), config.Observers...)}
+		structuredOutput: declared,
+		preSendHooks:     append([]PreSendHook(nil), config.PreSendHooks...),
+		observers:        append([]RunObserver(nil), config.Observers...)}
 	if config.Retry != nil {
 		a.retryCfg = *config.Retry
 	}
@@ -149,6 +160,7 @@ func (a *Agent) newRunConfig(opts []RunOption) runConfig {
 			opt(&cfg)
 		}
 	}
+	a.installStructuredOutput(&cfg)
 	return cfg
 }
 

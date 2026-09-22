@@ -179,54 +179,74 @@ var (
 // and string-keyed maps (populating additionalProperties). A visiting set
 // breaks cycles on self-referential structs.
 func typeSchema(t reflect.Type, visiting map[reflect.Type]bool) map[string]any {
+	nullable := false
 	for t.Kind() == reflect.Pointer {
 		t = t.Elem()
+		nullable = true
 	}
 
+	var schema map[string]any
 	if t == timeType {
-		return map[string]any{"type": "string", "format": "date-time"}
+		schema = map[string]any{"type": "string", "format": "date-time"}
+		return nullableTypeSchema(schema, nullable)
 	}
 	if t == rawMessageType {
-		return map[string]any{}
+		schema = map[string]any{}
+		return nullableTypeSchema(schema, nullable)
 	}
 	if t.Kind() == reflect.Slice && t.Elem().Kind() == reflect.Uint8 {
-		return map[string]any{"type": "string"}
+		schema = map[string]any{"type": "string"}
+		return nullableTypeSchema(schema, nullable)
 	}
 
 	switch t.Kind() {
 	case reflect.String:
-		return map[string]any{"type": "string"}
+		schema = map[string]any{"type": "string"}
 	case reflect.Bool:
-		return map[string]any{"type": "boolean"}
+		schema = map[string]any{"type": "boolean"}
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
 		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		return map[string]any{"type": "integer"}
+		schema = map[string]any{"type": "integer"}
 	case reflect.Float32, reflect.Float64:
-		return map[string]any{"type": "number"}
+		schema = map[string]any{"type": "number"}
 	case reflect.Slice, reflect.Array:
-		return map[string]any{
+		schema = map[string]any{
 			"type":  "array",
 			"items": typeSchema(t.Elem(), visiting),
 		}
 	case reflect.Map:
 		if t.Key().Kind() != reflect.String {
-			return map[string]any{"type": "object"}
+			schema = map[string]any{"type": "object"}
+			break
 		}
-		return map[string]any{
+		schema = map[string]any{
 			"type":                 "object",
 			"additionalProperties": typeSchema(t.Elem(), visiting),
 		}
 	case reflect.Struct:
 		if visiting[t] {
-			return map[string]any{"type": "object"}
+			schema = map[string]any{"type": "object"}
+			break
 		}
 		visiting[t] = true
-		out := objectSchema(t, visiting)
+		schema = objectSchema(t, visiting)
 		delete(visiting, t)
-		return out
 	case reflect.Interface:
-		return map[string]any{}
+		schema = map[string]any{}
 	default:
-		return map[string]any{"type": "object"}
+		schema = map[string]any{"type": "object"}
 	}
+	return nullableTypeSchema(schema, nullable)
+}
+
+func nullableTypeSchema(schema map[string]any, nullable bool) map[string]any {
+	if !nullable {
+		return schema
+	}
+	typ, ok := schema["type"].(string)
+	if !ok || typ == "null" {
+		return schema
+	}
+	schema["type"] = []any{typ, "null"}
+	return schema
 }

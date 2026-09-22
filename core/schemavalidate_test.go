@@ -1,6 +1,7 @@
 package core
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -187,6 +188,66 @@ func TestValidateTypedPayload(t *testing.T) {
 	}
 }
 
+func TestValidateTypedPayloadPointerScalarNullability(t *testing.T) {
+	type pointerPayload struct {
+		S *string  `json:"s"`
+		I *int     `json:"i"`
+		B *bool    `json:"b"`
+		F *float64 `json:"f"`
+		A *any     `json:"a"`
+	}
+	if got := validateTypedPayload[pointerPayload](json.RawMessage(`{"s":null,"i":null,"b":null,"f":null,"a":null}`)); len(got) != 0 {
+		t.Fatalf("pointer scalar null violations = %q", got)
+	}
+
+	type scalarPayload struct {
+		S string  `json:"s"`
+		I int     `json:"i"`
+		B bool    `json:"b"`
+		F float64 `json:"f"`
+		A any     `json:"a"`
+	}
+	got := validateTypedPayload[scalarPayload](json.RawMessage(`{"s":null,"i":null,"b":null,"f":null,"a":null}`))
+	want := []string{
+		"s: null is not a valid value for string",
+		"i: null is not a valid value for integer",
+		"b: null is not a valid value for boolean",
+		"f: null is not a valid value for number",
+		"a: null is not a valid value for any",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("non-pointer null violations = %q, want %q", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("violation[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestRunTypedAcceptsPointerScalarNullPayload(t *testing.T) {
+	type pointerPayload struct {
+		S *string  `json:"s"`
+		I *int     `json:"i"`
+		B *bool    `json:"b"`
+		F *float64 `json:"f"`
+		A *any     `json:"a"`
+	}
+	provider := &scriptedProvider{turns: []Message{
+		asstTool("s1", structuredOutputToolName, `{"s":null,"i":null,"b":null,"f":null,"a":null}`),
+	}}
+	got, result, err := RunTyped[pointerPayload](context.Background(), testAgent(provider), "go")
+	if err != nil {
+		t.Fatalf("RunTyped: %v (result %#v)", err, result)
+	}
+	if got.S != nil || got.I != nil || got.B != nil || got.F != nil || got.A != nil {
+		t.Fatalf("decoded pointers = %#v, want all nil", got)
+	}
+	if string(result.StructuredOutput) != `{"s":null,"i":null,"b":null,"f":null,"a":null}` {
+		t.Fatalf("structured output = %s", result.StructuredOutput)
+	}
+}
+
 func containsViolation(violations []string, sub string) bool {
 	for _, v := range violations {
 		if strings.Contains(v, sub) {
@@ -194,6 +255,22 @@ func containsViolation(violations []string, sub string) bool {
 		}
 	}
 	return false
+}
+
+// TestValidateTypedPayloadTimeIsCheckedAsString pins that a time.Time field
+// is validated as the string its advertised schema claims (the format itself
+// is provider metadata and stays unenforced).
+func TestValidateTypedPayloadTimeIsCheckedAsString(t *testing.T) {
+	type payload struct {
+		When time.Time `json:"when"`
+	}
+	got := validateTypedPayload[payload](json.RawMessage(`{"when":5}`))
+	if len(got) != 1 || got[0] != "when: expected string, got number" {
+		t.Fatalf("violations = %q", got)
+	}
+	if got := validateTypedPayload[payload](json.RawMessage(`{"when":"2024-01-02T03:04:05Z"}`)); len(got) != 0 {
+		t.Fatalf("valid time violations = %q", got)
+	}
 }
 
 // TestValidateTypedPayloadOmitsUnexportedFields pins that unexported fields are

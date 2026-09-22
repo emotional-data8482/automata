@@ -3,19 +3,20 @@ package core
 import (
 	"bytes"
 	"encoding/json"
-	"fmt"
-	"math"
 	"reflect"
-	"sort"
-	"strconv"
 	"strings"
 )
 
 // validateTypedPayload checks raw — a JSON payload a model produced for a
 // typed run (a [RunTyped]/[RunSessionTyped] structured-output tool call, a
-// parsed prose answer, or a provider-native structured response) — against the
-// schema implied by T. It applies the same rules [buildSchema] advertises to
-// the model:
+// parsed prose answer, a provider-native structured response, or a structured
+// child value) — against the schema implied by T. It is the Go-typed entry
+// point of the one supported schema contract shared with tool input values
+// and declared final-output schemas (see schemacontract.go): T's schema is
+// compiled with the same rules, and the payload is validated by the same
+// value validator used for raw declared schemas.
+//
+// The Go-derived contract preserves the rules [buildSchema] advertises:
 //
 //   - required = exported struct field whose json tag has no `omitempty`
 //     (renamed fields follow the tag; `json:"-"` fields are excluded),
@@ -23,11 +24,12 @@ import (
 //     (integral numbers only), floats↔number, slices↔array (element-recursive),
 //     string-keyed maps↔object (value-recursive), structs↔object
 //     (field-recursive), pointers follow their element type,
-//   - JSON null is valid only where the Go type allows it: pointer, slice, or
-//     map fields (including through pointers),
-//   - time.Time, json.RawMessage, interface{}, and []byte fields are checked
-//     for presence only ([]byte must be a JSON string, matching its advertised
-//     string schema) and are not inspected deeper,
+//   - JSON null is valid exactly where the Go kind allows it: pointer, slice,
+//     or map fields (including pointer-to-interface); non-pointer interface
+//     fields reject null while accepting any other value,
+//   - time.Time fields are checked as strings (the advertised schema);
+//     json.RawMessage and interface{} fields are otherwise not inspected
+//     deeper; []byte must be a JSON string, matching its advertised schema,
 //   - unknown JSON fields are ignored, matching json.Unmarshal.
 //
 // It returns path-qualified violations so the model can locate its own
@@ -41,124 +43,83 @@ func validateTypedPayload[T any](raw json.RawMessage) []string {
 	if err := dec.Decode(&decoded); err != nil {
 		return []string{"payload is not valid JSON: " + err.Error()}
 	}
-	v := &validator{visiting: map[reflect.Type]bool{}}
-	v.validate(reflect.TypeOf((*T)(nil)).Elem(), decoded, "")
-	return v.violations
+	contract := typeContract(reflect.TypeOf((*T)(nil)).Elem(), map[reflect.Type]bool{})
+	return contract.validate(decoded, "")
 }
 
-type validator struct {
-	violations []string
-	// visiting breaks recursion on self-referential struct types, mirroring
-	// typeSchema's cycle handling.
-	visiting map[reflect.Type]bool
-}
-
-func (v *validator) addf(path, format string, args ...any) {
-	msg := fmt.Sprintf(format, args...)
-	if path != "" {
-		msg = path + ": " + msg
-	}
-	v.violations = append(v.violations, msg)
-}
-
-// validate checks one JSON value against one Go type at the given path.
-func (v *validator) validate(t reflect.Type, val any, path string) {
-	if val == nil {
-		// JSON null is valid only where the schema/model can represent it.
-		switch t.Kind() {
-		case reflect.Pointer, reflect.Slice, reflect.Map:
-			// nullable
-		default:
-			v.addf(path, "null is not a valid value for %s", jsonKindName(t))
-		}
-		return
-	}
+// typeContract compiles the schema implied by a Go type into the shared
+// contract. Nullability follows the Go kind, not the advertised schema:
+// pointer, slice, and map fields accept JSON null exactly as the reflect
+// validator always has, while non-pointer interface fields do not.
+func typeContract(t reflect.Type, visiting map[reflect.Type]bool) schemaContract {
+	nullable := false
 	for t.Kind() == reflect.Pointer {
 		t = t.Elem()
+		nullable = true
 	}
-	if t == timeType || t == rawMessageType || t.Kind() == reflect.Interface {
-		return // opaque: presence only
+	if t.Kind() == reflect.Slice || t.Kind() == reflect.Map {
+		nullable = true
 	}
-	if t.Kind() == reflect.Slice && t.Elem().Kind() == reflect.Uint8 {
+	switch {
+	case t == timeType:
+		// Advertised as {"type":"string","format":"date-time"}; the format is
+		// provider metadata and the string type is enforced.
+		return schemaContract{typ: "string", display: "any", nullable: nullable}
+	case t == rawMessageType:
+		// Advertised as a shape-free schema; null stays valid (slice kind).
+		return schemaContract{display: "any", nullable: true}
+	case t.Kind() == reflect.Interface:
+		// Advertised as a shape-free schema, but null is valid only when the
+		// interface itself was reached through a pointer.
+		return schemaContract{display: "any", nullable: nullable}
+	case t.Kind() == reflect.Slice && t.Elem().Kind() == reflect.Uint8:
 		// []byte advertises as a string schema (see typeSchema).
-		if _, ok := val.(string); !ok {
-			v.addf(path, "expected string, got %s", jsonKindOf(val))
-		}
-		return
+		return schemaContract{typ: "string", display: "string", nullable: true}
 	}
 
 	switch t.Kind() {
 	case reflect.String:
-		if _, ok := val.(string); !ok {
-			v.addf(path, "expected string, got %s", jsonKindOf(val))
-		}
+		return schemaContract{typ: "string", display: "string", nullable: nullable}
 	case reflect.Bool:
-		if _, ok := val.(bool); !ok {
-			v.addf(path, "expected boolean, got %s", jsonKindOf(val))
-		}
+		return schemaContract{typ: "boolean", display: "boolean", nullable: nullable}
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
 		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		n, ok := val.(json.Number)
-		if !ok {
-			v.addf(path, "expected integer, got %s", jsonKindOf(val))
-			return
-		}
-		if !isIntegralNumber(n) {
-			v.addf(path, "expected integer, got non-integral number %s", n)
-		}
+		return schemaContract{typ: "integer", display: "integer", nullable: nullable}
 	case reflect.Float32, reflect.Float64:
-		if _, ok := val.(json.Number); !ok {
-			v.addf(path, "expected number, got %s", jsonKindOf(val))
-		}
+		return schemaContract{typ: "number", display: "number", nullable: nullable}
 	case reflect.Slice, reflect.Array:
-		items, ok := val.([]any)
-		if !ok {
-			v.addf(path, "expected array, got %s", jsonKindOf(val))
-			return
-		}
-		elem := t.Elem()
-		for i, item := range items {
-			v.validate(elem, item, fmt.Sprintf("%s[%d]", path, i))
-		}
+		items := typeContract(t.Elem(), visiting)
+		return schemaContract{typ: "array", display: "array", nullable: nullable, items: &items}
 	case reflect.Map:
 		if t.Key().Kind() != reflect.String {
-			return // non-string-key maps advertise as plain objects
+			// Non-string-key maps advertise as plain objects and accept any
+			// value, including null.
+			return schemaContract{display: "object", nullable: true}
 		}
-		obj, ok := val.(map[string]any)
-		if !ok {
-			v.addf(path, "expected object, got %s", jsonKindOf(val))
-			return
-		}
-		valType := t.Elem()
-		keys := make([]string, 0, len(obj))
-		for k := range obj {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		for _, k := range keys {
-			v.validate(valType, obj[k], joinPath(path, k))
-		}
+		additional := typeContract(t.Elem(), visiting)
+		return schemaContract{typ: "object", display: "object", nullable: nullable, additional: &additional}
 	case reflect.Struct:
-		obj, ok := val.(map[string]any)
-		if !ok {
-			v.addf(path, "expected object, got %s", jsonKindOf(val))
-			return
+		if visiting[t] {
+			// Self-referential type: deeper fields are already covered by
+			// buildSchema's plain-object fallback, which constrains nothing.
+			return schemaContract{display: "object", nullable: nullable}
 		}
-		if v.visiting[t] {
-			return // recursive type: deeper fields already covered by buildSchema's plain-object fallback
-		}
-		v.visiting[t] = true
-		v.validateObject(t, obj, path)
-		delete(v.visiting, t)
+		visiting[t] = true
+		c := structContract(t, visiting)
+		c.nullable = nullable
+		delete(visiting, t)
+		return c
 	default:
-		// buildSchema maps unknown kinds to plain object schemas (anything
-		// goes); accept any value here too.
+		// Unknown kinds map to plain object schemas that accept any value;
+		// null is valid only when the value itself was reached through a pointer.
+		return schemaContract{display: "object", nullable: nullable}
 	}
 }
 
-// validateObject walks the exported fields of a struct against a decoded JSON
-// object, mirroring objectSchema's field rules exactly.
-func (v *validator) validateObject(t reflect.Type, obj map[string]any, path string) {
+// structContract walks the exported fields of a struct type, mirroring
+// objectSchema's field rules exactly.
+func structContract(t reflect.Type, visiting map[reflect.Type]bool) schemaContract {
+	c := schemaContract{typ: "object", display: "object"}
 	for i := range t.NumField() {
 		field := t.Field(i)
 		if !field.IsExported() {
@@ -176,80 +137,12 @@ func (v *validator) validateObject(t reflect.Type, obj map[string]any, path stri
 			}
 			required = !strings.Contains(tag, "omitempty")
 		}
-		fieldPath := joinPath(path, jsonName)
-		value, present := obj[jsonName]
-		if !present {
-			if required {
-				v.addf(fieldPath, "missing required field")
-			}
-			continue
-		}
-		v.validate(field.Type, value, fieldPath)
+		c.properties = append(c.properties, contractProperty{
+			name:     jsonName,
+			contract: typeContract(field.Type, visiting),
+			required: required,
+		})
 	}
 	// Unknown JSON fields are ignored, matching json.Unmarshal.
-}
-
-func joinPath(prefix, name string) string {
-	if prefix == "" {
-		return name
-	}
-	return prefix + "." + name
-}
-
-// isIntegralNumber reports whether the JSON number literal denotes an integer
-// ("1.0" and "1e2" count; "1.5" does not).
-func isIntegralNumber(n json.Number) bool {
-	if _, err := n.Int64(); err == nil {
-		return true
-	}
-	f, err := strconv.ParseFloat(n.String(), 64)
-	if err != nil {
-		return false
-	}
-	return f == math.Trunc(f)
-}
-
-// jsonKindOf names the JSON kind of a decoded value for violation messages.
-func jsonKindOf(val any) string {
-	switch val.(type) {
-	case map[string]any:
-		return "object"
-	case []any:
-		return "array"
-	case string:
-		return "string"
-	case bool:
-		return "boolean"
-	case json.Number:
-		return "number"
-	default:
-		return fmt.Sprintf("%T", val)
-	}
-}
-
-// jsonKindName names the JSON kind a Go type advertises as (see typeSchema).
-func jsonKindName(t reflect.Type) string {
-	for t.Kind() == reflect.Pointer {
-		t = t.Elem()
-	}
-	if t == timeType || t == rawMessageType || t.Kind() == reflect.Interface {
-		return "any"
-	}
-	switch t.Kind() {
-	case reflect.String:
-		return "string"
-	case reflect.Bool:
-		return "boolean"
-	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
-		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		return "integer"
-	case reflect.Float32, reflect.Float64:
-		return "number"
-	case reflect.Slice, reflect.Array:
-		return "array"
-	case reflect.Struct:
-		return "object"
-	default:
-		return "object"
-	}
+	return c
 }

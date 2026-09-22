@@ -1,5 +1,7 @@
 package core
 
+import "encoding/json"
+
 func cloneMessages(messages []Message) []Message {
 	out := append([]Message(nil), messages...)
 	for i := range out {
@@ -57,6 +59,7 @@ func cloneRunResult(r RunResult) RunResult {
 	r.FinalMessage = cloneMessages([]Message{r.FinalMessage})[0]
 	r.Diagnostics = cloneDiagnostics(r.Diagnostics)
 	r.terminalToolInput = append([]byte(nil), r.terminalToolInput...)
+	r.StructuredOutput = append(json.RawMessage(nil), r.StructuredOutput...)
 	return r
 }
 func cloneStreamEvent(e StreamEvent) StreamEvent {

@@ -140,6 +140,7 @@ func TestTypedPublicAccountingAndFinalization(t *testing.T) {
 			p := &nativeCapturingProvider{turns: []Message{withUsage(asstTool("a", structuredOutputToolName, `{"name":"Ada"}`), &Usage{InputTokens: 10}), withUsage(asstTool("b", structuredOutputToolName, `{"name":"Ada","age":36}`), &Usage{InputTokens: 8})}}
 			if native {
 				p.turns[0] = withUsage(asstText("unusable"), &Usage{InputTokens: 10})
+				p.turns[1] = withUsage(asstText(`{"name":"Ada","age":36}`), &Usage{InputTokens: 8})
 			}
 			a := newTestAgent(t, p, AgentConfig{})
 			var opts []RunOption

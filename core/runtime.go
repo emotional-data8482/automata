@@ -14,9 +14,11 @@ import (
 )
 
 // runtimeEncodingVersion is the storage encoding this core build reads and
-// writes. Version 5 adds durable question and approval waits. Earlier
+// writes. Version 5 added durable question and approval waits. Version 6 adds
+// declared structured-output contracts: persisted correction-turn counts and
+// the validated final structured payload inside the run result. Earlier
 // pre-release stores are rejected without implicit rewrite.
-const runtimeEncodingVersion = 5
+const runtimeEncodingVersion = 6
 
 const (
 	runtimeMetaBucket         = "runtime_meta"
@@ -90,31 +92,36 @@ type definitionBinding struct {
 }
 
 type storedRuntimeRun struct {
-	Version            int                 `json:"version"`
-	RunID              string              `json:"run_id"`
-	DefinitionID       string              `json:"definition_id"`
-	DefinitionRevision string              `json:"definition_revision"`
-	Task               string              `json:"task"`
-	Deadline           time.Time           `json:"deadline,omitempty"`
-	State              RuntimeState        `json:"state"`
-	Generation         uint64              `json:"generation"`
-	Result             RunResult           `json:"result"`
-	TranscriptChunks   int                 `json:"transcript_chunks"`
-	TranscriptMessages int                 `json:"transcript_messages"`
-	Error              string              `json:"error,omitempty"`
-	ErrorKind          string              `json:"error_kind,omitempty"`
-	ErrorStopReason    StopReason          `json:"error_stop_reason,omitempty"`
-	ErrorRawReason     string              `json:"error_raw_reason,omitempty"`
-	LastTransition     string              `json:"last_transition,omitempty"`
-	EffectiveTools     []string            `json:"effective_tools,omitempty"`
-	AttentionReason    string              `json:"attention_reason,omitempty"`
-	AttentionKind      string              `json:"attention_kind,omitempty"`
-	HookResults        []RunHookResult     `json:"hook_results,omitempty"`
-	PendingBatchID     string              `json:"pending_batch_id,omitempty"`
-	NextBatchOrdinal   int                 `json:"next_batch_ordinal,omitempty"`
-	ToolBudget         storedToolBudget    `json:"tool_budget"`
-	ToolBatches        []ToolBatchSnapshot `json:"-"`
-	Waits              []WaitSnapshot      `json:"-"`
+	Version            int              `json:"version"`
+	RunID              string           `json:"run_id"`
+	DefinitionID       string           `json:"definition_id"`
+	DefinitionRevision string           `json:"definition_revision"`
+	Task               string           `json:"task"`
+	Deadline           time.Time        `json:"deadline,omitempty"`
+	State              RuntimeState     `json:"state"`
+	Generation         uint64           `json:"generation"`
+	Result             RunResult        `json:"result"`
+	TranscriptChunks   int              `json:"transcript_chunks"`
+	TranscriptMessages int              `json:"transcript_messages"`
+	Error              string           `json:"error,omitempty"`
+	ErrorKind          string           `json:"error_kind,omitempty"`
+	ErrorStopReason    StopReason       `json:"error_stop_reason,omitempty"`
+	ErrorRawReason     string           `json:"error_raw_reason,omitempty"`
+	LastTransition     string           `json:"last_transition,omitempty"`
+	EffectiveTools     []string         `json:"effective_tools,omitempty"`
+	AttentionReason    string           `json:"attention_reason,omitempty"`
+	AttentionKind      string           `json:"attention_kind,omitempty"`
+	HookResults        []RunHookResult  `json:"hook_results,omitempty"`
+	PendingBatchID     string           `json:"pending_batch_id,omitempty"`
+	NextBatchOrdinal   int              `json:"next_batch_ordinal,omitempty"`
+	ToolBudget         storedToolBudget `json:"tool_budget"`
+	// Corrections is the cumulative structured-output correction-turn count of
+	// the declared contract (see [StructuredOutputConfig]). It persists
+	// atomically with the transition that re-dispatches the correction so a
+	// restart cannot replay or extend the budget.
+	Corrections int                 `json:"corrections,omitempty"`
+	ToolBatches []ToolBatchSnapshot `json:"-"`
+	Waits       []WaitSnapshot      `json:"-"`
 }
 
 // admissionPayload is the canonical admission identity payload. Its JSON
@@ -568,6 +575,11 @@ func (r *Runtime) execute(workerCtx context.Context, runID string) {
 		return
 	}
 	cfg := binding.agent.newRunConfig(nil)
+	// Restore the persisted correction-turn count so a restarted correction
+	// continues the original budget rather than resetting it.
+	if cfg.structuredOutput != nil {
+		cfg.structuredOutput.correctionsUsed = record.Corrections
+	}
 	// Runtime observation is attached through RunHandle. Agent observers are
 	// synchronous direct-run instrumentation and do not participate here.
 	cfg.observers = nil
@@ -671,6 +683,7 @@ func (r *Runtime) persistTransition(ctx context.Context, runID string, transitio
 		}
 		record.Result = cloneRunResult(transition.Result)
 		record.Result.Messages = nil
+		record.Corrections = transition.StructuredCorrections
 		record.LastTransition = transition.Kind
 		if transition.Kind == "provider_accepted" {
 			record.EffectiveTools = append([]string(nil), transition.EffectiveTools...)
@@ -847,12 +860,16 @@ func setRuntimeError(record *storedRuntimeRun, err error) {
 		record.ErrorKind = "deadline"
 	case errors.Is(err, context.Canceled):
 		record.ErrorKind = "cancelled"
+	case errors.Is(err, ErrMaxStepsExceeded) && errors.Is(err, ErrInvalidStructuredOutput):
+		record.ErrorKind = "max_steps_invalid_structured_output"
 	case errors.Is(err, ErrMaxStepsExceeded):
 		record.ErrorKind = "max_steps"
 	case errors.Is(err, ErrInvalidMaxSteps):
 		record.ErrorKind = "invalid_max_steps"
 	case errors.Is(err, ErrEmptyResponse):
 		record.ErrorKind = "empty_response"
+	case errors.Is(err, ErrInvalidStructuredOutput):
+		record.ErrorKind = "invalid_structured_output"
 	default:
 		var completion *CompletionError
 		if errors.As(err, &completion) {
@@ -1328,10 +1345,14 @@ func snapshotError(snapshot RunSnapshot) error {
 		return context.Canceled
 	case "max_steps":
 		return fmt.Errorf("%s: %w", snapshot.Error, ErrMaxStepsExceeded)
+	case "max_steps_invalid_structured_output":
+		return fmt.Errorf("%s: %w", snapshot.Error, errors.Join(ErrMaxStepsExceeded, ErrInvalidStructuredOutput))
 	case "invalid_max_steps":
 		return fmt.Errorf("%s: %w", snapshot.Error, ErrInvalidMaxSteps)
 	case "empty_response":
 		return fmt.Errorf("%s: %w", snapshot.Error, ErrEmptyResponse)
+	case "invalid_structured_output":
+		return fmt.Errorf("%s: %w", snapshot.Error, ErrInvalidStructuredOutput)
 	case "completion":
 		return &CompletionError{Reason: snapshot.ErrorStopReason, RawReason: snapshot.ErrorRawReason}
 	}
