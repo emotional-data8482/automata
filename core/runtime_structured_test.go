@@ -176,7 +176,7 @@ func TestRuntimeStructuredCorrectionBudgetExhaustedFails(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if snapshot.ErrorKind != "invalid_structured_output" || snapshot.State != RuntimeTerminal {
+	if (snapshot.Failure == nil || snapshot.Failure.Kind != FailureInvalidStructuredOutput) || snapshot.State != RuntimeTerminal {
 		t.Fatalf("snapshot = %#v", snapshot)
 	}
 	receipt := ""
@@ -773,7 +773,7 @@ func TestRuntimeStructuredMaxTurnsSnapshotReopenKeepsInvalidCause(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if snapshot.State != RuntimeTerminal || snapshot.ErrorKind != "max_steps_invalid_structured_output" {
+	if snapshot.State != RuntimeTerminal || (snapshot.Failure == nil || snapshot.Failure.Kind != FailureMaxStepsInvalidStructuredOutput) {
 		t.Fatalf("snapshot = %#v", snapshot)
 	}
 	runID := handle.ID()
@@ -790,7 +790,7 @@ func TestRuntimeStructuredMaxTurnsSnapshotReopenKeepsInvalidCause(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if reopenedSnapshot.State != RuntimeTerminal || reopenedSnapshot.ErrorKind != "max_steps_invalid_structured_output" {
+	if reopenedSnapshot.State != RuntimeTerminal || (reopenedSnapshot.Failure == nil || reopenedSnapshot.Failure.Kind != FailureMaxStepsInvalidStructuredOutput) {
 		t.Fatalf("reopened snapshot = %#v", reopenedSnapshot)
 	}
 	reopenedResult, err := reopened.Handle(runID).Await(context.Background())

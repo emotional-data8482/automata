@@ -332,8 +332,8 @@ func TestChildWaitSurvivesProcessKill(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if childSnapshot.State != core.RuntimeWaiting || childSnapshot.ParentRunID != parentID {
-		t.Fatalf("reopened child = %s parent %q", childSnapshot.State, childSnapshot.ParentRunID)
+	if childSnapshot.State != core.RuntimeWaiting || childSnapshot.Parent == nil || childSnapshot.Parent.RunID != parentID {
+		t.Fatalf("reopened child = %s parent %#v", childSnapshot.State, childSnapshot.Parent)
 	}
 	if err := reopened.Handle(childID).ResolveWait(ctx, waitID, core.WaitResolution{Answer: json.RawMessage(`"yes"`), Decision: core.Allow}); err != nil {
 		t.Fatal(err)
@@ -357,8 +357,8 @@ func TestChildWaitSurvivesProcessKill(t *testing.T) {
 		t.Fatalf("post-restart write = %#v, want denied by the persisted cap", denied)
 	}
 	want := core.TreeAccounting{Runs: 2, Usage: core.Usage{InputTokens: 6}, ProviderAttempts: 6}
-	if snapshot.Tree != want {
-		t.Fatalf("tree accounting = %#v, want %#v", snapshot.Tree, want)
+	if snapshot.Accounting.Tree != want {
+		t.Fatalf("tree accounting = %#v, want %#v", snapshot.Accounting.Tree, want)
 	}
 	data, err := os.ReadFile(oracle)
 	if err != nil {
@@ -393,7 +393,10 @@ func TestChildCompletionWakeSurvivesProcessKill(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	parentID := childSnapshot.ParentRunID
+	if childSnapshot.Parent == nil {
+		t.Fatal("reopened child has no parent")
+	}
+	parentID := childSnapshot.Parent.RunID
 	result, err := awaitBounded(t, reopened.Handle(parentID))
 	if err != nil || result.Output != "parent done" {
 		t.Fatalf("parent = %q, %v", result.Output, err)
@@ -408,8 +411,8 @@ func TestChildCompletionWakeSurvivesProcessKill(t *testing.T) {
 	if linkedChildID(snapshot) != childID || snapshot.ToolBatches[0].Invocations[0].Result.Text() != "child done" {
 		t.Fatalf("parent batches = %#v", snapshot.ToolBatches)
 	}
-	if want := (core.TreeAccounting{Runs: 2, Usage: core.Usage{InputTokens: 3}, ProviderAttempts: 3}); snapshot.Tree != want {
-		t.Fatalf("tree accounting = %#v, want %#v", snapshot.Tree, want)
+	if want := (core.TreeAccounting{Runs: 2, Usage: core.Usage{InputTokens: 3}, ProviderAttempts: 3}); snapshot.Accounting.Tree != want {
+		t.Fatalf("tree accounting = %#v, want %#v", snapshot.Accounting.Tree, want)
 	}
 }
 
@@ -449,7 +452,7 @@ func TestChildCancellationSurvivesProcessKill(t *testing.T) {
 	if snapshot.State != core.RuntimeTerminal || snapshot.Result.Status != core.RunCancelled {
 		t.Fatalf("parent = %s %s", snapshot.State, snapshot.Result.Status)
 	}
-	if snapshot.Tree.Unsettled != 0 || snapshot.Tree.UnknownAttempts != 1 {
-		t.Fatalf("tree accounting = %#v, want settled with one unknown child attempt", snapshot.Tree)
+	if snapshot.Accounting.Tree.Unsettled != 0 || snapshot.Accounting.Tree.UnknownAttempts != 1 {
+		t.Fatalf("tree accounting = %#v, want settled with one unknown child attempt", snapshot.Accounting.Tree)
 	}
 }

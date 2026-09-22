@@ -665,7 +665,7 @@ type TreeAccounting struct {
 	// ProviderAttempts sums each counted run's recorded provider attempts.
 	ProviderAttempts int
 	// UnknownAttempts sums each counted run's unknown provider attempts (see
-	// [RunSnapshot]). Their usage is not included in Usage.
+	// [RunAccounting.UnknownAttempts]). Their usage is not included in Usage.
 	UnknownAttempts int
 	// Unsettled counts descendants that are not terminal; their local values
 	// can still grow.

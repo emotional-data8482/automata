@@ -579,12 +579,10 @@ func setInvocationError(invocation *storedToolInvocation, err error) {
 }
 
 func invocationError(invocation storedToolInvocation) error {
-	return snapshotError(RunSnapshot{
-		Error:           invocation.Error,
-		ErrorKind:       invocation.ErrorKind,
-		ErrorStopReason: invocation.ErrorStopReason,
-		ErrorRawReason:  invocation.ErrorRawReason,
-	})
+	return snapshotError(RunSnapshot{Failure: failureFromRecord(storedRuntimeRun{
+		Error: invocation.Error, ErrorKind: invocation.ErrorKind,
+		ErrorStopReason: invocation.ErrorStopReason, ErrorRawReason: invocation.ErrorRawReason,
+	})})
 }
 
 func (r *Runtime) completeToolInvocation(ctx context.Context, invocation storedToolInvocation, result ToolResult, executeErr error, canonical ToolResult, fatal bool) error {

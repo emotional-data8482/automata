@@ -180,8 +180,8 @@ func TestRuntimeDurableChildConcurrentSiblingsComplete(t *testing.T) {
 		if child.State != RuntimeTerminal || child.Result.Output != "child done" {
 			t.Fatalf("child %s = %s %q", invocation.ChildRunID, child.State, child.Result.Output)
 		}
-		if child.ParentRunID != handle.ID() || child.ParentOperationID != invocation.OperationID {
-			t.Fatalf("child %s parentage = %q/%q", invocation.ChildRunID, child.ParentRunID, child.ParentOperationID)
+		if child.Parent == nil || child.Parent.RunID != handle.ID() || child.Parent.OperationID != invocation.OperationID {
+			t.Fatalf("child %s parentage = %#v", invocation.ChildRunID, child.Parent)
 		}
 	}
 	// Canonical transcript keeps the child projections in model order.
@@ -258,8 +258,8 @@ func TestRuntimeDurableChildBudgetDeniedSiblingKeepsIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if childSnapshot.ParentRunID != result.RunID || childSnapshot.State != RuntimeTerminal {
-		t.Fatalf("child %s = %s parent %q", childID, childSnapshot.State, childSnapshot.ParentRunID)
+	if childSnapshot.Parent == nil || childSnapshot.Parent.RunID != result.RunID || childSnapshot.State != RuntimeTerminal {
+		t.Fatalf("child %s = %s parent %#v", childID, childSnapshot.State, childSnapshot.Parent)
 	}
 	// Exactly one child run and link exist; the denied reservation produced no
 	// second admission, and the parent's cap records one used reservation.
@@ -857,14 +857,14 @@ func TestRuntimeCommittedHooksAreBoundedVisibleAndDoNotRewriteResult(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if snapshot.State != RuntimeTerminal || len(snapshot.HookResults) != 3 {
+	if snapshot.State != RuntimeTerminal || len(snapshot.Hooks) != 3 {
 		t.Fatalf("hook snapshot = %#v", snapshot)
 	}
-	if snapshot.HookResults[0].Error != hookErr.Error() {
-		t.Fatalf("first hook result = %#v", snapshot.HookResults[0])
+	if snapshot.Hooks[0].Error != hookErr.Error() {
+		t.Fatalf("first hook result = %#v", snapshot.Hooks[0])
 	}
-	if snapshot.HookResults[1].Error != context.DeadlineExceeded.Error() || snapshot.HookResults[2].Error != "panic: boom" {
-		t.Fatalf("hook results = %#v", snapshot.HookResults)
+	if snapshot.Hooks[1].Error != context.DeadlineExceeded.Error() || snapshot.Hooks[2].Error != "panic: boom" {
+		t.Fatalf("hook results = %#v", snapshot.Hooks)
 	}
 	if want := []string{"audit", "bounded", "panic"}; !reflect.DeepEqual(order, want) {
 		t.Fatalf("hook order = %v, want %v", order, want)
@@ -938,7 +938,7 @@ func TestRuntimeRecoverUsesPinnedBindingAndConservativeAttention(t *testing.T) {
 		t.Fatal(err)
 	}
 	snapshot, err := missing.Handle("missing-binding").Snapshot(context.Background())
-	if err != nil || snapshot.State != RuntimeNeedsAttention || snapshot.AttentionReason == "" {
+	if err != nil || snapshot.State != RuntimeNeedsAttention || snapshot.Attention == nil || snapshot.Attention.Kind != AttentionExecution || snapshot.Attention.Reason == "" {
 		t.Fatalf("missing binding snapshot = %#v, %v", snapshot, err)
 	}
 	if err := missing.Register("agent", "v2", testAgent(&scriptedProvider{turns: []Message{asstText("late binding")}})); err != nil {

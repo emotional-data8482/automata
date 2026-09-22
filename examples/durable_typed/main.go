@@ -252,8 +252,8 @@ func reviewThread(ctx context.Context, runtime *core.Runtime) {
 		exitf("inspect conversation: %v", err)
 	}
 
-	fmt.Printf("child verdict: %+v (child run linked to parent: %t)\n", verdict, child.ParentRunID == first.RunID)
-	fmt.Printf("turn 1 input tokens: %d local, %d across %d runs\n", first.Usage.InputTokens, snapshot.Tree.Usage.InputTokens, snapshot.Tree.Runs)
+	fmt.Printf("child verdict: %+v (child run linked to parent: %t)\n", verdict, child.Parent != nil && child.Parent.RunID == first.RunID)
+	fmt.Printf("turn 1 input tokens: %d local, %d across %d runs\n", first.Usage.InputTokens, snapshot.Accounting.Tree.Usage.InputTokens, snapshot.Accounting.Tree.Runs)
 	fmt.Printf("turn 2 continued %d committed messages: %s\n", len(second.Messages)-2, second.Output)
 	fmt.Printf("conversation turns: %d; head is turn 2: %t\n", conversation.Turns, conversation.Head == second.RunID)
 }

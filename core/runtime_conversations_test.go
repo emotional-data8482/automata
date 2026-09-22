@@ -107,6 +107,17 @@ func TestRuntimeConversationContinuesCommittedHistory(t *testing.T) {
 		conversation.DefinitionID != "chat" || conversation.DefinitionRevision != "v1" {
 		t.Fatalf("conversation = %#v", conversation)
 	}
+	for _, runID := range []string{first.RunID, second.RunID} {
+		snapshot, err := runtime.Handle(runID).Snapshot(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if snapshot.Definition != (DefinitionRef{ID: "chat", Revision: "v1"}) ||
+			snapshot.Conversation == nil || *snapshot.Conversation != (ConversationRef{Scope: "tenant", ID: "c1"}) ||
+			snapshot.Parent != nil || snapshot.Failure != nil || snapshot.Attention != nil {
+			t.Fatalf("run %s snapshot groups = %#v", runID, snapshot)
+		}
+	}
 }
 
 // Stale heads, competing turns, and a different definition are rejected; a

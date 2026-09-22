@@ -21,7 +21,7 @@ type PreSendHook func(context.Context, Request) (Request, error)
 // in persisted results. Timeout supplies each attempt's context deadline; zero
 // selects 30 seconds. Hook implementations must honor context cancellation.
 //
-// A hook error is recorded in RunSnapshot.HookResults. It never changes the
+// A hook error is recorded in RunSnapshot.Hooks. It never changes the
 // execution result or its error. Runtime does not automatically retry hooks: a
 // process loss during delivery is an uncertain external effect and recovery
 // moves the run to RuntimeNeedsAttention until the host calls

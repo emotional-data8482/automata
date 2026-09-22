@@ -337,7 +337,7 @@ func TestRuntimeRecoveryDeliversHookNeverStarted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if deliveries.Load() != 1 || snapshot.State != RuntimeTerminal || snapshot.Result.Output != "done" || len(snapshot.HookResults) != 1 {
+	if deliveries.Load() != 1 || snapshot.State != RuntimeTerminal || snapshot.Result.Output != "done" || len(snapshot.Hooks) != 1 {
 		t.Fatalf("hook deliveries=%d snapshot=%#v", deliveries.Load(), snapshot)
 	}
 }

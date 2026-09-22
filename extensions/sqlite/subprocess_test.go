@@ -460,8 +460,8 @@ func TestInterruptedOwnerRunBecomesAttention(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if snapshot.State != core.RuntimeNeedsAttention ||
-		!strings.Contains(snapshot.AttentionReason, "previous owner stopped during execution") {
+	if snapshot.State != core.RuntimeNeedsAttention || snapshot.Attention == nil ||
+		!strings.Contains(snapshot.Attention.Reason, "previous owner stopped during execution") {
 		t.Fatalf("recovered snapshot = %#v", snapshot)
 	}
 

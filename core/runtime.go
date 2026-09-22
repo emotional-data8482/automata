@@ -74,34 +74,89 @@ type SubmitOptions struct {
 	Conversation ConversationOptions
 }
 
+// RunSnapshot is the host-facing view of a durable run. Optional groups are
+// nil when the run has no parent, conversation, failure, or attention.
+// Result.Usage is local; Accounting.Tree includes linked descendants.
 type RunSnapshot struct {
-	RunID              string
-	DefinitionID       string
-	DefinitionRevision string
-	State              RuntimeState
-	// ParentRunID and ParentOperationID identify the durable parent run and
-	// invocation that admitted this run as a child. Both are empty on
-	// ordinary runs.
-	ParentRunID       string
-	ParentOperationID string
-	Result            RunResult
-	Error             string
-	ErrorKind         string
-	ErrorStopReason   StopReason
-	ErrorRawReason    string
-	AttentionReason   string
-	AttentionKind     string
-	// UnknownAttempts counts provider attempts this run may have dispatched
-	// without a recorded outcome: recovery found its owner stopped where the
-	// next step was a provider call. Their usage, if any, is not in
-	// Result.Usage.
+	RunID        string
+	Definition   DefinitionRef
+	State        RuntimeState
+	Parent       *ParentRef
+	Conversation *ConversationRef
+	Result       RunResult
+	Failure      *RunFailure
+	Attention    *RunAttention
+	Accounting   RunAccounting
+	Hooks        []RunHookResult
+	ToolBatches  []ToolBatchSnapshot
+	Waits        []WaitSnapshot
+}
+
+// DefinitionRef identifies the pinned definition of a run.
+type DefinitionRef struct {
+	ID       string
+	Revision string
+}
+
+// ParentRef links a child to the durable invocation that admitted it.
+type ParentRef struct {
+	RunID       string
+	OperationID string
+}
+
+// ConversationRef identifies the conversation containing a turn.
+type ConversationRef struct {
+	Scope string
+	ID    string
+}
+
+// FailureKind classifies a persisted execution error independently of its message.
+type FailureKind string
+
+const (
+	FailureDeadline                        FailureKind = "deadline"
+	FailureCancelled                       FailureKind = "cancelled"
+	FailureMaxSteps                        FailureKind = "max_steps"
+	FailureMaxStepsInvalidStructuredOutput FailureKind = "max_steps_invalid_structured_output"
+	FailureInvalidMaxSteps                 FailureKind = "invalid_max_steps"
+	FailureEmptyResponse                   FailureKind = "empty_response"
+	FailureInvalidStructuredOutput         FailureKind = "invalid_structured_output"
+	FailureCompletion                      FailureKind = "completion"
+	FailureGeneric                         FailureKind = "generic"
+)
+
+// RunFailure preserves the error message and any provider completion details.
+type RunFailure struct {
+	Message    string
+	Kind       FailureKind
+	StopReason StopReason
+	RawReason  string
+}
+
+// AttentionKind identifies the reason a durable run cannot continue normally.
+type AttentionKind string
+
+const (
+	AttentionExecution AttentionKind = "execution"
+	AttentionHooks     AttentionKind = "hooks"
+	AttentionChild     AttentionKind = "child"
+)
+
+// RunAttention describes a run needing host intervention. BlockingRunID names
+// the pending child whose state blocks a parent in child attention.
+type RunAttention struct {
+	Kind          AttentionKind
+	Reason        string
+	BlockingRunID string
+}
+
+// RunAccounting separates uncertain local attempts from known subtree totals.
+type RunAccounting struct {
+	// UnknownAttempts counts provider calls this run may have dispatched
+	// without a recorded outcome. Their usage is not in Result.Usage.
 	UnknownAttempts int
-	// Tree aggregates recorded accounting across this run and its linked
-	// durable descendants. Result.Usage stays local to this run.
-	Tree        TreeAccounting
-	HookResults []RunHookResult
-	ToolBatches []ToolBatchSnapshot
-	Waits       []WaitSnapshot
+	// Tree aggregates recorded accounting over this run and its descendants.
+	Tree TreeAccounting
 }
 
 type definitionBinding struct {
@@ -148,7 +203,7 @@ type storedRuntimeRun struct {
 	// restart cannot replay or extend the budget.
 	Corrections int `json:"corrections,omitempty"`
 	// UnknownAttempts is persisted unknown provider-attempt evidence (see
-	// [RunSnapshot]). UnknownAttemptGeneration marks the interrupted
+	// [RunAccounting.UnknownAttempts]). UnknownAttemptGeneration marks the interrupted
 	// generation already counted so repeated recovery counts it once.
 	// HookDelivery names the committed-run hooks whose delivery started. It
 	// commits before the first hook is invoked: a finalizing run without it
@@ -1128,38 +1183,44 @@ func errorString(err error) string {
 }
 
 func setRuntimeError(record *storedRuntimeRun, err error) {
-	record.Error = errorString(err)
-	record.ErrorKind = ""
-	record.ErrorStopReason = ""
-	record.ErrorRawReason = ""
-	if err == nil {
-		return
+	failure := failureFromError(err)
+	record.Error, record.ErrorKind, record.ErrorStopReason, record.ErrorRawReason = "", "", "", ""
+	if failure != nil {
+		record.Error, record.ErrorKind = failure.Message, string(failure.Kind)
+		record.ErrorStopReason, record.ErrorRawReason = failure.StopReason, failure.RawReason
 	}
+}
+
+func failureFromError(err error) *RunFailure {
+	if err == nil {
+		return nil
+	}
+	failure := &RunFailure{Message: err.Error()}
 	switch {
 	case errors.Is(err, context.DeadlineExceeded):
-		record.ErrorKind = "deadline"
+		failure.Kind = FailureDeadline
 	case errors.Is(err, context.Canceled):
-		record.ErrorKind = "cancelled"
+		failure.Kind = FailureCancelled
 	case errors.Is(err, ErrMaxStepsExceeded) && errors.Is(err, ErrInvalidStructuredOutput):
-		record.ErrorKind = "max_steps_invalid_structured_output"
+		failure.Kind = FailureMaxStepsInvalidStructuredOutput
 	case errors.Is(err, ErrMaxStepsExceeded):
-		record.ErrorKind = "max_steps"
+		failure.Kind = FailureMaxSteps
 	case errors.Is(err, ErrInvalidMaxSteps):
-		record.ErrorKind = "invalid_max_steps"
+		failure.Kind = FailureInvalidMaxSteps
 	case errors.Is(err, ErrEmptyResponse):
-		record.ErrorKind = "empty_response"
+		failure.Kind = FailureEmptyResponse
 	case errors.Is(err, ErrInvalidStructuredOutput):
-		record.ErrorKind = "invalid_structured_output"
+		failure.Kind = FailureInvalidStructuredOutput
 	default:
 		var completion *CompletionError
 		if errors.As(err, &completion) {
-			record.ErrorKind = "completion"
-			record.ErrorStopReason = completion.Reason
-			record.ErrorRawReason = completion.RawReason
+			failure.Kind = FailureCompletion
+			failure.StopReason, failure.RawReason = completion.Reason, completion.RawReason
 		} else {
-			record.ErrorKind = "generic"
+			failure.Kind = FailureGeneric
 		}
 	}
+	return failure
 }
 
 func (r *Runtime) setFailure(runID string, err error) {
@@ -1361,7 +1422,7 @@ func (h *RunHandle) Snapshot(ctx context.Context) (RunSnapshot, error) {
 		h.runtime.mu.Unlock()
 		if !registered {
 			snapshot.State = RuntimeNeedsAttention
-			snapshot.AttentionReason = ErrDefinitionNotRegistered.Error()
+			snapshot.Attention = &RunAttention{Kind: AttentionExecution, Reason: ErrDefinitionNotRegistered.Error()}
 		}
 	}
 	return snapshot, nil
@@ -1422,7 +1483,7 @@ func (h *RunHandle) Await(ctx context.Context) (RunResult, error) {
 		case RuntimeTerminal:
 			return lastResult, snapshotError(snapshot)
 		case RuntimeNeedsAttention:
-			return lastResult, fmt.Errorf("%w: %s", ErrRunNeedsAttention, snapshot.AttentionReason)
+			return lastResult, fmt.Errorf("%w: %s", ErrRunNeedsAttention, snapshot.Attention.Reason)
 		}
 		select {
 		case <-ctx.Done():
@@ -1535,7 +1596,7 @@ func hooksAckReceiptKey(runID string) string { return "hooks\x00" + runID }
 // interrupted hooks may or may not have done; Runtime never invokes them
 // again. The run becomes terminal with its committed execution result
 // unchanged, each hook whose delivery had started is recorded as Unknown in
-// RunSnapshot.HookResults, and the terminal commit wakes a waiting durable
+// RunSnapshot.Hooks, and the terminal commit wakes a waiting durable
 // parent or advances the run's conversation like any other. An exact retry
 // after success returns nil; a run not awaiting hook acknowledgement is an
 // error.
@@ -1696,47 +1757,70 @@ func putRuntimeRun(tx StoreTransaction, record storedRuntimeRun) error {
 }
 
 func snapshotFromRecord(record storedRuntimeRun) RunSnapshot {
-	return RunSnapshot{
-		RunID: record.RunID, DefinitionID: record.DefinitionID,
-		DefinitionRevision: record.DefinitionRevision, State: record.State,
-		ParentRunID: record.ParentRunID, ParentOperationID: record.ParentOperationID,
-		Result: cloneRunResult(record.Result), Error: record.Error,
-		ErrorKind: record.ErrorKind, ErrorStopReason: record.ErrorStopReason,
-		ErrorRawReason:  record.ErrorRawReason,
-		AttentionReason: record.AttentionReason,
-		AttentionKind:   record.AttentionKind,
-		UnknownAttempts: record.UnknownAttempts,
-		Tree:            record.Tree,
-		HookResults:     append([]RunHookResult(nil), record.HookResults...),
-		ToolBatches:     cloneToolBatchSnapshots(record.ToolBatches),
-		Waits:           append([]WaitSnapshot(nil), record.Waits...),
+	snapshot := RunSnapshot{
+		RunID: record.RunID, Definition: DefinitionRef{ID: record.DefinitionID, Revision: record.DefinitionRevision},
+		State: record.State, Result: cloneRunResult(record.Result),
+		Accounting:  RunAccounting{UnknownAttempts: record.UnknownAttempts, Tree: record.Tree},
+		Hooks:       append([]RunHookResult(nil), record.HookResults...),
+		ToolBatches: cloneToolBatchSnapshots(record.ToolBatches),
+		Waits:       append([]WaitSnapshot(nil), record.Waits...),
 	}
+	if record.ParentRunID != "" {
+		snapshot.Parent = &ParentRef{RunID: record.ParentRunID, OperationID: record.ParentOperationID}
+	}
+	if record.ConversationID != "" {
+		snapshot.Conversation = &ConversationRef{Scope: record.ConversationScope, ID: record.ConversationID}
+	}
+	snapshot.Failure = failureFromRecord(record)
+	if record.State == RuntimeNeedsAttention {
+		snapshot.Attention = &RunAttention{Kind: AttentionKind(record.AttentionKind), Reason: record.AttentionReason}
+		if snapshot.Attention.Kind == AttentionChild {
+			// The persisted reason names the blocking child. Match it against a
+			// pending child wait, rather than trusting an arbitrary string as an ID.
+			for _, wait := range snapshot.Waits {
+				if wait.Kind == WaitChild && wait.State == WaitPending && wait.ChildRunID != "" &&
+					strings.HasPrefix(record.AttentionReason, "durable child "+wait.ChildRunID+" requires attention: ") {
+					snapshot.Attention.BlockingRunID = wait.ChildRunID
+					break
+				}
+			}
+		}
+	}
+	return snapshot
+}
+
+func failureFromRecord(record storedRuntimeRun) *RunFailure {
+	if record.Error == "" && record.ErrorKind == "" {
+		return nil
+	}
+	return &RunFailure{Message: record.Error, Kind: FailureKind(record.ErrorKind), StopReason: record.ErrorStopReason, RawReason: record.ErrorRawReason}
 }
 
 func snapshotError(snapshot RunSnapshot) error {
-	if snapshot.Error == "" {
+	failure := snapshot.Failure
+	if failure == nil || failure.Message == "" {
 		return nil
 	}
-	switch snapshot.ErrorKind {
-	case "deadline":
+	switch failure.Kind {
+	case FailureDeadline:
 		return context.DeadlineExceeded
-	case "cancelled":
+	case FailureCancelled:
 		return context.Canceled
-	case "max_steps":
-		return fmt.Errorf("%s: %w", snapshot.Error, ErrMaxStepsExceeded)
-	case "max_steps_invalid_structured_output":
-		return fmt.Errorf("%s: %w", snapshot.Error, errors.Join(ErrMaxStepsExceeded, ErrInvalidStructuredOutput))
-	case "invalid_max_steps":
-		return fmt.Errorf("%s: %w", snapshot.Error, ErrInvalidMaxSteps)
-	case "empty_response":
-		return fmt.Errorf("%s: %w", snapshot.Error, ErrEmptyResponse)
-	case "invalid_structured_output":
-		return fmt.Errorf("%s: %w", snapshot.Error, ErrInvalidStructuredOutput)
-	case "completion":
-		return &CompletionError{Reason: snapshot.ErrorStopReason, RawReason: snapshot.ErrorRawReason}
+	case FailureMaxSteps:
+		return fmt.Errorf("%s: %w", failure.Message, ErrMaxStepsExceeded)
+	case FailureMaxStepsInvalidStructuredOutput:
+		return fmt.Errorf("%s: %w", failure.Message, errors.Join(ErrMaxStepsExceeded, ErrInvalidStructuredOutput))
+	case FailureInvalidMaxSteps:
+		return fmt.Errorf("%s: %w", failure.Message, ErrInvalidMaxSteps)
+	case FailureEmptyResponse:
+		return fmt.Errorf("%s: %w", failure.Message, ErrEmptyResponse)
+	case FailureInvalidStructuredOutput:
+		return fmt.Errorf("%s: %w", failure.Message, ErrInvalidStructuredOutput)
+	case FailureCompletion:
+		return &CompletionError{Reason: failure.StopReason, RawReason: failure.RawReason}
 	}
 	if snapshot.Result.Status == RunCancelled {
 		return context.Canceled
 	}
-	return errors.New(snapshot.Error)
+	return errors.New(failure.Message)
 }

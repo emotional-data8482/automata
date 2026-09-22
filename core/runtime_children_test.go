@@ -815,9 +815,9 @@ func TestRuntimeDurableChildAttentionBlocksParentAndLaterUnblocks(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if snapshot.State != RuntimeNeedsAttention || snapshot.AttentionKind != "child" ||
-		!strings.Contains(snapshot.AttentionReason, childResult.RunID) {
-		t.Fatalf("parent snapshot = %s kind %q reason %q", snapshot.State, snapshot.AttentionKind, snapshot.AttentionReason)
+	if snapshot.State != RuntimeNeedsAttention || snapshot.Attention == nil || snapshot.Attention.Kind != AttentionChild ||
+		snapshot.Attention.BlockingRunID != childResult.RunID {
+		t.Fatalf("parent snapshot = %s attention %#v", snapshot.State, snapshot.Attention)
 	}
 	if _, err := runtime.Handle(parentID).Await(context.Background()); !errors.Is(err, ErrRunNeedsAttention) {
 		t.Fatalf("Await = %v, want ErrRunNeedsAttention", err)
@@ -846,7 +846,7 @@ func TestRuntimeDurableChildAttentionBlocksParentAndLaterUnblocks(t *testing.T) 
 		t.Fatalf("Await after child settlement: %v", err)
 	}
 	if final, _ := runtime.Handle(parentID).Snapshot(context.Background()); final.State != RuntimeTerminal ||
-		final.AttentionKind != "" || final.ToolBatches[0].Invocations[0].Result.Text() != "child done" {
+		final.Attention != nil || final.ToolBatches[0].Invocations[0].Result.Text() != "child done" {
 		t.Fatalf("parent final = %#v", final)
 	}
 	_ = final
@@ -903,8 +903,8 @@ func TestRuntimeDurableChildCancellationPropagatesToRunningChild(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if final.State != RuntimeTerminal || final.Result.Status != RunCancelled || final.Tree.Unsettled != 0 {
-		t.Fatalf("parent after child settled = %s %s unsettled %d", final.State, final.Result.Status, final.Tree.Unsettled)
+	if final.State != RuntimeTerminal || final.Result.Status != RunCancelled || final.Accounting.Tree.Unsettled != 0 {
+		t.Fatalf("parent after child settled = %s %s unsettled %d", final.State, final.Result.Status, final.Accounting.Tree.Unsettled)
 	}
 }
 
@@ -970,8 +970,8 @@ func TestRuntimeDurableCanceledParentBlocksNoncooperativeChildDispatch(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	if snapshot.State != RuntimeTerminal || snapshot.Result.Status != RunCancelled || snapshot.Tree.Unsettled != 1 {
-		t.Fatalf("parent = %s %s unsettled %d; want canceled with one unsettled child", snapshot.State, snapshot.Result.Status, snapshot.Tree.Unsettled)
+	if snapshot.State != RuntimeTerminal || snapshot.Result.Status != RunCancelled || snapshot.Accounting.Tree.Unsettled != 1 {
+		t.Fatalf("parent = %s %s unsettled %d; want canceled with one unsettled child", snapshot.State, snapshot.Result.Status, snapshot.Accounting.Tree.Unsettled)
 	}
 	childID := snapshot.ToolBatches[0].Invocations[0].ChildRunID
 	childRecord, err := runtimeRecord(runtime, childID)
@@ -994,8 +994,8 @@ func TestRuntimeDurableCanceledParentBlocksNoncooperativeChildDispatch(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	if final.State != RuntimeTerminal || final.Result.Status != RunCancelled || final.Tree.Unsettled != 0 {
-		t.Fatalf("parent after child settled = %s %s unsettled %d", final.State, final.Result.Status, final.Tree.Unsettled)
+	if final.State != RuntimeTerminal || final.Result.Status != RunCancelled || final.Accounting.Tree.Unsettled != 0 {
+		t.Fatalf("parent after child settled = %s %s unsettled %d", final.State, final.Result.Status, final.Accounting.Tree.Unsettled)
 	}
 }
 
@@ -1091,8 +1091,8 @@ func TestRuntimeDurableCancellationPersistsForSuspendedAndStoppedDescendants(t *
 	if err != nil {
 		t.Fatal(err)
 	}
-	if final.Tree.Unsettled != 0 || final.Result.Status != RunCancelled {
-		t.Fatalf("parent = %s unsettled %d", final.Result.Status, final.Tree.Unsettled)
+	if final.Accounting.Tree.Unsettled != 0 || final.Result.Status != RunCancelled {
+		t.Fatalf("parent = %s unsettled %d", final.Result.Status, final.Accounting.Tree.Unsettled)
 	}
 }
 
@@ -1138,8 +1138,8 @@ func TestRuntimeDurableCanceledChildWakesParentAfterDescendantSettles(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	if blocked.State != RuntimeNeedsAttention || blocked.AttentionKind != "child" {
-		t.Fatalf("parent = %s %q, want child attention while the descendant is unsettled", blocked.State, blocked.AttentionKind)
+	if blocked.State != RuntimeNeedsAttention || blocked.Attention == nil || blocked.Attention.Kind != AttentionChild {
+		t.Fatalf("parent = %s %#v, want child attention while the descendant is unsettled", blocked.State, blocked.Attention)
 	}
 
 	grandchildProvider.unblock()
@@ -1159,8 +1159,8 @@ func TestRuntimeDurableCanceledChildWakesParentAfterDescendantSettles(t *testing
 	if !projection.IsError || !strings.Contains(projection.Text(), "did not complete") {
 		t.Fatalf("canceled child projection = %#v", projection)
 	}
-	if final.Tree.Unsettled != 0 {
-		t.Fatalf("unsettled descendants = %d", final.Tree.Unsettled)
+	if final.Accounting.Tree.Unsettled != 0 {
+		t.Fatalf("unsettled descendants = %d", final.Accounting.Tree.Unsettled)
 	}
 }
 
@@ -1209,8 +1209,8 @@ func TestRuntimeDurableReconcilingTerminalChildWakesParent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if blocked.State != RuntimeNeedsAttention || blocked.AttentionKind != "child" {
-		t.Fatalf("parent = %s %q, want child attention for the uncertain effect", blocked.State, blocked.AttentionKind)
+	if blocked.State != RuntimeNeedsAttention || blocked.Attention == nil || blocked.Attention.Kind != AttentionChild {
+		t.Fatalf("parent = %s %#v, want child attention for the uncertain effect", blocked.State, blocked.Attention)
 	}
 	if err := runtime.Handle(childID).Reconcile(context.Background(), operationID, EffectResolution{
 		Result: TextResult("verified"), Effect: EffectReport{Status: EffectApplied, Receipt: "write-1"},
@@ -1274,8 +1274,8 @@ func TestRuntimeDurableWaitingDeadlinePropagatesToSuspendedDescendants(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	if child.State != RuntimeTerminal || child.ErrorKind != "deadline" || child.Waits[0].State != WaitCancelled {
-		t.Fatalf("child = %s %q wait %s, want deadline-finalized", child.State, child.ErrorKind, child.Waits[0].State)
+	if child.State != RuntimeTerminal || child.Failure == nil || child.Failure.Kind != FailureDeadline || child.Waits[0].State != WaitCancelled {
+		t.Fatalf("child = %s %#v wait %s, want deadline-finalized", child.State, child.Failure, child.Waits[0].State)
 	}
 }
 
@@ -2043,8 +2043,8 @@ func TestRuntimeDurableReservationStoreErrorIsNotBudgetDenial(t *testing.T) {
 	if len(childSnapshot.ToolBatches) != 0 {
 		t.Fatalf("child committed a batch despite the storage failure: %#v", childSnapshot.ToolBatches)
 	}
-	if !strings.Contains(childSnapshot.AttentionReason, "injected ancestor read failure") {
-		t.Fatalf("child attention = %q", childSnapshot.AttentionReason)
+	if childSnapshot.Attention == nil || !strings.Contains(childSnapshot.Attention.Reason, "injected ancestor read failure") {
+		t.Fatalf("child attention = %#v", childSnapshot.Attention)
 	}
 	if got := extraCalls.Load(); got != 0 {
 		t.Fatalf("extra calls = %d, want 0", got)
@@ -2115,8 +2115,8 @@ func TestRuntimeDurableTreeAccountingCountsEachRunOnce(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if snapshot.Tree != want {
-			t.Fatalf("%s: parent tree = %#v, want %#v", label, snapshot.Tree, want)
+		if snapshot.Accounting.Tree != want {
+			t.Fatalf("%s: parent tree = %#v, want %#v", label, snapshot.Accounting.Tree, want)
 		}
 		if snapshot.Result.Usage != result.Usage {
 			t.Fatalf("%s: parent local usage changed to %#v", label, snapshot.Result.Usage)
@@ -2133,8 +2133,8 @@ func TestRuntimeDurableTreeAccountingCountsEachRunOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if childSnapshot.Tree != (TreeAccounting{Runs: 2, Usage: Usage{InputTokens: 140, OutputTokens: 5}, ProviderAttempts: 3}) {
-		t.Fatalf("child tree = %#v", childSnapshot.Tree)
+	if childSnapshot.Accounting.Tree != (TreeAccounting{Runs: 2, Usage: Usage{InputTokens: 140, OutputTokens: 5}, ProviderAttempts: 3}) {
+		t.Fatalf("child tree = %#v", childSnapshot.Accounting.Tree)
 	}
 	if childSnapshot.Result.Usage != (Usage{InputTokens: 40, OutputTokens: 4}) {
 		t.Fatalf("child local usage = %#v", childSnapshot.Result.Usage)
@@ -2220,8 +2220,8 @@ func TestRuntimeRecoveryRecordsUnknownProviderAttemptOnce(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if snapshot.UnknownAttempts != wantUnknown || snapshot.Tree.UnknownAttempts != wantUnknown {
-			t.Fatalf("%s: unknown attempts = %d (tree %d), want %d", runID, snapshot.UnknownAttempts, snapshot.Tree.UnknownAttempts, wantUnknown)
+		if snapshot.Accounting.UnknownAttempts != wantUnknown || snapshot.Accounting.Tree.UnknownAttempts != wantUnknown {
+			t.Fatalf("%s: unknown attempts = %d (tree %d), want %d", runID, snapshot.Accounting.UnknownAttempts, snapshot.Accounting.Tree.UnknownAttempts, wantUnknown)
 		}
 		// The unknown attempt contributes no invented usage.
 		if result.Usage.InputTokens != 5 {
@@ -2320,15 +2320,15 @@ func TestRuntimeDurableSharedDeadlineFinalizesWokenParent(t *testing.T) {
 		t.Fatal(err)
 	}
 	snapshot := waitForRunState(t, runtime, handle.ID(), RuntimeTerminal)
-	if snapshot.ErrorKind != "deadline" || snapshot.Result.Status != RunCancelled {
-		t.Fatalf("parent = %s kind %q", snapshot.Result.Status, snapshot.ErrorKind)
+	if snapshot.Failure == nil || snapshot.Failure.Kind != FailureDeadline || snapshot.Result.Status != RunCancelled {
+		t.Fatalf("parent = %s failure %#v", snapshot.Result.Status, snapshot.Failure)
 	}
 	child, err := runtime.Handle(snapshot.ToolBatches[0].Invocations[0].ChildRunID).Snapshot(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if child.State != RuntimeTerminal || child.ErrorKind != "deadline" {
-		t.Fatalf("child = %s kind %q", child.State, child.ErrorKind)
+	if child.State != RuntimeTerminal || child.Failure == nil || child.Failure.Kind != FailureDeadline {
+		t.Fatalf("child = %s failure %#v", child.State, child.Failure)
 	}
 }
 
@@ -2372,8 +2372,8 @@ func TestRuntimeDurableChildAttentionParentHonorsDeadline(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if snapshot.State != RuntimeTerminal || snapshot.ErrorKind != kind {
-			t.Fatalf("run %s = %s kind %q, want terminal %s", runID, snapshot.State, snapshot.ErrorKind, kind)
+		if snapshot.State != RuntimeTerminal || snapshot.Failure == nil || snapshot.Failure.Kind != FailureKind(kind) {
+			t.Fatalf("run %s = %s failure %#v, want terminal %s", runID, snapshot.State, snapshot.Failure, kind)
 		}
 	}
 }
@@ -2466,8 +2466,8 @@ func TestRuntimeDurableChildAttentionClearsWhenSiblingsRemainPending(t *testing.
 	if err := runtime.markAttention(context.Background(), first, firstRecord.Generation, "stuck"); err != nil {
 		t.Fatal(err)
 	}
-	if blocked := waitForRunState(t, runtime, handle.ID(), RuntimeNeedsAttention); blocked.AttentionKind != "child" {
-		t.Fatalf("parent attention kind = %q", blocked.AttentionKind)
+	if blocked := waitForRunState(t, runtime, handle.ID(), RuntimeNeedsAttention); blocked.Attention == nil || blocked.Attention.Kind != AttentionChild {
+		t.Fatalf("parent attention = %#v", blocked.Attention)
 	}
 	if err := runtime.Handle(first).Cancel(context.Background()); err != nil {
 		t.Fatal(err)
@@ -2721,11 +2721,11 @@ func TestRuntimeAcknowledgeHooksCompletesChildAndWakesParent(t *testing.T) {
 	if err := runtime.Recover(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if child := waitForRunState(t, runtime, childResult.RunID, RuntimeNeedsAttention); child.AttentionKind != "hooks" {
-		t.Fatalf("child attention kind = %q", child.AttentionKind)
+	if child := waitForRunState(t, runtime, childResult.RunID, RuntimeNeedsAttention); child.Attention == nil || child.Attention.Kind != AttentionHooks {
+		t.Fatalf("child attention = %#v", child.Attention)
 	}
-	if blocked := waitForRunState(t, runtime, parentID, RuntimeNeedsAttention); blocked.AttentionKind != "child" {
-		t.Fatalf("parent attention kind = %q", blocked.AttentionKind)
+	if blocked := waitForRunState(t, runtime, parentID, RuntimeNeedsAttention); blocked.Attention == nil || blocked.Attention.Kind != AttentionChild {
+		t.Fatalf("parent attention = %#v", blocked.Attention)
 	}
 	if err := runtime.Handle(parentID).AcknowledgeHooks(context.Background()); err == nil {
 		t.Fatal("acknowledged hooks on a run that is not awaiting them")
@@ -2744,8 +2744,8 @@ func TestRuntimeAcknowledgeHooksCompletesChildAndWakesParent(t *testing.T) {
 	if child.State != RuntimeTerminal || child.Result.Status != RunCompleted || child.Result.Output != "child done" {
 		t.Fatalf("acknowledged child = %s %s %q", child.State, child.Result.Status, child.Result.Output)
 	}
-	if len(child.HookResults) != 1 || child.HookResults[0].Name != "audit" || !child.HookResults[0].Unknown || child.HookResults[0].Error == "" {
-		t.Fatalf("hook results = %#v, want one unknown audit delivery", child.HookResults)
+	if len(child.Hooks) != 1 || child.Hooks[0].Name != "audit" || !child.Hooks[0].Unknown || child.Hooks[0].Error == "" {
+		t.Fatalf("hook results = %#v, want one unknown audit delivery", child.Hooks)
 	}
 	waitForRunState(t, runtime, parentID, RuntimeTerminal)
 	parentSnapshot, err := runtime.Handle(parentID).Snapshot(context.Background())
