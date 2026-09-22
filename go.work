@@ -5,6 +5,7 @@ use (
 	./extensions/sqlite
 	./examples/claude
 	./examples/deep_research
+	./examples/durable_typed
 	./examples/openai
 	./examples/typed_agents
 	./extensions/claude
