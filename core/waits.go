@@ -16,6 +16,11 @@ type WaitKind string
 const (
 	WaitQuestion WaitKind = "question"
 	WaitApproval WaitKind = "approval"
+
+	// WaitChild is the internal wait a Runtime run holds while an admitted
+	// durable child run is pending. It is never created by host-facing
+	// WithDurableWait policies and is resolved only by child completion.
+	WaitChild WaitKind = "child"
 )
 
 // WaitState is the durable state of a question or approval.
@@ -160,10 +165,14 @@ type WaitSnapshot struct {
 	ActionDigest       string
 	DefinitionRevision string
 	PolicyContext      string
-	ExpiresAt          time.Time
-	Resolution         WaitResolution
-	CreatedAt          time.Time
-	ResolvedAt         time.Time
+	// ChildRunID is set on internal child waits and links the suspended
+	// invocation to its admitted child run. It is empty on question and
+	// approval waits.
+	ChildRunID string
+	ExpiresAt  time.Time
+	Resolution WaitResolution
+	CreatedAt  time.Time
+	ResolvedAt time.Time
 }
 
 type storedWait struct {
@@ -182,6 +191,7 @@ type storedWait struct {
 	ActionDigest       string          `json:"action_digest,omitempty"`
 	DefinitionID       string          `json:"definition_id"`
 	DefinitionRevision string          `json:"definition_revision"`
+	ChildRunID         string          `json:"child_run_id,omitempty"`
 	PolicyContext      string          `json:"policy_context,omitempty"`
 	ExpiresAt          time.Time       `json:"expires_at,omitzero"`
 	Resolution         WaitResolution  `json:"resolution,omitzero"`
@@ -223,7 +233,7 @@ func waitSnapshot(wait storedWait) WaitSnapshot {
 		ID: wait.ID, Kind: wait.Kind, State: wait.State, OperationID: wait.OperationID,
 		Tool: wait.Tool, Arguments: append(json.RawMessage(nil), wait.Arguments...), Prompt: wait.Prompt,
 		Target: wait.Target, ActionDigest: wait.ActionDigest, DefinitionRevision: wait.DefinitionRevision,
-		PolicyContext: wait.PolicyContext, ExpiresAt: wait.ExpiresAt,
+		PolicyContext: wait.PolicyContext, ChildRunID: wait.ChildRunID, ExpiresAt: wait.ExpiresAt,
 		Resolution: cloneWaitResolution(wait.Resolution), CreatedAt: wait.CreatedAt, ResolvedAt: wait.ResolvedAt,
 	}
 }

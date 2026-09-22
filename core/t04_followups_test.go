@@ -65,8 +65,10 @@ func TestRuntimeRecoveryNeverRepeatsUncertainCommittedHook(t *testing.T) {
 		deliveries.Add(1)
 		return nil
 	}}}
+	// Write 7 commits the hook-delivery marker; write 8 records the delivered
+	// outcome and is the fault that leaves delivery uncertain.
 	runtime, err := NewRuntime(context.Background(), RuntimeConfig{
-		Store: &failWritableTransactionStore{Store: noCloseStore{Store: base}, failAt: 7}, Hooks: hooks,
+		Store: &failWritableTransactionStore{Store: noCloseStore{Store: base}, failAt: 8}, Hooks: hooks,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -290,5 +292,52 @@ func TestRuntimeFatalBatchEmitsQueuedCancellationResult(t *testing.T) {
 	}, SubmitOptions{})
 	if err == nil || queuedExecutions.Load() != 0 || len(resultIDs) != 2 || resultIDs[0] != "fatal" || resultIDs[1] != "queued" {
 		t.Fatalf("result IDs=%v queued executions=%d err=%v", resultIDs, queuedExecutions.Load(), err)
+	}
+}
+
+// A fault on the hook-delivery marker leaves no hook invoked, so recovery
+// delivers each hook exactly once and commits the terminal result.
+func TestRuntimeRecoveryDeliversHookNeverStarted(t *testing.T) {
+	base := &memoryStore{buckets: make(map[string]map[string][]byte)}
+	var deliveries atomic.Int32
+	hooks := []CommittedRunHook{{Name: "effect", Handle: func(context.Context, RunSnapshot) error {
+		deliveries.Add(1)
+		return nil
+	}}}
+	runtime, err := NewRuntime(context.Background(), RuntimeConfig{
+		Store: &failWritableTransactionStore{Store: noCloseStore{Store: base}, failAt: 7}, Hooks: hooks,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	agent := testAgent(&countingRuntimeProvider{})
+	if err := runtime.Register("agent", "v1", agent); err != nil {
+		t.Fatal(err)
+	}
+	result, err := runtime.Run(context.Background(), "agent", "v1", "work", SubmitOptions{})
+	if err == nil || deliveries.Load() != 0 {
+		t.Fatalf("marker fault = %v, deliveries %d", err, deliveries.Load())
+	}
+	_ = runtime.Close()
+
+	reopened, err := NewRuntime(context.Background(), RuntimeConfig{Store: noCloseStore{Store: base}, Hooks: hooks})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if err := reopened.Register("agent", "v1", agent); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if err := reopened.Recover(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	snapshot, err := reopened.Handle(result.RunID).Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deliveries.Load() != 1 || snapshot.State != RuntimeTerminal || snapshot.Result.Output != "done" || len(snapshot.HookResults) != 1 {
+		t.Fatalf("hook deliveries=%d snapshot=%#v", deliveries.Load(), snapshot)
 	}
 }

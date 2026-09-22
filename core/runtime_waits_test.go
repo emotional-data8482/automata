@@ -49,7 +49,7 @@ func TestDurableWaitEncodingIsStable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const want = `{"version":6,"run_id":"run-1","id":"wait-1","kind":"approval","state":"pending","operation_id":"op-1","batch_id":"batch-1","ordinal":2,"tool":"write","arguments":{"path":"a"},"target":"a","action_digest":"digest","definition_id":"agent","definition_revision":"v1","policy_context":"policy-v2","created_at":"2026-01-02T03:04:05Z"}`
+	const want = `{"version":7,"run_id":"run-1","id":"wait-1","kind":"approval","state":"pending","operation_id":"op-1","batch_id":"batch-1","ordinal":2,"tool":"write","arguments":{"path":"a"},"target":"a","action_digest":"digest","definition_id":"agent","definition_revision":"v1","policy_context":"policy-v2","created_at":"2026-01-02T03:04:05Z"}`
 	if string(data) != want {
 		t.Fatalf("wait encoding drifted:\n got %s\nwant %s", data, want)
 	}

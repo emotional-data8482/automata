@@ -40,6 +40,17 @@ func (l *loop) executeToolBatch(
 		if _, known := l.toolsByName[call.Name]; known {
 			var err error
 			usage, err = policy.reserve(call.Name)
+			if err != nil && !errors.Is(err, ErrToolBudgetExhausted) {
+				// A durable reservation that could not be recorded (storage,
+				// cancellation) fails this run; it is never a budget denial.
+				// Every call still receives exactly one result.
+				for j := range results {
+					if len(results[j].Blocks) == 0 {
+						results[j] = ToolResultMessage(calls[j].ID, "not executed: tool reservation failed", true)
+					}
+				}
+				return results, err
+			}
 			if err != nil {
 				results[i] = l.policyDeniedToolResult(ctx, call, usage, err)
 				continue

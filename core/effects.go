@@ -173,6 +173,9 @@ type ToolInvocationSnapshot struct {
 	Error       string
 	GuardKey    string
 	WaitID      string
+	// ChildRunID links a durable child invocation to its admitted child run.
+	// It is empty for ordinary tool invocations.
+	ChildRunID string
 }
 
 // ToolBatchSnapshot describes one durable model tool-request batch.

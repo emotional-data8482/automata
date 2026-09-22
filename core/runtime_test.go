@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"reflect"
 	"strings"
@@ -10,6 +11,18 @@ import (
 	"testing"
 	"time"
 )
+
+// repeatingChildProvider answers every provider turn with a fixed child
+// response, so several concurrent durable child runs of one definition can
+// each complete independently.
+type repeatingChildProvider struct {
+	calls atomic.Int32
+}
+
+func (p *repeatingChildProvider) Invoke(context.Context, Request) (Response, error) {
+	p.calls.Add(1)
+	return fixtureResponse(asstText("child done")), nil
+}
 
 func TestRuntimeRequiresExplicitStore(t *testing.T) {
 	if _, err := NewRuntime(context.Background(), RuntimeConfig{}); err == nil {
@@ -95,51 +108,118 @@ func TestRuntimeCompletedAdmissionRetryReturnsStoredResult(t *testing.T) {
 	}
 }
 
-func TestRuntimeRunSharesToolBudgetWithConcurrentChildren(t *testing.T) {
-	child := testAgent(nestedBudgetProvider{})
-	var leafCalls atomic.Int64
-	child.RegisterTool(Func("leaf", "nested work", func(context.Context, struct{}) (string, error) {
-		leafCalls.Add(1)
-		return "leaf done", nil
-	}))
-
+// Durable children are ordinary durable runs: the parent suspends on a
+// persisted child wait while its children execute, and consumes each
+// completion exactly once. The parent's subtree cap is pinned at admission and
+// each child invocation reserves against it atomically with batch creation.
+func TestRuntimeDurableChildConcurrentSiblingsComplete(t *testing.T) {
+	childProvider := &repeatingChildProvider{}
+	child := testAgent(childProvider)
+	childDefinition := ToolDefinition{
+		Name:        "child",
+		Description: "delegate to a durable child",
+		InputSchema: json.RawMessage(`{"type":"object","properties":{"topic":{"type":"string"}},"required":["topic"]}`),
+	}
 	parent := testAgent(&scriptedProvider{turns: []Message{
-		AssistantMessage(toolUse("sub-1", "child", `{}`), toolUse("sub-2", "child", `{}`)),
+		AssistantMessage(toolUse("sub-1", "child", `{"topic":"a"}`), toolUse("sub-2", "child", `{"topic":"b"}`)),
 		asstText("parent done"),
-	}}).WithToolPolicy(ToolPolicy{MaxCalls: 3})
-	parent.RegisterTool(AsTool[struct{}](child, "child", "delegate"))
+	}})
+	parent.RegisterTool(DurableChildTool(childDefinition, DurableChildPolicy{DefinitionID: "child", Revision: "v1"}))
+	parent.WithToolPolicy(ToolPolicy{MaxCalls: 2})
 
 	runtime := newTestRuntime(t)
+	if err := runtime.Register("child", "v1", child); err != nil {
+		t.Fatal(err)
+	}
 	if err := runtime.Register("parent", "v1", parent); err != nil {
 		t.Fatal(err)
 	}
-	result, err := runtime.Run(context.Background(), "parent", "v1", "go", SubmitOptions{})
+	handle, err := runtime.Submit(context.Background(), "parent", "v1", "go", SubmitOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := handle.Await(context.Background())
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	if result.Output != "parent done" {
 		t.Errorf("output = %q", result.Output)
 	}
-	if got := leafCalls.Load(); got != 1 {
-		t.Fatalf("nested leaf calls = %d, want 1", got)
+	if got := childProvider.calls.Load(); got != 2 {
+		t.Fatalf("child provider calls = %d, want 2", got)
+	}
+	// The two concurrent sibling child invocations reserved the parent's
+	// pinned subtree cap atomically with batch creation.
+	parentRecord, err := runtimeRecord(runtime, handle.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parentRecord.ToolBudget.TotalCap != 2 || parentRecord.ToolBudget.Total != 2 {
+		t.Fatalf("parent tool budget = %#v, want cap 2 used 2", parentRecord.ToolBudget)
+	}
+	snapshot, err := handle.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.ToolBatches) != 1 || len(snapshot.ToolBatches[0].Invocations) != 2 {
+		t.Fatalf("parent batch = %#v", snapshot.ToolBatches)
+	}
+	childIDs := map[string]bool{}
+	for i, invocation := range snapshot.ToolBatches[0].Invocations {
+		if invocation.ChildRunID == "" {
+			t.Fatalf("invocation %d has no child run id", i)
+		}
+		if childIDs[invocation.ChildRunID] {
+			t.Fatalf("duplicate child run id %q across siblings", invocation.ChildRunID)
+		}
+		childIDs[invocation.ChildRunID] = true
+		child, err := runtime.Handle(invocation.ChildRunID).Snapshot(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if child.State != RuntimeTerminal || child.Result.Output != "child done" {
+			t.Fatalf("child %s = %s %q", invocation.ChildRunID, child.State, child.Result.Output)
+		}
+		if child.ParentRunID != handle.ID() || child.ParentOperationID != invocation.OperationID {
+			t.Fatalf("child %s parentage = %q/%q", invocation.ChildRunID, child.ParentRunID, child.ParentOperationID)
+		}
+	}
+	// Canonical transcript keeps the child projections in model order.
+	results := snapshot.Result.Messages
+	if len(results) < 4 {
+		t.Fatalf("parent transcript = %#v", results)
+	}
+	for i, callID := range []string{"sub-1", "sub-2"} {
+		blocks := results[2+i].Blocks
+		if len(blocks) != 1 {
+			t.Fatalf("tool result %d = %#v", i, blocks)
+		}
+		resultBlock, ok := blocks[0].(ToolResultBlock)
+		if !ok || resultBlock.ToolUseID != callID {
+			t.Fatalf("transcript result %d = %#v", i, blocks)
+		}
+		if resultBlock.IsError || resultBlock.Content[0].(TextBlock).Text != "child done" {
+			t.Fatalf("child projection %d = %#v", i, blocks)
+		}
 	}
 }
 
-func TestRuntimeRunStreamSharesToolBudgetAndKeepsChildIdentity(t *testing.T) {
-	child := testAgent(nestedBudgetProvider{})
-	var leafCalls atomic.Int64
-	child.RegisterTool(Func("leaf", "nested work", func(context.Context, struct{}) (string, error) {
-		leafCalls.Add(1)
-		return "unexpected", nil
-	}))
-
+// The denied sibling keeps its identity as a recoverable, not-applied result:
+// no second child run is admitted and the parent's pinned cap is charged only
+// by the admitted sibling.
+func TestRuntimeDurableChildBudgetDeniedSiblingKeepsIdentity(t *testing.T) {
+	childProvider := &repeatingChildProvider{}
+	child := testAgent(childProvider)
 	parent := testAgent(&scriptedProvider{turns: []Message{
-		asstTool("sub-1", "child", `{}`),
+		AssistantMessage(toolUse("sub-1", "child", `{"topic":"a"}`), toolUse("sub-2", "child", `{"topic":"b"}`)),
 		asstText("parent done"),
 	}}).WithToolPolicy(ToolPolicy{MaxCalls: 1})
-	parent.RegisterTool(AsTool[struct{}](child, "child", "delegate"))
+	parent.RegisterTool(DurableChildTool(childTestDefinition("child"), DurableChildPolicy{DefinitionID: "child", Revision: "v1"}))
 
 	runtime := newTestRuntime(t)
+	if err := runtime.Register("child", "v1", child); err != nil {
+		t.Fatal(err)
+	}
 	if err := runtime.Register("parent", "v1", parent); err != nil {
 		t.Fatal(err)
 	}
@@ -155,11 +235,52 @@ func TestRuntimeRunStreamSharesToolBudgetAndKeepsChildIdentity(t *testing.T) {
 	if result.Output != "parent done" {
 		t.Errorf("output = %q", result.Output)
 	}
-	if got := leafCalls.Load(); got != 0 {
-		t.Fatalf("leaf executed %d times, want 0", got)
+	if got := childProvider.calls.Load(); got != 1 {
+		t.Fatalf("child provider calls = %d, want 1", got)
 	}
-	if budgetEvent.Agent != "child" || budgetEvent.InvocationID != "sub-1" {
-		t.Errorf("nested budget tags = agent %q invocation %q", budgetEvent.Agent, budgetEvent.InvocationID)
+	if budgetEvent.ToolCall.Name != "child" || budgetEvent.ToolCall.ID != "sub-2" {
+		t.Errorf("budget event = %#v", budgetEvent)
+	}
+	handle := runtime.Handle(result.RunID)
+	snapshot, err := handle.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	batch := snapshot.ToolBatches[0]
+	if batch.Invocations[1].Effect.Status != EffectNotApplied || batch.Invocations[1].State != ToolInvocationCompleted {
+		t.Fatalf("denied sibling = %#v", batch.Invocations[1])
+	}
+	childID := batch.Invocations[0].ChildRunID
+	if batch.Invocations[1].ChildRunID != "" {
+		t.Fatalf("denied sibling admitted a child run: %#v", batch.Invocations[1])
+	}
+	childSnapshot, err := runtime.Handle(childID).Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if childSnapshot.ParentRunID != result.RunID || childSnapshot.State != RuntimeTerminal {
+		t.Fatalf("child %s = %s parent %q", childID, childSnapshot.State, childSnapshot.ParentRunID)
+	}
+	// Exactly one child run and link exist; the denied reservation produced no
+	// second admission, and the parent's cap records one used reservation.
+	parentRecord, err := runtimeRecord(runtime, result.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parentRecord.ToolBudget.TotalCap != 1 || parentRecord.ToolBudget.Total != 1 {
+		t.Fatalf("parent tool budget = %#v, want cap 1 used 1", parentRecord.ToolBudget)
+	}
+	var runCount, linkCount int
+	if err := runtime.transaction(context.Background(), false, func(tx StoreTransaction) error {
+		if err := tx.Scan(runtimeRunsBucket, "", func(string, []byte) error { runCount++; return nil }); err != nil {
+			return err
+		}
+		return tx.Scan(runtimeChildLinksBucket, "", func(string, []byte) error { linkCount++; return nil })
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if runCount != 2 || linkCount != 1 {
+		t.Fatalf("runs = %d links = %d, want 2/1", runCount, linkCount)
 	}
 }
 
@@ -830,15 +951,25 @@ func TestRuntimeRecoverUsesPinnedBindingAndConservativeAttention(t *testing.T) {
 	if err != nil || result.Output != "late binding" {
 		t.Fatalf("late-bound result = %#v, %v", result, err)
 	}
-	finalizing := storedRuntimeRun{
-		Version: runtimeEncodingVersion, RunID: "hook-uncertain", DefinitionID: "agent",
-		DefinitionRevision: "v2", Task: "work", State: RuntimeFinalizing,
-		Generation: 1, Result: RunResult{RunID: "hook-uncertain", Status: RunCompleted, Output: "done"},
-	}
-	if err := store.Transaction(context.Background(), true, func(tx StoreTransaction) error {
-		return putRuntimeRun(tx, finalizing)
-	}); err != nil {
-		t.Fatal(err)
+	// Hook delivery had started, so its outcome is unknown: attention. A
+	// committed result whose delivery never started finishes instead.
+	for _, finalizing := range []storedRuntimeRun{
+		{
+			Version: runtimeEncodingVersion, RunID: "hook-uncertain", DefinitionID: "agent",
+			DefinitionRevision: "v2", Task: "work", State: RuntimeFinalizing, HookDelivery: []string{"audit"},
+			Generation: 1, Result: RunResult{RunID: "hook-uncertain", Status: RunCompleted, Output: "done"},
+		},
+		{
+			Version: runtimeEncodingVersion, RunID: "hook-unstarted", DefinitionID: "agent",
+			DefinitionRevision: "v2", Task: "work", State: RuntimeFinalizing,
+			Generation: 1, Result: RunResult{RunID: "hook-unstarted", Status: RunCompleted, Output: "done"},
+		},
+	} {
+		if err := store.Transaction(context.Background(), true, func(tx StoreTransaction) error {
+			return putRuntimeRun(tx, finalizing)
+		}); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := missing.Recover(context.Background()); err != nil {
 		t.Fatal(err)
@@ -846,6 +977,10 @@ func TestRuntimeRecoverUsesPinnedBindingAndConservativeAttention(t *testing.T) {
 	snapshot, err = missing.Handle("hook-uncertain").Snapshot(context.Background())
 	if err != nil || snapshot.State != RuntimeNeedsAttention || snapshot.Result.Output != "done" {
 		t.Fatalf("uncertain hook recovery = %#v, %v", snapshot, err)
+	}
+	snapshot, err = missing.Handle("hook-unstarted").Snapshot(context.Background())
+	if err != nil || snapshot.State != RuntimeTerminal || snapshot.Result.Status != RunCompleted || snapshot.Result.Output != "done" {
+		t.Fatalf("unstarted hook recovery = %#v, %v", snapshot, err)
 	}
 }
 
@@ -967,6 +1102,18 @@ func TestRuntimeCloseYieldsInterruptedWorkerToAttention(t *testing.T) {
 	if handle.ID() == "" {
 		t.Fatal("admitted run lost its identity")
 	}
+}
+
+// runtimeRecord loads a stored run record through the runtime's store so tests
+// can assert on durable bookkeeping that is not part of the public snapshot.
+func runtimeRecord(runtime *Runtime, runID string) (storedRuntimeRun, error) {
+	var record storedRuntimeRun
+	err := runtime.transaction(context.Background(), false, func(tx StoreTransaction) error {
+		var err error
+		record, err = getRuntimeRun(tx, runID)
+		return err
+	})
+	return record, err
 }
 
 func newTestRuntime(t *testing.T) *Runtime {

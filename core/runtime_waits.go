@@ -146,10 +146,12 @@ func markRunReadyAfterWaits(tx StoreTransaction, runID string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if record.State != RuntimeWaiting {
+	if record.State != RuntimeWaiting && !(record.State == RuntimeNeedsAttention && record.AttentionKind == "child") {
 		return false, nil
 	}
 	record.State = RuntimeReady
+	record.AttentionReason = ""
+	record.AttentionKind = ""
 	record.Generation++
 	if err := putRuntimeRun(tx, record); err != nil {
 		return false, err
@@ -215,8 +217,14 @@ func historicalWaitResult(wait storedWait, digest string) (bool, error) {
 	}
 }
 
+// suspendedForDeadline reports a run whose logical deadline is enforced
+// without a worker: waiting on waits, or blocked on required-child attention.
+func suspendedForDeadline(record storedRuntimeRun) bool {
+	return record.State == RuntimeWaiting || (record.State == RuntimeNeedsAttention && record.AttentionKind == "child")
+}
+
 func finalizeWaitingDeadline(tx StoreTransaction, record *storedRuntimeRun, now time.Time) error {
-	if record.State != RuntimeWaiting || record.Deadline.IsZero() || now.Before(record.Deadline) {
+	if !suspendedForDeadline(*record) || record.Deadline.IsZero() || now.Before(record.Deadline) {
 		return nil
 	}
 	if err := resolveReservedInvocations(tx, *record); err != nil {
@@ -231,7 +239,11 @@ func finalizeWaitingDeadline(tx StoreTransaction, record *storedRuntimeRun, now 
 	record.AttentionKind = ""
 	setRuntimeError(record, context.DeadlineExceeded)
 	record.Generation++
-	return putRuntimeRun(tx, *record)
+	if err := putRuntimeRun(tx, *record); err != nil {
+		return err
+	}
+	_, err := propagateCancellationTx(tx, record.RunID, context.DeadlineExceeded)
+	return err
 }
 
 func (r *Runtime) expireWaitingDeadline(ctx context.Context, runID string) (bool, error) {
@@ -241,7 +253,7 @@ func (r *Runtime) expireWaitingDeadline(ctx context.Context, runID string) (bool
 		if err != nil {
 			return err
 		}
-		if record.State != RuntimeWaiting || record.Deadline.IsZero() || time.Now().UTC().Before(record.Deadline) {
+		if !suspendedForDeadline(record) || record.Deadline.IsZero() || time.Now().UTC().Before(record.Deadline) {
 			return nil
 		}
 		if err := finalizeWaitingDeadline(tx, &record, time.Now().UTC()); err != nil {
@@ -276,6 +288,10 @@ func (h *RunHandle) ResolveWait(ctx context.Context, waitID string, resolution W
 		observed, err = getStoredWait(tx, h.runID, waitID)
 		if err != nil {
 			return err
+		}
+		// Child waits are internal: only child completion resolves them.
+		if observed.Kind == WaitChild {
+			return errChildWaitHostResolution
 		}
 		if historical, resultErr := historicalWaitResult(observed, digest); historical {
 			historicalErr = resultErr
@@ -330,6 +346,9 @@ func (h *RunHandle) ResolveWait(ctx context.Context, waitID string, resolution W
 		wait, err := getStoredWait(tx, h.runID, waitID)
 		if err != nil {
 			return err
+		}
+		if wait.Kind == WaitChild {
+			return errChildWaitHostResolution
 		}
 		if historical, resultErr := historicalWaitResult(wait, digest); historical {
 			if resultErr != nil {

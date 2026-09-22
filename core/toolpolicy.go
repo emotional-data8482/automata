@@ -129,6 +129,10 @@ type toolBudgetCounter struct {
 type toolBudgetScope struct {
 	mu     *sync.Mutex
 	totals []*toolBudgetCounter
+	// durable, when set, charges one call against the persisted subtree caps
+	// of the enclosing Runtime run and its ancestors. Process-local runs
+	// nested inside that run's tools inherit it with the scope.
+	durable func() (toolBudgetUsage, error)
 }
 
 type toolBudgetContextKey struct{}
@@ -147,39 +151,45 @@ type toolBudgetUsage struct {
 }
 
 type storedToolBudget struct {
+	// Total counts reservations charged against TotalCap: this run's own known
+	// calls plus every call its descendants reserved beneath it. PerTool counts
+	// this run's own calls per capped tool.
 	Total   int            `json:"total,omitempty"`
 	PerTool map[string]int `json:"per_tool,omitempty"`
+	// TotalCap and PerToolCap pin the cap values this run was admitted with:
+	// TotalCap is the subtree cap every descendant reservation must honor, and
+	// PerTool stays run-local. Zero values remain unlimited. Caps persist as
+	// values on the record; no context pointers are ever stored.
+	TotalCap   int            `json:"total_cap,omitempty"`
+	PerToolCap map[string]int `json:"per_tool_cap,omitempty"`
 }
 
-func (s *toolPolicyState) snapshotBudget() storedToolBudget {
-	budget := storedToolBudget{PerTool: make(map[string]int)}
-	s.scope.mu.Lock()
-	defer s.scope.mu.Unlock()
-	if len(s.scope.totals) > 0 {
-		budget.Total = s.scope.totals[len(s.scope.totals)-1].used
+// pinnedToolCaps extracts the durable cap values to pin on a run record at
+// root or child admission. Zero caps stay unlimited and are omitted.
+func pinnedToolCaps(policy ToolPolicy) storedToolBudget {
+	var caps storedToolBudget
+	if policy.MaxCalls > 0 {
+		caps.TotalCap = policy.MaxCalls
 	}
-	for name, counter := range s.perTool {
-		if counter.used > 0 {
-			budget.PerTool[name] = counter.used
+	for name, limits := range policy.PerTool {
+		if limits.MaxCalls > 0 {
+			if caps.PerToolCap == nil {
+				caps.PerToolCap = make(map[string]int)
+			}
+			caps.PerToolCap[name] = limits.MaxCalls
 		}
 	}
-	if len(budget.PerTool) == 0 {
-		budget.PerTool = nil
-	}
-	return budget
+	return caps
 }
 
-func (s *toolPolicyState) restoreBudget(budget storedToolBudget) {
-	s.scope.mu.Lock()
-	defer s.scope.mu.Unlock()
-	for _, counter := range s.scope.totals {
-		counter.used = budget.Total
-	}
-	for name, used := range budget.PerTool {
-		if counter := s.perTool[name]; counter != nil {
-			counter.used = used
-		}
-	}
+// withDurableBudget makes the persisted records the only total budget of a
+// Runtime run's scope. The run's own calls reserve through its durable batch;
+// nested process-local runs started by its tools charge the same records via
+// charge. It returns ctx carrying the replaced scope.
+func (s *toolPolicyState) withDurableBudget(ctx context.Context, charge func() (toolBudgetUsage, error)) context.Context {
+	s.scope.totals = nil
+	s.scope.durable = charge
+	return context.WithValue(ctx, toolBudgetContextKey{}, s.scope)
 }
 
 func newToolPolicyState(ctx context.Context, policy ToolPolicy) (context.Context, *toolPolicyState, error) {
@@ -195,8 +205,9 @@ func newToolPolicyState(ctx context.Context, policy ToolPolicy) (context.Context
 	state := &toolPolicyState{
 		policy: policy,
 		scope: toolBudgetScope{
-			mu:     inherited.mu,
-			totals: append([]*toolBudgetCounter(nil), inherited.totals...),
+			mu:      inherited.mu,
+			totals:  append([]*toolBudgetCounter(nil), inherited.totals...),
+			durable: inherited.durable,
 		},
 		perTool: make(map[string]*toolBudgetCounter),
 	}
@@ -220,7 +231,7 @@ func newToolPolicyState(ctx context.Context, policy ToolPolicy) (context.Context
 // batch; the shared lock makes concurrent nested-agent batches safe as well.
 func (s *toolPolicyState) reserve(tool string) (toolBudgetUsage, error) {
 	perTool := s.perTool[tool]
-	if len(s.scope.totals) == 0 && perTool == nil {
+	if len(s.scope.totals) == 0 && perTool == nil && s.scope.durable == nil {
 		return toolBudgetUsage{}, nil
 	}
 
@@ -231,6 +242,47 @@ func (s *toolPolicyState) reserve(tool string) (toolBudgetUsage, error) {
 	if perTool != nil {
 		counters = append(append([]*toolBudgetCounter(nil), counters...), perTool)
 	}
+	var usage toolBudgetUsage
+	if s.scope.durable != nil {
+		// Check the local counters first so a local denial charges nothing
+		// durably; the durable charge itself is atomic in its transaction.
+		if denied, err := checkBudgetCounters(counters); err != nil {
+			return denied, err
+		}
+		var err error
+		if usage, err = s.scope.durable(); err != nil {
+			return usage, err
+		}
+	}
+	if denied, err := chargeBudgetCounters(counters); err != nil {
+		return denied, err
+	}
+
+	if n := len(s.scope.totals); n > 0 {
+		nearest := s.scope.totals[n-1]
+		usage.used, usage.max = nearest.used, nearest.max
+	}
+	if perTool != nil {
+		usage.toolUsed, usage.toolMax = perTool.used, perTool.max
+	}
+	return usage, nil
+}
+
+// chargeBudgetCounters checks every counter, then increments all of them. A
+// denial leaves every counter unchanged and reports the exhausted one. Callers
+// hold the lock or store transaction that makes the check and charge atomic.
+func chargeBudgetCounters(counters []*toolBudgetCounter) (toolBudgetUsage, error) {
+	if usage, err := checkBudgetCounters(counters); err != nil {
+		return usage, err
+	}
+	for _, counter := range counters {
+		counter.used++
+	}
+	return toolBudgetUsage{}, nil
+}
+
+// checkBudgetCounters reports the first exhausted counter without charging.
+func checkBudgetCounters(counters []*toolBudgetCounter) (toolBudgetUsage, error) {
 	for _, counter := range counters {
 		if counter.used < counter.max {
 			continue
@@ -242,17 +294,5 @@ func (s *toolPolicyState) reserve(tool string) (toolBudgetUsage, error) {
 		}
 		return usage, fmt.Errorf("%w: max calls %d", ErrToolBudgetExhausted, counter.max)
 	}
-	for _, counter := range counters {
-		counter.used++
-	}
-
-	var usage toolBudgetUsage
-	if n := len(s.scope.totals); n > 0 {
-		nearest := s.scope.totals[n-1]
-		usage.used, usage.max = nearest.used, nearest.max
-	}
-	if perTool != nil {
-		usage.toolUsed, usage.toolMax = perTool.used, perTool.max
-	}
-	return usage, nil
+	return toolBudgetUsage{}, nil
 }

@@ -47,6 +47,9 @@ type storedToolInvocation struct {
 	GuardKey        string              `json:"guard_key,omitempty"`
 	GuardDisplay    string              `json:"guard_display,omitempty"`
 	WaitID          string              `json:"wait_id,omitempty"`
+	// ChildRunID links a durable child invocation to its admitted child run.
+	// It is empty for ordinary tool invocations.
+	ChildRunID string `json:"child_run_id,omitempty"`
 }
 
 type storedEffectGuard struct {
@@ -142,6 +145,7 @@ func loadToolBatchSnapshots(tx StoreTransaction, runID string) ([]ToolBatchSnaps
 				Error:       invocation.Error,
 				GuardKey:    invocation.GuardDisplay,
 				WaitID:      invocation.WaitID,
+				ChildRunID:  invocation.ChildRunID,
 			})
 		}
 		snapshots = append(snapshots, snapshot)
@@ -181,11 +185,119 @@ func effectGuardStorageKey(scope, tool, semantic string) string {
 	return hex.EncodeToString(digest[:])
 }
 
-func (r *Runtime) prepareDurableBatch(ctx context.Context, runID string, l *loop, calls []ToolUseBlock, policy *toolPolicyState) (storedToolBatch, []storedToolInvocation, bool, error) {
-	var batch storedToolBatch
-	var invocations []storedToolInvocation
-	created := false
-	err := r.transaction(context.WithoutCancel(ctx), true, func(tx StoreTransaction) error {
+// maxReservationAncestorDepth bounds the ancestor chain walk a durable batch
+// reservation performs. Admitted runs form a tree, so a deeper chain can only
+// come from a corrupt store; fail closed instead of looping.
+const maxReservationAncestorDepth = 64
+
+// reserveDurableInvocation atomically reserves one known invocation across
+// every applicable ancestor subtree total plus the preparing run's own total
+// and per-tool counters, inside the caller's batch-creation transaction. A
+// child invocation costs one reservation on each applicable ancestor total;
+// a descendant's known invocations reserve the same chain against its own
+// record. All counters live on the persisted records, so concurrent sibling
+// reservations serialize on the store, a replayed batch never re-reserves
+// (the pending-batch path returns before reserving), and a rolled-back
+// transaction reverts every charge. Zero caps stay unlimited and PerTool caps
+// stay run-local. On denial no counter is charged anywhere.
+func reserveDurableInvocation(tx StoreTransaction, record *storedRuntimeRun, tool string) (toolBudgetUsage, error) {
+	parentID := record.ParentRunID
+	var capped []storedRuntimeRun
+	for depth := 0; parentID != ""; depth++ {
+		if depth > maxReservationAncestorDepth {
+			return toolBudgetUsage{}, fmt.Errorf("ancestor chain for run %s exceeds %d", record.RunID, maxReservationAncestorDepth)
+		}
+		parent, err := getRuntimeRun(tx, parentID)
+		if err != nil {
+			return toolBudgetUsage{}, fmt.Errorf("load ancestor %s for tool reservation: %w", parentID, err)
+		}
+		if parent.ToolBudget.TotalCap > 0 {
+			capped = append(capped, parent)
+		}
+		parentID = parent.ParentRunID
+	}
+	return chargeDurableBudget(tx, record, capped, tool)
+}
+
+// chargeDurableBudget checks then charges the persisted cap counters of the
+// preparing run and its capped ancestors under the caller's store transaction:
+// the run's own total, its local per-tool cap, then each ancestor from nearest
+// to root. Charges land on the persisted records themselves, never on a local
+// snapshot, so an ancestor's own next batch cannot overwrite a descendant's
+// charge and concurrent siblings serialize on the store.
+func chargeDurableBudget(tx StoreTransaction, record *storedRuntimeRun, capped []storedRuntimeRun, tool string) (toolBudgetUsage, error) {
+	var counters []*toolBudgetCounter
+	var localTotal, localPerTool *toolBudgetCounter
+	if cap := record.ToolBudget.TotalCap; cap > 0 {
+		localTotal = &toolBudgetCounter{max: cap, used: record.ToolBudget.Total}
+		counters = append(counters, localTotal)
+	}
+	if cap := record.ToolBudget.PerToolCap[tool]; cap > 0 {
+		localPerTool = &toolBudgetCounter{max: cap, used: record.ToolBudget.PerTool[tool], tool: tool}
+		counters = append(counters, localPerTool)
+	}
+	for i := range capped {
+		counters = append(counters, &toolBudgetCounter{max: capped[i].ToolBudget.TotalCap, used: capped[i].ToolBudget.Total})
+	}
+	if usage, err := chargeBudgetCounters(counters); err != nil {
+		return usage, err
+	}
+	var usage toolBudgetUsage
+	if localTotal != nil {
+		record.ToolBudget.Total = localTotal.used
+		usage.used, usage.max = localTotal.used, localTotal.max
+	}
+	if localPerTool != nil {
+		if record.ToolBudget.PerTool == nil {
+			record.ToolBudget.PerTool = make(map[string]int)
+		}
+		record.ToolBudget.PerTool[tool] = localPerTool.used
+		usage.toolUsed, usage.toolMax = localPerTool.used, localPerTool.max
+	}
+	for i := range capped {
+		capped[i].ToolBudget.Total++
+		if err := putRuntimeRun(tx, capped[i]); err != nil {
+			return toolBudgetUsage{}, err
+		}
+	}
+	if localTotal == nil && len(capped) > 0 {
+		usage.used, usage.max = capped[0].ToolBudget.Total, capped[0].ToolBudget.TotalCap
+	}
+	return usage, nil
+}
+
+// reserveNestedCall charges one known tool call that a process-local agent,
+// running inside runID's tool execution, reserved for itself. It persists the
+// charge on runID's subtree cap and every capped ancestor immediately, so
+// nested work cannot exceed a durable cap or lose its charges on restart.
+func (r *Runtime) reserveNestedCall(runID string) (toolBudgetUsage, error) {
+	var usage toolBudgetUsage
+	err := r.transaction(context.Background(), true, func(tx StoreTransaction) error {
+		record, err := getRuntimeRun(tx, runID)
+		if err != nil {
+			return err
+		}
+		if record.State != RuntimeRunning {
+			// A canceled or no longer owned run admits no new nested work.
+			return context.Canceled
+		}
+		// Nested tool names belong to the nested agent, so no local per-tool
+		// cap of this run applies.
+		if usage, err = reserveDurableInvocation(tx, &record, ""); err != nil {
+			return err
+		}
+		return putRuntimeRun(tx, record)
+	})
+	return usage, err
+}
+
+// prepareDurableBatch creates the run's pending tool batch or reloads it. It
+// reports whether it created the batch and whether it committed the run as
+// waiting; a suspended worker must return without dispatching, because only
+// the wait resolution that makes the run ready again may resume it.
+func (r *Runtime) prepareDurableBatch(ctx context.Context, runID string, l *loop, calls []ToolUseBlock) (batch storedToolBatch, invocations []storedToolInvocation, created, suspended bool, err error) {
+	err = r.transaction(context.WithoutCancel(ctx), true, func(tx StoreTransaction) error {
+		created, suspended = false, false
 		record, err := getRuntimeRun(tx, runID)
 		if err != nil {
 			return err
@@ -206,7 +318,28 @@ func (r *Runtime) prepareDurableBatch(ctx context.Context, runID string, l *loop
 				return err
 			}
 			invocations, err = loadStoredInvocations(tx, runID, record.PendingBatchID)
-			return err
+			if err != nil {
+				return err
+			}
+			// A replayed batch that still holds a pending wait suspends the
+			// run exactly as creation does, so the worker never leaves it
+			// running without an owner.
+			for _, invocation := range invocations {
+				if invocation.WaitID == "" || invocation.State != ToolInvocationReserved {
+					continue
+				}
+				wait, err := getStoredWait(tx, runID, invocation.WaitID)
+				if err != nil {
+					return err
+				}
+				if wait.State == WaitPending {
+					record.State = RuntimeWaiting
+					record.Generation++
+					suspended = true
+					return putRuntimeRun(tx, record)
+				}
+			}
+			return nil
 		}
 
 		created = true
@@ -223,12 +356,48 @@ func (r *Runtime) prepareDurableBatch(ctx context.Context, runID string, l *loop
 				Ordinal:     i, Call: cloneBlock(call).(ToolUseBlock), State: ToolInvocationReserved,
 			}
 			if registered, known := l.toolsByName[call.Name]; known {
-				invocation.Budget, err = policy.reserve(call.Name)
+				// Durable reservation: known invocations reserve across the
+				// preparing run's own total and per-tool counters plus every
+				// applicable ancestor subtree total, atomically with this batch
+				// creation. Denial produces a recoverable, not-applied
+				// model-visible result without charging any counter.
+				invocation.Budget, err = reserveDurableInvocation(tx, &record, call.Name)
+				if err != nil && !errors.Is(err, ErrToolBudgetExhausted) {
+					// Only exhaustion is a model-visible denial. A storage or
+					// ancestor-chain failure aborts batch creation; it must never
+					// be committed as a recoverable, not-applied tool result.
+					return err
+				}
 				if err != nil {
 					message := l.policyDeniedToolResult(ctx, call, invocation.Budget, err)
 					invocation.State = ToolInvocationCompleted
 					invocation.Result = resultFromMessage(message)
 					invocation.Effect = EffectReport{Status: EffectNotApplied}
+				} else if child, childErr := durableChildDeclaration(registered.executor); childErr != nil {
+					return childErr
+				} else if child != nil {
+					// Durable child invocation. The reservation above charged this
+					// child invocation once against each applicable ancestor total;
+					// the child run, operation link, and internal child wait commit
+					// atomically in this same transaction, so an exhausted or
+					// failed admission cannot leave a charged reservation without a
+					// persisted outcome. The model's raw arguments are validated
+					// against the frozen child schema and forwarded verbatim
+					// as the deterministic child task.
+					if err := validateToolArguments(child.definition.InputSchema, call.Input); err != nil {
+						invocation.State = ToolInvocationCompleted
+						invocation.Result = ErrorResult("invalid child arguments: " + err.Error())
+						invocation.Effect = EffectReport{Status: EffectNotApplied}
+					} else {
+						receipt, admitErr := r.admitChildRun(tx, record, invocation, child.policy, string(call.Input))
+						if admitErr != nil {
+							return admitErr
+						}
+						invocation.WaitID = receipt.WaitID
+						invocation.ChildRunID = receipt.ChildRunID
+					}
+					invocations[i] = invocation
+					continue
 				} else {
 					effectPolicy, policyErr := effectPolicyFor(registered.executor)
 					if policyErr != nil {
@@ -295,17 +464,20 @@ func (r *Runtime) prepareDurableBatch(ctx context.Context, runID string, l *loop
 		}
 		record.PendingBatchID = batch.BatchID
 		record.NextBatchOrdinal++
-		record.ToolBudget = policy.snapshotBudget()
+		// record.ToolBudget is maintained by chargeDurableBudget directly on the
+		// persisted record, never from an in-memory snapshot: a snapshot would
+		// overwrite the descendant charges this run's record accumulates.
 		for _, invocation := range invocations {
 			if invocation.WaitID != "" && invocation.State == ToolInvocationReserved {
 				record.State = RuntimeWaiting
+				suspended = true
 				break
 			}
 		}
 		record.Generation++
 		return putRuntimeRun(tx, record)
 	})
-	return batch, invocations, created, err
+	return batch, invocations, created, suspended, err
 }
 
 func (r *Runtime) beginToolDispatch(ctx context.Context, invocation storedToolInvocation) (storedToolInvocation, bool, error) {
@@ -455,7 +627,7 @@ func emitStoredToolResult(l *loop, invocation storedToolInvocation, err error) {
 }
 
 func (r *Runtime) executeDurableToolBatch(ctx context.Context, runID string, l *loop, calls []ToolUseBlock, messages []Message, policy *toolPolicyState) ([]Message, error) {
-	batch, invocations, created, err := r.prepareDurableBatch(ctx, runID, l, calls, policy)
+	batch, invocations, created, suspended, err := r.prepareDurableBatch(ctx, runID, l, calls)
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return nil, err
@@ -475,6 +647,11 @@ func (r *Runtime) executeDurableToolBatch(ctx context.Context, runID string, l *
 		}
 	}
 
+	// Any pending wait suspends the entire batch before workers run. All
+	// pending child waits are rechecked here so the first child can never
+	// strand its siblings: every admitted child is scheduled before the
+	// worker suspends, and scheduling is idempotent.
+	pendingChild := false
 	for _, invocation := range invocations {
 		if invocation.WaitID == "" || invocation.State != ToolInvocationReserved {
 			continue
@@ -487,9 +664,22 @@ func (r *Runtime) executeDurableToolBatch(ctx context.Context, runID string, l *
 		}); err != nil {
 			return nil, fmt.Errorf("%w: inspect durable wait: %v", errDurableBatchIncomplete, err)
 		}
-		if wait.State == WaitPending {
-			return nil, errDurableWaiting
+		if wait.State != WaitPending {
+			continue
 		}
+		if wait.Kind == WaitChild {
+			// Covers a newly created batch and a batch reloaded after a crash
+			// between child admission and scheduling.
+			r.scheduleChild(ctx, wait.ChildRunID)
+			pendingChild = true
+		} else {
+			pendingChild = true
+		}
+	}
+	// A committed waiting state suspends even if a wait was resolved in the
+	// meantime: that resolution made the run ready and owns its resumption.
+	if pendingChild || suspended {
+		return nil, errDurableWaiting
 	}
 
 	jobs := make(chan storedToolInvocation, len(invocations))
@@ -707,6 +897,14 @@ func resolveReservedInvocations(tx StoreTransaction, record storedRuntimeRun) er
 		invocation.State = ToolInvocationCompleted
 		invocation.Result = ErrorResult("not executed: run cancelled")
 		invocation.Effect = EffectReport{Status: EffectNotApplied}
+		if invocation.ChildRunID != "" {
+			// The admitted child may already have acted, or even completed
+			// before its outcome was consumed. Its outcome and effect evidence
+			// stay on the linked child run; the parent invocation itself
+			// applies nothing, as for a consumed child.
+			invocation.Result = ErrorResult(fmt.Sprintf("not consumed: run cancelled; the outcome of child run %s is recorded on that run", invocation.ChildRunID))
+			invocation.Effect = EffectReport{Status: EffectNone}
+		}
 		setInvocationError(&invocation, nil)
 		if invocation.GuardKey != "" {
 			raw, guardErr := tx.Get(runtimeEffectGuardsBucket, invocation.GuardKey)
@@ -759,7 +957,9 @@ func (r *Runtime) recoverToolBatch(ctx context.Context, record storedRuntimeRun)
 		return false, nil
 	}
 	var hasUncertain, cancelled bool
+	var committed storedRuntimeRun
 	err := r.transaction(ctx, true, func(tx StoreTransaction) error {
+		hasUncertain = false
 		current, err := getRuntimeRun(tx, record.RunID)
 		if err != nil {
 			return err
@@ -805,10 +1005,14 @@ func (r *Runtime) recoverToolBatch(ctx context.Context, record storedRuntimeRun)
 			current.AttentionKind = ""
 		}
 		current.Generation++
+		committed = current
 		return putRuntimeRun(tx, current)
 	})
 	if err == nil && cancelled {
 		return false, r.completeRunHooks(record.RunID)
+	}
+	if err == nil && hasUncertain {
+		err = r.notifyParentOfAttention(ctx, committed)
 	}
 	return !hasUncertain && !cancelled, err
 }
@@ -938,6 +1142,12 @@ func (h *RunHandle) Reconcile(ctx context.Context, operationID string, resolutio
 	})
 	if err == nil && ready {
 		h.runtime.start(h.runID)
+	}
+	if err == nil {
+		// Reconciling a terminal child's last uncertain effect (or one deep in
+		// a canceled subtree) is what lets a blocked parent consume the child
+		// outcome; the parent continues without replaying any child work.
+		err = h.runtime.wakeParentFromChild(context.WithoutCancel(ctx), h.runID)
 	}
 	return err
 }

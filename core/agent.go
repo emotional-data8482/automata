@@ -237,6 +237,10 @@ func (t *agentTool) Execute(ctx context.Context, args json.RawMessage) (ToolResu
 // nested tool calls; the child may also enforce a stricter local ToolPolicy.
 // Timeouts, rate limiters, and parallelism remain local to each configured
 // agent, except that a timeout on this AsTool call bounds the complete child run.
+//
+// The child runs in process inside the parent's tool call and does not survive
+// a restart; [Runtime.Register] rejects it. Use [DurableChildTool] for durable
+// composition.
 func AsTool[P any](a *Agent, name, description string) Tool {
 	var zero P
 	return &agentTool{

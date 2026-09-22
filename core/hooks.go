@@ -24,7 +24,8 @@ type PreSendHook func(context.Context, Request) (Request, error)
 // A hook error is recorded in RunSnapshot.HookResults. It never changes the
 // execution result or its error. Runtime does not automatically retry hooks: a
 // process loss during delivery is an uncertain external effect and recovery
-// moves the run to RuntimeNeedsAttention.
+// moves the run to RuntimeNeedsAttention until the host calls
+// [RunHandle.AcknowledgeHooks].
 type CommittedRunHook struct {
 	Name    string
 	Timeout time.Duration
@@ -36,6 +37,9 @@ type CommittedRunHook struct {
 type RunHookResult struct {
 	Name  string `json:"name"`
 	Error string `json:"error,omitempty"`
+	// Unknown marks a hook whose delivery was interrupted and later
+	// acknowledged: it may or may not have run. Error is also set.
+	Unknown bool `json:"unknown,omitempty"`
 }
 
 func validateCommittedRunHooks(hooks []CommittedRunHook) ([]CommittedRunHook, error) {
