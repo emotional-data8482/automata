@@ -57,7 +57,8 @@ historical durable outcomes, including after later run transitions.
   before closing storage. An interrupted whole-loop segment is conservatively
   marked `RuntimeNeedsAttention`; it is never automatically replayed.
 - `RunHandle.Cancel` is the logical cancellation command. A persisted deadline
-  in `SubmitOptions` has the same logical ownership.
+  in `SubmitOptions` has the same logical ownership. Both reach every required
+  durable child (see [Durable children](#durable-children)).
 
 `Runtime.Run` is `Submit` plus `Await`. `Runtime.RunStream` admits the same kind
 of run and attaches a bounded live view; detaching the view does not own worker
@@ -77,9 +78,22 @@ implementations must honor context cancellation.
 Each attempt is recorded in `RunSnapshot.HookResults`. Hook errors and panics
 remain visible there but never change `RunResult` or its execution error. After
 the hook outcomes commit, the run becomes `RuntimeTerminal` and `Await`
-returns. Runtime never retries a hook automatically: if the process stops in
-`RuntimeFinalizing`, recovery reports `RuntimeNeedsAttention` because an
-external effect may have happened without its outcome being stored.
+returns. Runtime commits a delivery marker before invoking the first hook and
+never retries a hook automatically. If the process stops in
+`RuntimeFinalizing` after that marker, recovery reports `RuntimeNeedsAttention`
+because an external effect may have happened without its outcome being stored.
+If it stops before the marker, no hook ran, so recovery invokes the currently
+configured hooks once and commits the terminal state.
+
+A run in hook attention (`AttentionKind` `"hooks"`) also keeps a waiting
+durable parent blocked or its conversation busy. After checking whatever the
+interrupted hooks might have done, the host calls `handle.AcknowledgeHooks(ctx)`.
+Runtime never invokes those hooks again. The run becomes terminal with its
+committed result unchanged, and each hook whose delivery had started is recorded
+in `HookResults` with `Unknown` set and a non-empty `Error`. The terminal commit
+wakes the parent or advances the conversation as usual. An exact retry returns
+the original outcome. `Cancel` remains available but records the run as
+canceled.
 
 ## Storage and recovery
 
@@ -98,6 +112,11 @@ outcome becomes `ToolInvocationUncertain`, keeps the run in
 transcript receives the complete batch in model request order only after every
 invocation has an authoritative outcome. A fatal batch outcome commits with
 that history; recovery finalizes the failure rather than continuing the model.
+
+Provider attempts have no per-attempt record. When recovery finds a run whose
+stopped owner's next step was a provider call, it counts one
+`RunSnapshot.UnknownAttempts`: that attempt may have been sent, and its usage,
+if any, is not in `RunResult.Usage`. Runtime never invents usage for it.
 
 ## Tool effects and reconciliation
 
@@ -284,6 +303,135 @@ enforce the same contract through the same loop, but direct Agent, Session, and
 typed helper entry points remain process-local. Only Runtime promises durable
 admission, persisted correction counts, recovery, and effect preservation.
 
+## Durable children
+
+A parent delegates to another registered definition through a
+`DurableChildTool`. The declaration pins the child's definition ID and
+revision and freezes the model-facing input schema:
+
+```go
+if err := runtime.Register("researcher", "v2", researcher); err != nil {
+    return err
+}
+research := core.DurableChildTool(core.ToolDefinition{
+    Name:        "research",
+    Description: "Research one topic.",
+    InputSchema: json.RawMessage(`{"type":"object",
+        "properties":{"topic":{"type":"string"}},"required":["topic"]}`),
+}, core.DurableChildPolicy{DefinitionID: "researcher", Revision: "v2"})
+
+lead, err := core.New(provider, core.AgentConfig{Tools: []core.Tool{research}})
+if err != nil { return err }
+if err := runtime.Register("lead", "v1", lead); err != nil { return err }
+```
+
+Each call is admitted as an ordinary durable child run. The child run, its link
+to the parent run and operation ID, and an internal child wait commit in the
+same transaction that reserves the parent invocation. The child's task is the
+model's arguments, validated against the frozen schema and passed as raw JSON.
+Invalid arguments are a model-visible error and admit no child, although, as
+for any known tool, the call has already consumed its cap reservation. Admission fails
+closed when the pinned child binding is not registered. An admission replay
+after a crash resolves the same child, and completed siblings are never rerun.
+Children are never retried implicitly.
+
+Runtime never infers durable children from Agent values. `Register` rejects a
+process-local `AsTool` or `AsToolFunc` adapter, directly or behind first-party
+wrappers. It also rejects a child tool wrapped for retry, durable waits, or an
+effect policy, and a parent that would intercept child calls with a
+process-local `Approver`, per-call timeout, or rate limiter. The declaration's
+`Execute` always fails, so direct `Agent.Run` cannot invoke it by accident.
+
+The parent's worker returns while children run. When a child terminalizes,
+Runtime consumes the child wait once and makes the parent runnable; recovery
+repeats the check if that wake was lost. `ResolveWait` cannot resolve child
+waits. The parent receives the child's accepted structured output as JSON text,
+otherwise its final message blocks (including `RawBlock`), or a model-visible
+error when the child failed or was canceled. The child run keeps its own
+transcript, effects, and receipts: `ToolInvocationSnapshot.ChildRunID` and
+`WaitSnapshot.ChildRunID` link down, and the child's
+`RunSnapshot.ParentRunID`/`ParentOperationID` link up.
+
+A child that needs attention, or a terminal child whose subtree still has an
+uncertain effect or an unsettled run, blocks the parent in
+`RuntimeNeedsAttention` with `AttentionKind` `"child"`. Reconciling the child's
+operation (or the child otherwise settling cleanly) lets the parent consume the
+outcome and continue without replaying child work.
+
+### Caps and accounting
+
+`ToolPolicy.MaxCalls` is pinned on each run at admission and acts as a subtree
+cap. A child invocation consumes one reservation from its parent. Every known
+tool call in a descendant reserves against its own caps and every capped
+ancestor, atomically with the descendant's batch creation. `PerTool` caps stay
+local to their run, zero stays unlimited, and turn and provider limits are
+per run. A process-local agent that a Runtime tool runs internally (for example
+`inner.Run(ctx, ...)` inside a `Func`) charges the same persisted caps for each
+of its known calls. Counters live on the persisted records, survive restarts,
+and are never charged again when a batch is replayed.
+
+`RunResult.Usage` stays local to one run. `RunSnapshot.Tree` totals `Usage`,
+`ProviderAttempts`, and `UnknownAttempts` across the run and its linked
+descendants, counting each run's persisted local values once. Repeated
+completion notices or recovery passes never add usage again. `Tree.Unsettled`
+counts descendants that are not yet terminal. This is inspection, not a budget
+or billing ledger.
+
+### Cancellation and deadlines
+
+Children are required: there is no detached mode. Canceling a run cancels every
+non-terminal descendant in the same commit, before any local worker is
+signaled. Suspended descendants become terminal at once. Running descendants
+move to `RuntimeCancelRequested` and cannot admit children or dispatch reserved
+tools; after a crash, recovery finishes their cancellation without dispatching
+anything. A child inherits its parent's deadline at admission. When a waiting
+parent's deadline passes, its suspended descendants are finalized with it.
+
+A canceled parent may become terminal before a non-cooperative descendant
+stops. It keeps its links and all descendant effect evidence, `Tree.Unsettled`
+shows the work still settling, and it never reports clean completion.
+Canceling a child directly delivers the canceled outcome to its waiting parent
+as a model-visible error once the child and its subtree have settled. A running
+child first finishes its cancellation; while any descendant is still settling,
+the parent reports child attention. A parent blocked on child attention is
+still suspended, so its own deadline is enforced as for a waiting run.
+
+## Conversations
+
+A Runtime conversation serializes runs of one definition into turns:
+
+```go
+first, err := runtime.Run(ctx, "assistant", "v1", "Summarize the report.",
+    core.SubmitOptions{Conversation: core.ConversationOptions{
+        Scope: tenantID, ID: threadID}})
+if err != nil { return err }
+
+next, err := runtime.Run(ctx, "assistant", "v1", "Now list the risks.",
+    core.SubmitOptions{Conversation: core.ConversationOptions{
+        Scope: tenantID, ID: threadID, ExpectedHead: first.RunID}})
+```
+
+The first turn pins the definition and revision. Each later turn names the
+committed head it continues. Admission reserves the conversation's single
+active slot: a competing turn returns `ErrConversationBusy`, and a stale
+`ExpectedHead` or a different definition returns `ErrConversationConflict`.
+With `Scope` and `Key`, an exact retry resolves its original run before these
+checks, so a lost acknowledgement never turns into a conflict.
+
+A turn starts from the head's committed transcript plus the new task, appended
+exactly once. Provider-native blocks are preserved, `RunResult.Messages` holds
+the whole conversation, and `RunResult.Usage` covers only that turn. The head
+advances, and the active slot is released, in the same commit that makes the
+turn terminal, whether it completed, failed, or was canceled. A failed or
+canceled turn with structurally complete history can be continued. A head with
+unanswered tool calls, uncertain effects, or unsettled children returns
+`ErrConversationBlocked`; Runtime never fabricates results to make history
+valid. A turn that needs attention keeps the conversation busy until it is
+reconciled, acknowledged (for interrupted hook delivery), or canceled.
+`Runtime.Conversation` returns the committed head, active run, and turn count.
+Each turn copies the committed history into its own transcript; bounding
+long-history cost is T08 work.
+
 ## Transformation, observation, and history
 
 - `PreSendHook` remains an immutable request transformation supplied by the
@@ -299,14 +447,15 @@ reconnectable delivery rather than an in-process hook attempt.
 
 Canonical conversation data remains JSON-encoded `[]core.Message`, with
 `Message.Blocks` as the source of truth. Pending provider/tool work is not
-fabricated as canonical history. Durable conversation-head serialization and
-cross-process continuation build on this format in T07; the current `Session`
-mutex is not a durable concurrency primitive.
+fabricated as canonical history.
 
 ## Direct entry points
 
-`Agent.Run`, `Agent.RunStream`, `Session`, `RunTyped`, and `RunSessionTyped` are
-currently direct, process-local entry points. `Session` is still the useful
-conversation concept; T07 moves that concept onto committed Runtime history
-rather than discarding it. T06 moves typed correction into the same lifecycle
-for declared output contracts. New durable code should start with `Runtime`.
+`Agent.Run`, `Agent.RunStream`, `Session`, `RunTyped`, `RunSessionTyped`,
+`AsTool`, and `AsToolFunc` remain direct, process-local transitional entry
+points; T09 migrates or removes them. None of them persists anything or
+survives a restart, and the `Session` mutex is not a durable concurrency
+primitive. The durable equivalents are Runtime conversations for `Session`,
+`DurableChildTool` for `AsTool`/`AsToolFunc`, and a declared
+`StructuredOutput` for typed results. New durable code should start with
+`Runtime`.

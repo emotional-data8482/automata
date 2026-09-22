@@ -67,7 +67,8 @@ For restartable execution, use the explicit durable lifecycle described in
 `core.Runtime` with `extensions/sqlite`, register an immutable `Agent` revision,
 then submit and await a `RunHandle`. Use `core.NewEphemeralRuntime` only when
 loss on process exit is intentional. Storage failure never falls back to
-memory.
+memory. Durable child runs (`core.DurableChildTool`) and serialized
+conversation turns (`SubmitOptions.Conversation`) use the same lifecycle.
 
 The direct `Agent.Run`, session, and typed helpers shown below are currently
 process-local APIs; they are not persistent Runtime entry points. They are not
@@ -145,7 +146,8 @@ res, err := agent.Run(ctx, task,
 Policy-created tool timeouts are recoverable error results; cancellation of the
 parent run remains fatal. Call budgets reserve known requests in model order
 before approval, overflow calls receive explicit transcript results, and total
-budgets are shared atomically through nested `AsTool` runs. Tools and limiters
+budgets are shared atomically through nested `AsTool` runs (durable children
+share them as persisted subtree caps instead). Tools and limiters
 must honor context cancellation—Go cannot forcibly stop a function that ignores
 its context. The zero policy preserves existing behavior.
 
@@ -184,8 +186,10 @@ For durable execution, use `Runtime`. The old callback-based checkpoint hook
 was removed because callback success is not proof of durable commit. Runtime
 instead supports named, timeout-bounded `CommittedRunHook`s that run after the
 execution result commits; their outcomes are persisted in `RunSnapshot` and do
-not rewrite the execution result. `Session` remains the process-local
-conversation API while runtime-backed continuation is integrated.
+not rewrite the execution result. `Session` remains a process-local
+conversation API. For durable, serialized turns that survive restarts, submit
+Runtime runs with `SubmitOptions.Conversation`; see
+[Conversations](docs/durable-runtime.md#conversations).
 
 ## Typed results
 
@@ -349,6 +353,13 @@ orch.RegisterTool(core.AsToolFunc[researchParams](researcher, "researcher",
  }))
 ```
 
+`AsTool` and `AsToolFunc` run the sub-agent inside the parent's tool call, in
+process; the child is lost on restart, and `Runtime` rejects them. For durable
+composition, register the child as its own definition and declare it with
+`core.DurableChildTool`. Each call then becomes a linked child run with its own
+record, and the child shares the parent's persisted caps and cancellation. See
+[Durable children](docs/durable-runtime.md#durable-children).
+
 ## Watch every agent work
 
 `RunStream` delivers a live event stream — including events from nested
@@ -392,7 +403,8 @@ researcher.RegisterTool(tools.WebSearch(tavily.New(os.Getenv("TAVILY_API_KEY")))
 - `examples/claude` — minimal tool-using agent.
 - `examples/durable_typed` — credential-free fake-provider Runtime demo showing
   a mutating tool, an invalid structured payload, correction to a typed domain
-  value, and one external write:
+  value, and one external write; then a durable child with typed output inside
+  a two-turn Runtime conversation:
 
   ```sh
   go run ./examples/durable_typed

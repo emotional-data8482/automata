@@ -20,9 +20,9 @@ import (
 // external side effect while cancellation races its return, and a synthetic
 // canceled result does not imply that side effect was rolled back.
 //
-// Session remains useful as the conversation abstraction. This implementation
-// is process-local; Runtime-backed durable conversations will replace its
-// manual persistence path. Until then, [Message] marshals to JSON, so store
+// Session is a process-local transitional entry point. For durable,
+// serialized turns use Runtime conversations ([SubmitOptions].Conversation).
+// For manual persistence, [Message] marshals to JSON, so store
 // session.Messages() anywhere and rebuild with [Agent.ResumeSession]:
 //
 //	blob, _ := json.Marshal(session.Messages())
