@@ -75,7 +75,7 @@ registration order with detached snapshots and a per-hook timeout. Zero timeout
 selects 30 seconds. As with tools, Go cannot forcibly stop a callback; hook
 implementations must honor context cancellation.
 
-Each attempt is recorded in `RunSnapshot.HookResults`. Hook errors and panics
+Each attempt is recorded in `RunSnapshot.Hooks`. Hook errors and panics
 remain visible there but never change `RunResult` or its execution error. After
 the hook outcomes commit, the run becomes `RuntimeTerminal` and `Await`
 returns. Runtime commits a delivery marker before invoking the first hook and
@@ -85,12 +85,12 @@ because an external effect may have happened without its outcome being stored.
 If it stops before the marker, no hook ran, so recovery invokes the currently
 configured hooks once and commits the terminal state.
 
-A run in hook attention (`AttentionKind` `"hooks"`) also keeps a waiting
+A run in hook attention (`RunSnapshot.Attention.Kind == AttentionHooks`) also keeps a waiting
 durable parent blocked or its conversation busy. After checking whatever the
 interrupted hooks might have done, the host calls `handle.AcknowledgeHooks(ctx)`.
 Runtime never invokes those hooks again. The run becomes terminal with its
 committed result unchanged, and each hook whose delivery had started is recorded
-in `HookResults` with `Unknown` set and a non-empty `Error`. The terminal commit
+in `Hooks` with `Unknown` set and a non-empty `Error`. The terminal commit
 wakes the parent or advances the conversation as usual. An exact retry returns
 the original outcome. `Cancel` remains available but records the run as
 canceled.
@@ -115,7 +115,7 @@ that history; recovery finalizes the failure rather than continuing the model.
 
 Provider attempts have no per-attempt record. When recovery finds a run whose
 stopped owner's next step was a provider call, it counts one
-`RunSnapshot.UnknownAttempts`: that attempt may have been sent, and its usage,
+`RunSnapshot.Accounting.UnknownAttempts`: that attempt may have been sent, and its usage,
 if any, is not in `RunResult.Usage`. Runtime never invents usage for it.
 
 ## Tool effects and reconciliation
@@ -350,11 +350,14 @@ otherwise its final message blocks (including `RawBlock`), or a model-visible
 error when the child failed or was canceled. The child run keeps its own
 transcript, effects, and receipts: `ToolInvocationSnapshot.ChildRunID` and
 `WaitSnapshot.ChildRunID` link down, and the child's
-`RunSnapshot.ParentRunID`/`ParentOperationID` link up.
+`RunSnapshot.Parent.RunID`/`OperationID` link up (`Parent` is nil for a root run).
 
 A child that needs attention, or a terminal child whose subtree still has an
 uncertain effect or an unsettled run, blocks the parent in
-`RuntimeNeedsAttention` with `AttentionKind` `"child"`. Reconciling the child's
+`RuntimeNeedsAttention` with `Attention.Kind == AttentionChild`. The parent's
+`Attention.BlockingRunID` identifies the pending child responsible for the
+current attention; inspect that child's snapshot to act on its own evidence.
+Reconciling the child's
 operation (or the child otherwise settling cleanly) lets the parent consume the
 outcome and continue without replaying child work.
 
@@ -370,10 +373,10 @@ per run. A process-local agent that a Runtime tool runs internally (for example
 of its known calls. Counters live on the persisted records, survive restarts,
 and are never charged again when a batch is replayed.
 
-`RunResult.Usage` stays local to one run. `RunSnapshot.Tree` totals `Usage`,
+`RunResult.Usage` stays local to one run. `RunSnapshot.Accounting.Tree` totals `Usage`,
 `ProviderAttempts`, and `UnknownAttempts` across the run and its linked
 descendants, counting each run's persisted local values once. Repeated
-completion notices or recovery passes never add usage again. `Tree.Unsettled`
+completion notices or recovery passes never add usage again. `Accounting.Tree.Unsettled`
 counts descendants that are not yet terminal. This is inspection, not a budget
 or billing ledger.
 
@@ -388,8 +391,15 @@ anything. A child inherits its parent's deadline at admission. When a waiting
 parent's deadline passes, its suspended descendants are finalized with it.
 
 A canceled parent may become terminal before a non-cooperative descendant
-stops. It keeps its links and all descendant effect evidence, `Tree.Unsettled`
-shows the work still settling, and it never reports clean completion.
+stops. It keeps its links and all descendant effect evidence,
+`Accounting.Tree.Unsettled` shows the work still settling, and it never reports clean completion.
+`RunSnapshot.Definition` holds the pinned ID/revision, `Conversation` identifies
+a turn (nil otherwise), and `Failure` is nil on success. A non-nil `Failure`
+contains the persisted message, typed `FailureKind`, and any completion stop
+reason. `Attention` is nil outside needs-attention; `Accounting.UnknownAttempts`
+is local to the run, while `Accounting.Tree.UnknownAttempts` includes descendants.
+These are public projections; the storage encoding is unchanged.
+
 Canceling a child directly delivers the canceled outcome to its waiting parent
 as a model-visible error once the child and its subtree have settled. A running
 child first finishes its cancellation; while any descendant is still settling,
