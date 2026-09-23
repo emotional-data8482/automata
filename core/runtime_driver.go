@@ -144,7 +144,9 @@ func (r *Runtime) observeCommits(commits []runCommit) {
 }
 
 // maintainRun applies the suspended-run checks to one run and rearms its next
-// due time. Errors are left for the next trigger or Recover: the driver is a
+// due time. A terminal child run is due when a descendant settled beneath it:
+// its parent wake climbs to the nearest live ancestor, so the repair repeats
+// that climb. Errors are left for the next trigger or Recover: the driver is a
 // backstop and never records a worker failure of its own.
 func (r *Runtime) maintainRun(ctx context.Context, runID string) {
 	r.mu.Lock()
@@ -154,7 +156,14 @@ func (r *Runtime) maintainRun(ctx context.Context, runID string) {
 		return
 	}
 	record, err := r.compactRecord(ctx, runID)
-	if err != nil || !suspendedForDeadline(record) {
+	if err != nil {
+		return
+	}
+	if record.State == RuntimeTerminal && record.ParentRunID != "" {
+		_ = r.wakeParentFromChild(ctx, runID)
+		return
+	}
+	if !suspendedForDeadline(record) {
 		return
 	}
 	if err := r.maintainSuspended(ctx, record); err != nil {

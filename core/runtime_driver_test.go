@@ -165,3 +165,69 @@ func TestRuntimeDriverRepairsLostChildWakeWithoutRecover(t *testing.T) {
 		t.Fatalf("child provider calls = %d, want 1", got)
 	}
 }
+// Without any host Recover call, a lost wake from a grandchild that settles
+// beneath a canceled (terminal) child is repaired through that child: the
+// driver repeats the wake's climb to the root, which stops needing child
+// attention and continues.
+func TestRuntimeDriverRepairsLostWakeThroughTerminalChild(t *testing.T) {
+	shortRepairDelay(t)
+	grandchildProvider := newIgnoringCancelProvider()
+	t.Cleanup(grandchildProvider.unblock)
+	child := testAgent(&scriptedProvider{turns: []Message{
+		asstTool("g1", "delegate2", `{"topic":"tea"}`),
+		asstText("child done"),
+	}})
+	child.RegisterTool(DurableChildTool(childTestDefinition("delegate2"), DurableChildPolicy{DefinitionID: "grandchild", Revision: "v1"}))
+	parent := testAgent(&scriptedProvider{turns: []Message{
+		asstTool("c1", "delegate", `{"topic":"tea"}`),
+		asstText("parent done"),
+	}})
+	newSharedChildDefinition(parent)
+	store := &failChildConsumeStore{Store: NewMemoryStore()}
+	runtime, err := NewRuntime(context.Background(), RuntimeConfig{Store: store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = runtime.Close() })
+	for id, agent := range map[string]*Agent{"grandchild": testAgent(grandchildProvider), "child": child, "parent": parent} {
+		if err := runtime.Register(id, "v1", agent); err != nil {
+			t.Fatal(err)
+		}
+	}
+	handle, err := runtime.Submit(context.Background(), "parent", "v1", "go", SubmitOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForSignal(t, grandchildProvider.started, "grandchild provider")
+	snapshot, err := handle.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	childID := snapshot.ToolBatches[0].Invocations[0].ChildRunID
+	if err := runtime.Handle(childID).Cancel(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	blocked := waitForRunState(t, runtime, handle.ID(), RuntimeNeedsAttention)
+	if blocked.Attention == nil || blocked.Attention.Kind != AttentionChild || blocked.Attention.BlockingRunID != childID {
+		t.Fatalf("parent attention = %#v, want child %s while its descendant settles", blocked.Attention, childID)
+	}
+	// Let the cancellation's own repair checks pass before losing the wake.
+	time.Sleep(50 * time.Millisecond)
+	store.armed.Store(true)
+	grandchildProvider.unblock()
+	waitForRunState(t, runtime, handle.ID(), RuntimeTerminal)
+	result, err := handle.Await(context.Background())
+	if err != nil || result.Output != "parent done" {
+		t.Fatalf("parent after lost deep wake = %#v, %v", result, err)
+	}
+	if store.armed.Load() {
+		t.Fatal("the parent wake fault never fired")
+	}
+	final, err := handle.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if final.Accounting.Tree.Unsettled != 0 || final.Attention != nil {
+		t.Fatalf("parent after settlement: attention %#v, unsettled descendants %d", final.Attention, final.Accounting.Tree.Unsettled)
+	}
+}
