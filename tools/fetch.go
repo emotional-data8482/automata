@@ -29,8 +29,9 @@ type fetchParams struct {
 // rejected. Responses are capped at 512 KiB with a truncation marker.
 //
 // Security: the model chooses the URL, so this tool will happily fetch
-// internal endpoints reachable from the host (SSRF). In production, gate it
-// with an [core.Approver] or front it with an egress proxy.
+// internal endpoints reachable from the host (SSRF). In production, front it
+// with an egress proxy, or gate it with a durable approval
+// ([core.WithDurableWait]).
 func HTTPFetch() core.Tool {
 	client := &http.Client{Timeout: fetchTimeout}
 	return domainTool("http_fetch",

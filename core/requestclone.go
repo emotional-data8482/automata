@@ -58,7 +58,6 @@ func cloneRunResult(r RunResult) RunResult {
 	r.Messages = cloneMessages(r.Messages)
 	r.FinalMessage = cloneMessages([]Message{r.FinalMessage})[0]
 	r.Diagnostics = cloneDiagnostics(r.Diagnostics)
-	r.terminalToolInput = append([]byte(nil), r.terminalToolInput...)
 	r.StructuredOutput = append(json.RawMessage(nil), r.StructuredOutput...)
 	return r
 }
@@ -70,16 +69,4 @@ func cloneStreamEvent(e StreamEvent) StreamEvent {
 		e.Usage = &v
 	}
 	return e
-}
-func cloneEventPayload(p RunEventPayload) RunEventPayload {
-	switch v := p.(type) {
-	case RunFinishedPayload:
-		v.Result = cloneRunResult(v.Result)
-		return v
-	case CheckpointCommittedPayload:
-		v.Checkpoint.Messages = cloneMessages(v.Checkpoint.Messages)
-		return v
-	default:
-		return p
-	}
 }

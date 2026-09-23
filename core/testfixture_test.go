@@ -2,12 +2,40 @@ package core
 
 import (
 	"context"
+	"log/slog"
+	"testing"
+
 	"github.com/emotional-data8482/automata/retry"
 	"github.com/emotional-data8482/automata/tracing"
-	"log/slog"
 )
 
-// testAgent retains setup for pre-migration characterization fixtures only.
+// runAgent runs task on agent the only way an Agent runs: admitted to a fresh
+// ephemeral Runtime, awaited, and returned with its committed result.
+func runAgent(t testing.TB, agent *Agent, task string, opts ...SubmitOption) (RunResult, error) {
+	t.Helper()
+	return runAgentStream(t, agent, task, nil, opts...)
+}
+
+// runAgentStream is runAgent with a live view.
+func runAgentStream(t testing.TB, agent *Agent, task string, onEvent func(StreamEvent), opts ...SubmitOption) (RunResult, error) {
+	t.Helper()
+	runtime, err := NewEphemeralRuntime()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = runtime.Close() })
+	ref, err := runtime.Register("agent", "test", agent)
+	if err != nil {
+		return RunResult{}, err
+	}
+	if onEvent == nil {
+		return runtime.Run(context.Background(), ref, task, opts...)
+	}
+	return runtime.RunStream(context.Background(), ref, task, onEvent, opts...)
+}
+
+// testAgent builds a zero-config agent; the With* fixtures below adjust it
+// before registration, which freezes a copy.
 func testAgent(p Provider) *Agent {
 	if p == nil {
 		p = &scriptedProvider{}
@@ -18,8 +46,6 @@ func testAgent(p Provider) *Agent {
 	}
 	return a
 }
-
-const DefaultMaxSteps = DefaultMaxTurns
 
 func (a *Agent) WithLogger(l *slog.Logger) *Agent {
 	a.log = l
@@ -36,8 +62,8 @@ func (a *Agent) WithSystemPrompt(prompt string) *Agent {
 	return a
 }
 
-func (a *Agent) WithMaxSteps(maxSteps int) *Agent {
-	a.maxSteps = maxSteps
+func (a *Agent) WithMaxTurns(maxTurns int) *Agent {
+	a.maxTurns = maxTurns
 	return a
 }
 
@@ -46,26 +72,13 @@ func (a *Agent) WithRetry(cfg retry.Config) *Agent {
 	return a
 }
 
-// WithApprover sets the Approver that gates tool calls before execution. The
-// default is [AllowAll], which permits every call unconditionally.
-func (a *Agent) WithApprover(ap Approver) *Agent {
-	a.approver = ap
-	return a
-}
-
-// WithToolPolicy sets the default deterministic limits for local tool work.
-// The zero policy preserves the historical unbounded behavior. The policy is
-// copied; configure the agent before starting any runs. Use the package-level
-// [WithToolPolicy] RunOption to replace it for one run.
 func (a *Agent) WithToolPolicy(policy ToolPolicy) *Agent {
 	a.toolPolicy = policy.clone()
 	return a
 }
 
-// WithDefaultCallOptions sets the [CallOptions] applied to every run of this
-// agent. A per-run [WithCallOptions] override is merged over these defaults.
-func (a *Agent) WithDefaultCallOptions(o CallOptions) *Agent {
-	a.defaultCallOptions = o
+func (a *Agent) WithCallOptions(o CallOptions) *Agent {
+	a.callOptions = o
 	return a
 }
 
@@ -93,10 +106,8 @@ func (a *Agent) WithTools(tools ...Tool) *Agent {
 // what the model uses to invoke it; registering a tool whose name matches an
 // already-registered tool silently replaces the existing one.
 //
-// Tool errors are not fatal: if the tool's Execute returns an error, the run
-// converts it to "error: <msg>" and feeds it back to the model as the tool
-// result, letting the model recover. The exceptions are [context.Canceled]
-// and [context.DeadlineExceeded], which abort the run. See [Func] for the
+// A non-nil Go error from Execute is fatal to the run; a model-visible
+// recoverable failure is a ToolResult with IsError set. See [Func] for the
 // typed-handler convenience wrapper.
 func (a *Agent) RegisterTool(t Tool) {
 	a.tools = append(a.tools, t)
@@ -108,15 +119,12 @@ func (a *Agent) RegisterFunc(name, description string, fn func(context.Context) 
 	}))
 }
 
-func legacyCallOptions(o CallOptions) RunOption {
-	return func(c *runConfig) { c.options = c.options.merge(o) }
-}
-func (a *Agent) testResumeSession(m []Message) *Session {
-	s, e := a.ResumeSession(m)
-	if e != nil {
-		panic(e)
+func roles(messages []Message) []string {
+	out := make([]string, len(messages))
+	for i, m := range messages {
+		out[i] = m.Role
 	}
-	return s
+	return out
 }
 
 func fixtureResponse(m Message) Response {

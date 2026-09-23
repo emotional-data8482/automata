@@ -90,12 +90,21 @@ type saveDocParams struct {
 // it composes the Markdown, saves it, and returns the path. If outPath is set
 // (the -o flag) it always wins; otherwise the file lands in the working
 // directory under the model's filename or a topic slug + timestamp.
+//
+// The tool is declared mutating, so every outcome reports whether the write
+// happened: the durable run records the saved path as the effect receipt, and
+// a crash mid-write is surfaced for reconciliation instead of being retried.
 func saveDocumentTool(topic, outPath string, sink func(tea.Msg)) core.Tool {
-	return core.Func("save_document",
+	save := core.FuncResult("save_document",
 		"Save the final Markdown report to disk and return the absolute path it was written to.",
-		func(_ context.Context, p saveDocParams) (string, error) {
+		func(_ context.Context, p saveDocParams) (core.ToolResult, error) {
+			notApplied := func(message string) (core.ToolResult, error) {
+				result := core.ErrorResult(message)
+				result.Effect = core.EffectReport{Status: core.EffectNotApplied}
+				return result, nil
+			}
 			if strings.TrimSpace(p.Content) == "" {
-				return "", fmt.Errorf("content is required")
+				return notApplied("content is required")
 			}
 
 			path := outPath
@@ -110,15 +119,21 @@ func saveDocumentTool(topic, outPath string, sink func(tea.Msg)) core.Tool {
 			}
 
 			if err := os.WriteFile(path, []byte(p.Content), 0o644); err != nil {
-				return "", fmt.Errorf("write %s: %w", path, err)
+				// A failed write may have left a partial file.
+				result := core.ErrorResult(fmt.Sprintf("write %s: %v", path, err))
+				result.Effect = core.EffectReport{Status: core.EffectUnknown}
+				return result, nil
 			}
 			abs, err := filepath.Abs(path)
 			if err != nil {
 				abs = path
 			}
 			sink(savedMsg{path: abs})
-			return abs, nil
+			result := core.TextResult(abs)
+			result.Effect = core.EffectReport{Status: core.EffectApplied, Receipt: abs}
+			return result, nil
 		})
+	return core.WithToolEffectPolicy(save, core.ToolEffectPolicy{Kind: core.ToolEffectMutating})
 }
 
 // --- helpers --------------------------------------------------------------

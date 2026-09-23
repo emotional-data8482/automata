@@ -26,14 +26,14 @@ func TestPrunedRunTombstoneSurvivesReopen(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := runtime.Register("agent", "v1", staticAgent(t)); err != nil {
+		if _, err := runtime.Register("agent", "v1", staticAgent(t)); err != nil {
 			t.Fatal(err)
 		}
 		return runtime
 	}
-	options := core.SubmitOptions{Scope: "tenant", Key: "job"}
+	options := core.WithIdempotencyKey("tenant", "job")
 	first := open()
-	result, err := first.Run(ctx, "agent", "v1", "work", options)
+	result, err := first.Run(ctx, core.DefinitionRef{ID: "agent", Revision: "v1"}, "work", options)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -49,7 +49,7 @@ func TestPrunedRunTombstoneSurvivesReopen(t *testing.T) {
 	if _, err := reopened.Handle(result.RunID).Snapshot(ctx); !errors.Is(err, core.ErrRunPruned) {
 		t.Fatalf("snapshot after reopen = %v, want ErrRunPruned", err)
 	}
-	if _, err := reopened.Submit(ctx, "agent", "v1", "work", options); !errors.Is(err, core.ErrRunPruned) {
+	if _, err := reopened.Submit(ctx, core.DefinitionRef{ID: "agent", Revision: "v1"}, "work", options); !errors.Is(err, core.ErrRunPruned) {
 		t.Fatalf("admission retry after reopen = %v, want ErrRunPruned", err)
 	}
 }

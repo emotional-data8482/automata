@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -48,7 +49,7 @@ func TestRunResultFields(t *testing.T) {
 		return "echoed:" + a.Msg, nil
 	}))
 
-	res, err := agent.Run(context.Background(), "go")
+	res, err := runAgent(t, agent, "go")
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -58,8 +59,8 @@ func TestRunResultFields(t *testing.T) {
 	if res.FinalMessage.Text() != "all done" {
 		t.Errorf("FinalMessage.Text() = %q, want %q", res.FinalMessage.Text(), "all done")
 	}
-	if res.Steps != 2 {
-		t.Errorf("Steps = %d, want 2", res.Steps)
+	if res.Turns != 2 {
+		t.Errorf("Turns = %d, want 2", res.Turns)
 	}
 	if res.Usage != (Usage{InputTokens: 18, OutputTokens: 8}) {
 		t.Errorf("Usage = %+v, want summed {18 8}", res.Usage)
@@ -73,26 +74,26 @@ func TestRunResultFields(t *testing.T) {
 	}
 }
 
-// TestRunResultMaxStepsReturnsPartials pins that hitting the step budget returns
-// the error AND a populated result (partial transcript, usage, StopMaxSteps).
-func TestRunResultMaxStepsReturnsPartials(t *testing.T) {
+// TestRunResultMaxTurnsReturnsPartials pins that hitting the turn budget returns
+// the error AND a populated result (partial transcript, usage, StopMaxTurns).
+func TestRunResultMaxTurnsReturnsPartials(t *testing.T) {
 	provider := &optionsProvider{turns: []Message{
 		withUsage(asstTool("c1", "echo", "{}"), &Usage{InputTokens: 4, OutputTokens: 2}),
 	}}
-	agent := testAgent(provider).WithMaxSteps(1)
+	agent := testAgent(provider).WithMaxTurns(1)
 	agent.RegisterTool(Func("echo", "echoes", func(_ context.Context, _ echoArgs) (string, error) {
 		return "ok", nil
 	}))
 
-	res, err := agent.Run(context.Background(), "go")
-	if !errors.Is(err, ErrMaxStepsExceeded) {
-		t.Fatalf("err = %v, want ErrMaxStepsExceeded", err)
+	res, err := runAgent(t, agent, "go")
+	if !errors.Is(err, ErrMaxTurnsExceeded) || !strings.Contains(err.Error(), "exceeded max turns (1)") {
+		t.Fatalf("err = %v, want ErrMaxTurnsExceeded with effective limit 1", err)
 	}
-	if res.StopReason != StopMaxSteps {
-		t.Errorf("StopReason = %q, want %q", res.StopReason, StopMaxSteps)
+	if res.StopReason != StopMaxTurns {
+		t.Errorf("StopReason = %q, want %q", res.StopReason, StopMaxTurns)
 	}
-	if res.Steps != 1 {
-		t.Errorf("Steps = %d, want 1", res.Steps)
+	if res.Turns != 1 {
+		t.Errorf("Turns = %d, want 1", res.Turns)
 	}
 	if res.Usage != (Usage{InputTokens: 4, OutputTokens: 2}) {
 		t.Errorf("Usage = %+v, want partial {4 2}", res.Usage)
@@ -143,7 +144,7 @@ func TestCompletionFailuresReturnPartialResults(t *testing.T) {
 				StopReason:    tt.reason,
 				RawStopReason: tt.raw,
 			}}
-			res, err := testAgent(provider).Run(context.Background(), "go")
+			res, err := runAgent(t, testAgent(provider), "go")
 			if !errors.Is(err, tt.wantIs) {
 				t.Fatalf("err = %v, want errors.Is(_, %v)", err, tt.wantIs)
 			}
@@ -160,8 +161,8 @@ func TestCompletionFailuresReturnPartialResults(t *testing.T) {
 			if res.StopReason != tt.reason || res.RawStopReason != tt.raw {
 				t.Errorf("result reasons = %q / %q, want %q / %q", res.StopReason, res.RawStopReason, tt.reason, tt.raw)
 			}
-			if res.Steps != 1 || len(res.Messages) == 0 || res.Messages[len(res.Messages)-1].Role != "assistant" {
-				t.Errorf("partial result lost progress: Steps=%d Messages=%+v", res.Steps, res.Messages)
+			if res.Turns != 1 || len(res.Messages) == 0 || res.Messages[len(res.Messages)-1].Role != "assistant" {
+				t.Errorf("partial result lost progress: Turns=%d Messages=%+v", res.Turns, res.Messages)
 			}
 		})
 	}
@@ -172,7 +173,7 @@ func TestUnrecognizedResponseReasonDoesNotBecomeSuccess(t *testing.T) {
 		Message:    asstText("looks complete"),
 		StopReason: StopReason("brand_new_reason"),
 	}}
-	res, err := testAgent(provider).Run(context.Background(), "go")
+	res, err := runAgent(t, testAgent(provider), "go")
 	if !errors.Is(err, ErrUnknownStopReason) {
 		t.Fatalf("err = %v, want ErrUnknownStopReason", err)
 	}
@@ -185,12 +186,12 @@ func TestUnrecognizedResponseReasonDoesNotBecomeSuccess(t *testing.T) {
 // provider on every turn.
 func TestDefaultCallOptionsSent(t *testing.T) {
 	provider := &optionsProvider{turns: []Message{asstText("done")}}
-	agent := testAgent(provider).WithDefaultCallOptions(CallOptions{
+	agent := testAgent(provider).WithCallOptions(CallOptions{
 		Temperature: floatPtr(0.2),
 		MaxTokens:   1024,
 	})
 
-	if _, err := agent.Run(context.Background(), "go"); err != nil {
+	if _, err := runAgent(t, agent, "go"); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	if len(provider.seen) != 1 {
@@ -199,51 +200,5 @@ func TestDefaultCallOptionsSent(t *testing.T) {
 	got := provider.seen[0]
 	if got.Temperature == nil || *got.Temperature != 0.2 || got.MaxTokens != 1024 {
 		t.Errorf("sent options = %+v, want temp 0.2 / max 1024", got)
-	}
-}
-
-// TestWithCallOptionsMergesOverDefault pins that a per-run override merges over
-// the agent default field-by-field: overridden fields change, others persist.
-func TestWithCallOptionsMergesOverDefault(t *testing.T) {
-	provider := &optionsProvider{turns: []Message{asstText("done")}}
-	agent := testAgent(provider).WithDefaultCallOptions(CallOptions{
-		Temperature: floatPtr(0.2),
-		MaxTokens:   1024,
-	})
-
-	if _, err := agent.Run(context.Background(), "go",
-		legacyCallOptions(CallOptions{MaxTokens: 4096}), // override only MaxTokens
-	); err != nil {
-		t.Fatalf("Run: %v", err)
-	}
-	got := provider.seen[0]
-	if got.MaxTokens != 4096 {
-		t.Errorf("MaxTokens = %d, want overridden 4096", got.MaxTokens)
-	}
-	if got.Temperature == nil || *got.Temperature != 0.2 {
-		t.Errorf("Temperature = %v, want default 0.2 preserved", got.Temperature)
-	}
-}
-
-// TestCallOptionsMerge unit-tests the field-wise merge directly.
-func TestCallOptionsMerge(t *testing.T) {
-	base := CallOptions{
-		Temperature:    floatPtr(0.5),
-		MaxTokens:      100,
-		StopSequences:  []string{"a"},
-		ThinkingBudget: 2048,
-	}
-	over := CallOptions{MaxTokens: 200, ThinkingBudget: 4096}
-	got := base.merge(over)
-
-	if got.MaxTokens != 200 || got.ThinkingBudget != 4096 {
-		t.Errorf("override fields not applied: %+v", got)
-	}
-	if got.Temperature == nil || *got.Temperature != 0.5 || len(got.StopSequences) != 1 {
-		t.Errorf("untouched fields not preserved: %+v", got)
-	}
-	// The base value is not mutated.
-	if base.MaxTokens != 100 {
-		t.Errorf("merge mutated the receiver: %+v", base)
 	}
 }

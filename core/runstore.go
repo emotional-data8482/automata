@@ -51,10 +51,6 @@ func NewMemoryStore() Store {
 	return &memoryStore{buckets: make(map[string]*memoryBucket)}
 }
 
-func newEphemeralStore() Store {
-	return NewMemoryStore()
-}
-
 // memoryStore serializes writers with an exclusive lock, so a writable
 // transaction mutates committed state in place and keeps an undo log for
 // rollback: a write costs O(log n) plus the key shift, never a copy of the

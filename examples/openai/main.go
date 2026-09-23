@@ -1,5 +1,7 @@
 // Command openai is a minimal tool-using agent on the automata framework,
 // backed by the OpenAI Chat Completions API (or any OpenAI-compatible endpoint).
+// The run is ephemeral: it executes through a core.Runtime on an in-memory
+// store, which is lost on exit.
 //
 // Environment:
 //
@@ -48,11 +50,25 @@ func main() {
 		})}})
 
 	if err != nil {
-		panic(err)
+		fmt.Fprintln(os.Stderr, "configure agent:", err)
+		os.Exit(1)
 	}
 
-	res, err := agent.RunStream(
-		context.Background(),
+	runtime, err := core.NewEphemeralRuntime()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "open runtime:", err)
+		os.Exit(1)
+	}
+	defer runtime.Close()
+	assistant, err := runtime.Register("assistant", "v1", agent)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "register agent:", err)
+		os.Exit(1)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	res, err := runtime.RunStream(ctx, assistant,
 		"What time is it right now in Tokyo, and how many hours ahead of UTC is that?",
 		func(ev core.StreamEvent) {
 			switch ev.Kind {
@@ -67,8 +83,8 @@ func main() {
 	)
 	fmt.Println()
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "run failed:", err)
+		fmt.Fprintf(os.Stderr, "run failed after %d turns (partial output %q): %v\n", res.Turns, res.Output, err)
 		os.Exit(1)
 	}
-	fmt.Printf("\n[%d steps, %d output tokens]\n", res.Steps, res.Usage.OutputTokens)
+	fmt.Printf("\n[%d turns, %d output tokens]\n", res.Turns, res.Usage.OutputTokens)
 }

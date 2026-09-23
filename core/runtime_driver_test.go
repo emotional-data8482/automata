@@ -33,10 +33,10 @@ func awaitWithin(t *testing.T, handle *RunHandle, within time.Duration) (RunResu
 func TestRuntimeDriverFinalizesWaitingDeadlineWithoutRecover(t *testing.T) {
 	runtime := newTestRuntime(t)
 	provider := &scriptedProvider{turns: []Message{asstTool("q-1", "ask_user", `{"prompt":"region?"}`)}}
-	if err := runtime.Register("asker", "v1", questionTestAgent(t, provider)); err != nil {
+	if _, err := runtime.Register("asker", "v1", questionTestAgent(t, provider)); err != nil {
 		t.Fatal(err)
 	}
-	handle, err := runtime.Submit(context.Background(), "asker", "v1", "help", SubmitOptions{Deadline: time.Now().Add(50 * time.Millisecond)})
+	handle, err := runtime.Submit(context.Background(), DefinitionRef{ID: "asker", Revision: "v1"}, "help", WithDeadline(time.Now().Add(50*time.Millisecond)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,10 +75,10 @@ func TestRuntimeDriverExpiresWaitWithoutRecover(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = runtime.Close() })
-	if err := runtime.Register("writer", "v1", expiringApprovalAgent(t, &calls, 30*time.Millisecond)); err != nil {
+	if _, err := runtime.Register("writer", "v1", expiringApprovalAgent(t, &calls, 30*time.Millisecond)); err != nil {
 		t.Fatal(err)
 	}
-	handle, err := runtime.Submit(context.Background(), "writer", "v1", "go", SubmitOptions{})
+	handle, err := runtime.Submit(context.Background(), DefinitionRef{ID: "writer", Revision: "v1"}, "go")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -144,13 +144,13 @@ func TestRuntimeDriverRepairsLostChildWakeWithoutRecover(t *testing.T) {
 		asstText("parent done"),
 	}})
 	newSharedChildDefinition(parent)
-	if err := runtime.Register("child", "v1", testAgent(childProvider)); err != nil {
+	if _, err := runtime.Register("child", "v1", testAgent(childProvider)); err != nil {
 		t.Fatal(err)
 	}
-	if err := runtime.Register("parent", "v1", parent); err != nil {
+	if _, err := runtime.Register("parent", "v1", parent); err != nil {
 		t.Fatal(err)
 	}
-	handle, err := runtime.Submit(context.Background(), "parent", "v1", "go", SubmitOptions{})
+	handle, err := runtime.Submit(context.Background(), DefinitionRef{ID: "parent", Revision: "v1"}, "go")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -178,7 +178,7 @@ func TestRuntimeDriverRepairsLostWakeThroughTerminalChild(t *testing.T) {
 		asstTool("g1", "delegate2", `{"topic":"tea"}`),
 		asstText("child done"),
 	}})
-	child.RegisterTool(DurableChildTool(childTestDefinition("delegate2"), DurableChildPolicy{DefinitionID: "grandchild", Revision: "v1"}))
+	child.RegisterTool(NewChildTool(childTestDefinition("delegate2"), DefinitionRef{ID: "grandchild", Revision: "v1"}))
 	parent := testAgent(&scriptedProvider{turns: []Message{
 		asstTool("c1", "delegate", `{"topic":"tea"}`),
 		asstText("parent done"),
@@ -191,11 +191,11 @@ func TestRuntimeDriverRepairsLostWakeThroughTerminalChild(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = runtime.Close() })
 	for id, agent := range map[string]*Agent{"grandchild": testAgent(grandchildProvider), "child": child, "parent": parent} {
-		if err := runtime.Register(id, "v1", agent); err != nil {
+		if _, err := runtime.Register(id, "v1", agent); err != nil {
 			t.Fatal(err)
 		}
 	}
-	handle, err := runtime.Submit(context.Background(), "parent", "v1", "go", SubmitOptions{})
+	handle, err := runtime.Submit(context.Background(), DefinitionRef{ID: "parent", Revision: "v1"}, "go")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -258,16 +258,16 @@ func TestRuntimeDriverSlowHookDoesNotDelayOtherDeadlines(t *testing.T) {
 	defer close(release)
 	for _, name := range []string{"first", "second"} {
 		provider := &scriptedProvider{turns: []Message{asstTool("q-1", "ask_user", `{"prompt":"region?"}`)}}
-		if err := runtime.Register(name, "v1", questionTestAgent(t, provider)); err != nil {
+		if _, err := runtime.Register(name, "v1", questionTestAgent(t, provider)); err != nil {
 			t.Fatal(err)
 		}
 	}
-	first, err := runtime.Submit(context.Background(), "first", "v1", "help", SubmitOptions{Deadline: time.Now().Add(100 * time.Millisecond)})
+	first, err := runtime.Submit(context.Background(), DefinitionRef{ID: "first", Revision: "v1"}, "help", WithDeadline(time.Now().Add(100*time.Millisecond)))
 	if err != nil {
 		t.Fatal(err)
 	}
 	waitForRuntimeWait(t, first)
-	second, err := runtime.Submit(context.Background(), "second", "v1", "help", SubmitOptions{Deadline: time.Now().Add(200 * time.Millisecond)})
+	second, err := runtime.Submit(context.Background(), DefinitionRef{ID: "second", Revision: "v1"}, "help", WithDeadline(time.Now().Add(200*time.Millisecond)))
 	if err != nil {
 		t.Fatal(err)
 	}

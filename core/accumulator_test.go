@@ -103,7 +103,7 @@ func TestStreamAccumulatorSnapshotIsolation(t *testing.T) {
 	}
 }
 
-// TestStreamAccumulatorTopLevelFirst pins Views ordering when a sub-agent
+// TestStreamAccumulatorTopLevelFirst pins Views ordering when a child run
 // produces events before the top-level agent does.
 func TestStreamAccumulatorTopLevelFirst(t *testing.T) {
 	var acc StreamAccumulator
@@ -124,7 +124,7 @@ func TestStreamAccumulatorViewMissing(t *testing.T) {
 }
 
 // TestStreamAccumulatorSeparatesParallelInvocations pins the InvocationID fix:
-// two concurrent calls to the same sub-agent tool share an Agent name but must
+// two concurrent calls to the same child tool share an Agent name but must
 // land in separate lanes keyed by InvocationID, not interleave into one view.
 func TestStreamAccumulatorSeparatesParallelInvocations(t *testing.T) {
 	var acc StreamAccumulator

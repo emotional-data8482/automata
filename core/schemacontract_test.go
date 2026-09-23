@@ -138,25 +138,16 @@ func TestSchemaContractEnforcedConstraints(t *testing.T) {
 	t.Run("integer exactness", func(t *testing.T) {
 		contract := mustCompileSchema(t, `{"type":"integer"}`)
 		for _, number := range []json.Number{"1e2", "1.0", "-2.5e3", "9007199254740993.0"} {
-			if !isIntegralNumber(number) {
-				t.Fatalf("isIntegralNumber(%q) = false, want true", number)
-			}
 			if got := firstViolation(contract.validate(number, "n")); got != "" {
 				t.Fatalf("integer %q rejected: %q", number, got)
 			}
 		}
 		for _, number := range []json.Number{"1.0000000000000001", "1e-1", "9007199254740993.1"} {
-			if isIntegralNumber(number) {
-				t.Fatalf("isIntegralNumber(%q) = true, want false", number)
-			}
 			if got := firstViolation(contract.validate(number, "n")); !strings.Contains(got, "non-integral number") {
 				t.Fatalf("fractional %q violation = %q", number, got)
 			}
 		}
 		for _, number := range []json.Number{"01", "+1", "1e", "NaN"} {
-			if isIntegralNumber(number) {
-				t.Fatalf("malformed isIntegralNumber(%q) = true, want false", number)
-			}
 			if got := firstViolation(contract.validate(number, "n")); !strings.Contains(got, "invalid JSON number") {
 				t.Fatalf("malformed %q violation = %q", number, got)
 			}

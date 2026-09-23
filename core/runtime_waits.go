@@ -149,7 +149,7 @@ func markRunReadyAfterWaits(tx StoreTransaction, runID string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if record.State != RuntimeWaiting && !(record.State == RuntimeNeedsAttention && record.AttentionKind == "child") {
+	if record.State != RuntimeWaiting && !(record.State == RuntimeNeedsAttention && record.AttentionKind == AttentionChild) {
 		return false, nil
 	}
 	record.State = RuntimeReady
@@ -230,7 +230,7 @@ func historicalWaitResult(wait storedWait, digest string) (bool, error) {
 // suspendedForDeadline reports a run whose logical deadline is enforced
 // without a worker: waiting on waits, or blocked on required-child attention.
 func suspendedForDeadline(record storedRuntimeRun) bool {
-	return record.State == RuntimeWaiting || (record.State == RuntimeNeedsAttention && record.AttentionKind == "child")
+	return record.State == RuntimeWaiting || (record.State == RuntimeNeedsAttention && record.AttentionKind == AttentionChild)
 }
 
 func finalizeWaitingDeadline(tx StoreTransaction, record *storedRuntimeRun, now time.Time) error {
@@ -327,13 +327,10 @@ func (h *RunHandle) ResolveWait(ctx context.Context, waitID string, resolution W
 		if len(resolution.Answer) == 0 || !json.Valid(resolution.Answer) {
 			return errors.New("question resolution requires a valid JSON answer")
 		}
-		if resolution.ActionDigest != "" || resolution.Decision != Allow {
+		if resolution.ActionDigest != "" || resolution.Decision != "" {
 			return errors.New("question resolution cannot authorize an action")
 		}
 	} else {
-		if resolution.Decision == Modify {
-			return errors.New("modified actions require a new approval")
-		}
 		if resolution.Decision != Allow && resolution.Decision != Deny {
 			return errors.New("invalid approval decision")
 		}

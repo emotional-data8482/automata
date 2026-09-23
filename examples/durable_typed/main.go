@@ -5,9 +5,13 @@
 // payload. Runtime corrects the payload in the same run without re-dispatching
 // the already accepted write.
 //
-// Second, a lead agent delegates to a reviewer through a durable child tool.
+// Second, a lead agent delegates to a reviewer through a typed child tool.
 // The reviewer's typed verdict is kept on its own child run, and the lead
 // continues the same conversation in a second, serialized turn.
+//
+// No JSON schema is written by hand: core.OutputSchema derives the output
+// contracts, core.ChildTool derives the child's input schema, and core.Decode
+// validates and decodes accepted output.
 package main
 
 import (
@@ -35,8 +39,14 @@ type PublishBrief struct {
 	Corrections int    `json:"corrections"`
 }
 
+// ReviewRequest is the reviewer child's input: the lead's model fills it,
+// and each call becomes a durable child run whose task is this value as JSON.
+type ReviewRequest struct {
+	Artifact string `json:"artifact" desc:"path of the artifact to review"`
+}
+
 type ReviewVerdict struct {
-	Verdict string `json:"verdict"`
+	Verdict string `json:"verdict" desc:"approve or reject"`
 	Notes   string `json:"notes"`
 }
 
@@ -117,17 +127,7 @@ func publishWithCorrection(ctx context.Context, runtime *core.Runtime) {
 		Tools:    []core.Tool{publish},
 		MaxTurns: 6,
 		StructuredOutput: &core.StructuredOutputConfig{
-			Schema: json.RawMessage(`{
-				"type":"object",
-				"properties":{
-					"title":{"type":"string"},
-					"accepted":{"type":"boolean"},
-					"receipt":{"type":"string"},
-					"corrections":{"type":"integer","minimum":0}
-				},
-				"required":["title","accepted","receipt","corrections"],
-				"additionalProperties":false
-			}`),
+			Schema:         core.OutputSchema[PublishBrief](),
 			MaxCorrections: 1,
 		},
 	})
@@ -135,12 +135,12 @@ func publishWithCorrection(ctx context.Context, runtime *core.Runtime) {
 		exitf("construct agent: %v", err)
 	}
 
-	if err := runtime.Register("publisher", "demo-v1", agent); err != nil {
+	publisher, err := runtime.Register("publisher", "demo-v1", agent)
+	if err != nil {
 		exitf("register agent: %v", err)
 	}
-	handle, err := runtime.Submit(ctx, "publisher", "demo-v1", "publish the report and return the domain brief", core.SubmitOptions{
-		Scope: "demo", Key: "report-001",
-	})
+	handle, err := runtime.Submit(ctx, publisher, "publish the report and return the domain brief",
+		core.WithIdempotencyKey("demo", "report-001"))
 	if err != nil {
 		exitf("submit run: %v", err)
 	}
@@ -149,8 +149,8 @@ func publishWithCorrection(ctx context.Context, runtime *core.Runtime) {
 	if err != nil {
 		exitf("run failed after %d turns with partial structured output %q: %v", result.Turns, result.StructuredOutput, err)
 	}
-	var brief PublishBrief
-	if err := json.Unmarshal(result.StructuredOutput, &brief); err != nil {
+	brief, err := core.Decode[PublishBrief](result)
+	if err != nil {
 		exitf("decode structured output: %v", err)
 	}
 	if writes.Load() != 1 {
@@ -181,30 +181,20 @@ func reviewThread(ctx context.Context, runtime *core.Runtime) {
 	reviewer, err := core.New(&fakeProvider{turns: []core.Message{
 		withUsage(core.AssistantMessage(core.ToolUseBlock{ID: "verdict-1", Name: "automata_structured_output", Input: json.RawMessage(`{"verdict":"approve","notes":"receipt report.md#1 matches the brief"}`)}), 40),
 	}}, core.AgentConfig{
-		MaxTurns: 3,
-		StructuredOutput: &core.StructuredOutputConfig{
-			Schema: json.RawMessage(`{
-				"type":"object",
-				"properties":{"verdict":{"type":"string","enum":["approve","reject"]},"notes":{"type":"string"}},
-				"required":["verdict","notes"],
-				"additionalProperties":false
-			}`),
-		},
+		MaxTurns:         3,
+		StructuredOutput: &core.StructuredOutputConfig{Schema: core.OutputSchema[ReviewVerdict]()},
 	})
 	if err != nil {
 		exitf("construct reviewer: %v", err)
 	}
-	if err := runtime.Register("reviewer", "demo-v1", reviewer); err != nil {
+	reviewerRef, err := runtime.Register("reviewer", "demo-v1", reviewer)
+	if err != nil {
 		exitf("register reviewer: %v", err)
 	}
 
 	// The child tool pins the reviewer's registered definition and revision;
 	// each call is admitted as its own durable run linked to the lead's call.
-	review := core.DurableChildTool(core.ToolDefinition{
-		Name:        "review",
-		Description: "Ask the reviewer for a verdict on one artifact.",
-		InputSchema: json.RawMessage(`{"type":"object","properties":{"artifact":{"type":"string"}},"required":["artifact"]}`),
-	}, core.DurableChildPolicy{DefinitionID: "reviewer", Revision: "demo-v1"})
+	review := core.ChildTool[ReviewRequest]("review", "Ask the reviewer for a verdict on one artifact.", reviewerRef)
 	lead, err := core.New(&fakeProvider{turns: []core.Message{
 		withUsage(core.AssistantMessage(core.ToolUseBlock{ID: "review-1", Name: "review", Input: json.RawMessage(`{"artifact":"report.md"}`)}), 30),
 		withUsage(core.AssistantMessage(core.TextBlock{Text: "The reviewer approved report.md."}), 60),
@@ -217,19 +207,19 @@ func reviewThread(ctx context.Context, runtime *core.Runtime) {
 	if err != nil {
 		exitf("construct lead: %v", err)
 	}
-	if err := runtime.Register("lead", "demo-v1", lead); err != nil {
+	leadRef, err := runtime.Register("lead", "demo-v1", lead)
+	if err != nil {
 		exitf("register lead: %v", err)
 	}
 
-	thread := core.ConversationOptions{Scope: "demo", ID: "report-review"}
-	first, err := runtime.Run(ctx, "lead", "demo-v1", "Get report.md reviewed.", core.SubmitOptions{Conversation: thread})
+	thread := core.ConversationRef{Scope: "demo", ID: "report-review"}
+	first, err := runtime.Run(ctx, leadRef, "Get report.md reviewed.", core.WithConversation(thread, ""))
 	if err != nil {
 		exitf("first turn failed after %d turns with output %q: %v", first.Turns, first.Output, err)
 	}
 	// The second turn names the head it continues; a stale or competing turn
 	// would be rejected instead of merged.
-	thread.ExpectedHead = first.RunID
-	second, err := runtime.Run(ctx, "lead", "demo-v1", "Summarize that for the team.", core.SubmitOptions{Conversation: thread})
+	second, err := runtime.Run(ctx, leadRef, "Summarize that for the team.", core.WithConversation(thread, first.RunID))
 	if err != nil {
 		exitf("second turn failed after %d turns with output %q: %v", second.Turns, second.Output, err)
 	}
@@ -243,11 +233,11 @@ func reviewThread(ctx context.Context, runtime *core.Runtime) {
 	if err != nil {
 		exitf("snapshot child run: %v", err)
 	}
-	var verdict ReviewVerdict
-	if err := json.Unmarshal(child.Result.StructuredOutput, &verdict); err != nil {
+	verdict, err := core.Decode[ReviewVerdict](child.Result)
+	if err != nil {
 		exitf("decode child verdict: %v", err)
 	}
-	conversation, err := runtime.Conversation(ctx, thread.Scope, thread.ID)
+	conversation, err := runtime.Conversation(ctx, thread)
 	if err != nil {
 		exitf("inspect conversation: %v", err)
 	}

@@ -27,9 +27,7 @@ func TestToolPolicyTimeoutIsRecoverable(t *testing.T) {
 	}))
 
 	var event StreamEvent
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	result, err := agent.RunStream(ctx, "go", func(ev StreamEvent) {
+	result, err := runAgentStream(t, agent, "go", func(ev StreamEvent) {
 		if ev.Kind == StreamToolResult {
 			event = ev
 		}
@@ -66,7 +64,7 @@ func TestToolPolicyTimeoutKeepsSiblingOutcome(t *testing.T) {
 		return "fast result", nil
 	}))
 
-	result, err := agent.Run(context.Background(), "go")
+	result, err := runAgent(t, agent, "go")
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -90,9 +88,7 @@ func TestToolPolicyParentDeadlineRemainsFatal(t *testing.T) {
 		return "", ctx.Err()
 	}))
 
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
-	defer cancel()
-	result, err := agent.Run(ctx, "go")
+	result, err := runAgent(t, agent, "go", WithDeadline(time.Now().Add(20*time.Millisecond)))
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("err = %v, want parent deadline", err)
 	}
@@ -117,7 +113,7 @@ func TestToolPolicyBudgetDeniesBatchOverflowInModelOrder(t *testing.T) {
 		return "ok", nil
 	}))
 
-	result, err := agent.Run(context.Background(), "go")
+	result, err := runAgent(t, agent, "go")
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -154,7 +150,7 @@ func TestToolPolicyBudgetPersistsAcrossProviderSteps(t *testing.T) {
 		return "ok", nil
 	}))
 
-	result, err := agent.Run(context.Background(), "go")
+	result, err := runAgent(t, agent, "go")
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -190,7 +186,7 @@ func TestToolPolicyPerToolBudgetDoesNotLimitOtherTools(t *testing.T) {
 		return "other", nil
 	}))
 
-	result, err := agent.Run(context.Background(), "go")
+	result, err := runAgent(t, agent, "go")
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -206,44 +202,7 @@ func TestToolPolicyPerToolBudgetDoesNotLimitOtherTools(t *testing.T) {
 	}
 }
 
-func TestToolPolicyBudgetReservationPrecedesApproval(t *testing.T) {
-	provider := &scriptedProvider{turns: []Message{
-		AssistantMessage(toolUse("c1", "work", `{}`), toolUse("c2", "work", `{}`)),
-		asstText("done"),
-	}}
-	var approvals atomic.Int64
-	var executions atomic.Int64
-	agent := testAgent(provider).
-		WithToolPolicy(ToolPolicy{MaxCalls: 1}).
-		WithApprover(ApproverFunc(func(_ context.Context, _ ToolUseBlock, _ []Message) (Decision, error) {
-			approvals.Add(1)
-			return Decision{Outcome: Deny, Reason: "operator denied"}, nil
-		}))
-	agent.RegisterTool(Func("work", "never executes", func(context.Context, struct{}) (string, error) {
-		executions.Add(1)
-		return "unexpected", nil
-	}))
-
-	result, err := agent.Run(context.Background(), "go")
-	if err != nil {
-		t.Fatalf("Run: %v", err)
-	}
-	if got := approvals.Load(); got != 1 {
-		t.Errorf("approvals = %d, want 1 (overflow is rejected before approval)", got)
-	}
-	if got := executions.Load(); got != 0 {
-		t.Errorf("executions = %d, want 0", got)
-	}
-	results := transcriptToolResults(result.Messages)
-	if got := (Message{Blocks: results[0].Content}).Text(); got != "denied: operator denied" {
-		t.Errorf("first result = %q", got)
-	}
-	if got := (Message{Blocks: results[1].Content}).Text(); !strings.Contains(got, "tool budget exhausted") {
-		t.Errorf("second result = %q", got)
-	}
-}
-
-func TestRunToolPolicyReplacesAgentDefaultAndBudgetsReset(t *testing.T) {
+func TestToolPolicyBudgetsArePerRun(t *testing.T) {
 	batch := AssistantMessage(toolUse("c1", "work", `{}`), toolUse("c2", "work", `{}`))
 	provider := &scriptedProvider{turns: []Message{batch, asstText("one"), batch, asstText("two")}}
 	var executed atomic.Int64
@@ -253,22 +212,21 @@ func TestRunToolPolicyReplacesAgentDefaultAndBudgetsReset(t *testing.T) {
 		return "ok", nil
 	}))
 
-	first, err := agent.Run(context.Background(), "first", WithToolPolicy(ToolPolicy{MaxCalls: 2}))
+	first, err := runAgent(t, agent, "first")
 	if err != nil {
 		t.Fatalf("first Run: %v", err)
 	}
-	second, err := agent.Run(context.Background(), "second")
+	second, err := runAgent(t, agent, "second")
 	if err != nil {
 		t.Fatalf("second Run: %v", err)
 	}
-	if got := executed.Load(); got != 3 {
-		t.Fatalf("executed across runs = %d, want 3", got)
+	if got := executed.Load(); got != 2 {
+		t.Fatalf("executed across runs = %d, want 2", got)
 	}
-	if results := transcriptToolResults(first.Messages); results[0].IsError || results[1].IsError {
-		t.Errorf("per-run replacement did not allow both calls: %+v", results)
-	}
-	if results := transcriptToolResults(second.Messages); results[0].IsError || !results[1].IsError {
-		t.Errorf("agent default was not restored/reset: %+v", results)
+	for _, result := range []RunResult{first, second} {
+		if results := transcriptToolResults(result.Messages); results[0].IsError || !results[1].IsError {
+			t.Errorf("each run should allow exactly one call: %+v", results)
+		}
 	}
 }
 
@@ -304,7 +262,7 @@ func TestToolPolicyRateLimiterDoesNotThrottleOtherTools(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		_, err := agent.Run(context.Background(), "go")
+		_, err := runAgent(t, agent, "go")
 		done <- err
 	}()
 	select {
@@ -352,7 +310,7 @@ func TestToolPolicyTimeoutIncludesRateLimiterWait(t *testing.T) {
 	}))
 
 	var event StreamEvent
-	result, err := agent.RunStream(context.Background(), "go", func(ev StreamEvent) {
+	result, err := runAgentStream(t, agent, "go", func(ev StreamEvent) {
 		if ev.Kind == StreamToolResult {
 			event = ev
 		}
@@ -383,7 +341,7 @@ func TestToolPolicyRateLimiterErrorIsRecoverable(t *testing.T) {
 		return "unexpected", nil
 	}))
 
-	result, err := agent.Run(context.Background(), "go")
+	result, err := runAgent(t, agent, "go")
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -424,7 +382,7 @@ func TestToolPolicyMaxParallel(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		_, err := agent.Run(context.Background(), "go")
+		_, err := runAgent(t, agent, "go")
 		done <- err
 	}()
 	for range 2 {
@@ -468,7 +426,7 @@ func TestToolPolicyWithToolRetryUsesOneBudgetReservation(t *testing.T) {
 	})
 	agent.RegisterTool(WithToolRetry(tool, retry.Config{MaxAttempts: 2, RetryUnknown: true}))
 
-	result, err := agent.Run(context.Background(), "go")
+	result, err := runAgent(t, agent, "go")
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -493,52 +451,33 @@ func (nestedBudgetProvider) Invoke(_ context.Context, req Request) (Response, er
 
 }
 
-func TestToolPolicyBudgetIsSharedAcrossConcurrentAsToolRuns(t *testing.T) {
-	child := testAgent(nestedBudgetProvider{})
-	var leafCalls atomic.Int64
-	child.RegisterTool(Func("leaf", "nested work", func(context.Context, struct{}) (string, error) {
-		leafCalls.Add(1)
-		return "leaf done", nil
-	}))
-
-	parentProvider := &scriptedProvider{turns: []Message{
-		AssistantMessage(toolUse("sub-1", "child", `{}`), toolUse("sub-2", "child", `{}`)),
-		asstText("parent done"),
-	}}
-	parent := testAgent(parentProvider).WithToolPolicy(ToolPolicy{MaxCalls: 3})
-	parent.RegisterTool(AsTool[struct{}](child, "child", "delegate"))
-
-	result, err := parent.Run(context.Background(), "go")
-	if err != nil {
-		t.Fatalf("Run: %v", err)
-	}
-	if result.Output != "parent done" {
-		t.Errorf("output = %q", result.Output)
-	}
-	// The two AsTool calls consume two slots; their concurrent child runs race
-	// for the one remaining shared slot, and exactly one nested tool may run.
-	if got := leafCalls.Load(); got != 1 {
-		t.Fatalf("nested leaf calls = %d, want 1", got)
-	}
-}
-
-func TestToolPolicyNestedBudgetStreamEventKeepsSubAgentTags(t *testing.T) {
+// A child run's budget denial reaches the parent's live view with the child's
+// tags: the parent's subtree cap is persisted and shared by the child.
+func TestToolPolicyChildBudgetDenialKeepsChildTags(t *testing.T) {
+	runtime := newTestRuntime(t)
 	child := testAgent(nestedBudgetProvider{})
 	var leafCalls atomic.Int64
 	child.RegisterTool(Func("leaf", "nested work", func(context.Context, struct{}) (string, error) {
 		leafCalls.Add(1)
 		return "unexpected", nil
 	}))
+	childRef, err := runtime.Register("child", "v1", child)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	parentProvider := &scriptedProvider{turns: []Message{
 		asstTool("sub-1", "child", `{}`),
 		asstText("parent done"),
 	}}
-	parent := testAgent(parentProvider).WithToolPolicy(ToolPolicy{MaxCalls: 1})
-	parent.RegisterTool(AsTool[struct{}](child, "child", "delegate"))
+	parent := testAgent(parentProvider).WithToolPolicy(ToolPolicy{MaxCalls: 1}).WithTools(ChildTool[struct{}]("child", "delegate", childRef))
+	parentRef, err := runtime.Register("parent", "v1", parent)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	var budgetEvent StreamEvent
-	_, err := parent.RunStream(context.Background(), "go", func(ev StreamEvent) {
+	_, err = runtime.RunStream(context.Background(), parentRef, "go", func(ev StreamEvent) {
 		if ev.Kind == StreamToolResult && errors.Is(ev.Err, ErrToolBudgetExhausted) {
 			budgetEvent = ev
 		}
@@ -572,9 +511,9 @@ func TestTerminalToolProducesResultsForEverySiblingCall(t *testing.T) {
 		return "unexpected", nil
 	}))
 
-	value, result, err := RunTyped[terminalBatchValue](context.Background(), agent, "go")
+	value, result, err := runTyped[terminalBatchValue](t, agent, "go")
 	if err != nil {
-		t.Fatalf("RunTyped: %v", err)
+		t.Fatalf("typed run: %v", err)
 	}
 	if value.Answer != "done" || executed.Load() {
 		t.Fatalf("value=%+v executed=%v", value, executed.Load())
@@ -585,20 +524,5 @@ func TestTerminalToolProducesResultsForEverySiblingCall(t *testing.T) {
 	}
 	if !results[0].IsError || results[1].IsError {
 		t.Errorf("terminal batch errors = [%v %v], want [true false]", results[0].IsError, results[1].IsError)
-	}
-}
-
-func TestToolPolicyInvalidConfigurationFailsBeforeProviderCall(t *testing.T) {
-	provider := &capturingProvider{turns: []Message{asstText("unexpected")}}
-	agent := testAgent(provider).WithToolPolicy(ToolPolicy{MaxParallel: -1})
-	result, err := agent.Run(context.Background(), "go")
-	if !errors.Is(err, ErrInvalidToolPolicy) {
-		t.Fatalf("err = %v, want ErrInvalidToolPolicy", err)
-	}
-	if provider.calls != 0 {
-		t.Fatalf("provider calls = %d, want 0", provider.calls)
-	}
-	if len(result.Messages) != 0 {
-		t.Errorf("messages = %+v, want untouched transcript", result.Messages)
 	}
 }

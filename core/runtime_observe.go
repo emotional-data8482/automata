@@ -70,7 +70,7 @@ type CommittedEvent struct {
 	// RuntimeNeedsAttention state.
 	State         RuntimeState
 	PreviousState RuntimeState
-	AttentionKind string
+	AttentionKind AttentionKind
 	Reason        string
 
 	// MessageIndex and MessageCount locate the appended messages in the run
@@ -118,7 +118,7 @@ type storedRunEvent struct {
 	Kind            CommittedEventKind  `json:"kind"`
 	State           RuntimeState        `json:"state,omitempty"`
 	PreviousState   RuntimeState        `json:"previous_state,omitempty"`
-	AttentionKind   string              `json:"attention_kind,omitempty"`
+	AttentionKind   AttentionKind       `json:"attention_kind,omitempty"`
 	Reason          string              `json:"reason,omitempty"`
 	MessageIndex    int                 `json:"message_index,omitempty"`
 	MessageCount    int                 `json:"message_count,omitempty"`
@@ -274,13 +274,13 @@ type runCommit struct {
 
 // runEventView decodes only the run-record fields event derivation reads.
 type runEventView struct {
-	State              RuntimeState `json:"state"`
-	TranscriptMessages int          `json:"transcript_messages"`
-	TranscriptBase     int          `json:"transcript_base_messages,omitempty"`
-	AttentionKind      string       `json:"attention_kind,omitempty"`
-	AttentionReason    string       `json:"attention_reason,omitempty"`
-	ParentRunID        string       `json:"parent_run_id,omitempty"`
-	Deadline           time.Time    `json:"deadline,omitempty"`
+	State              RuntimeState  `json:"state"`
+	TranscriptMessages int           `json:"transcript_messages"`
+	TranscriptBase     int           `json:"transcript_base_messages,omitempty"`
+	AttentionKind      AttentionKind `json:"attention_kind,omitempty"`
+	AttentionReason    string        `json:"attention_reason,omitempty"`
+	ParentRunID        string        `json:"parent_run_id,omitempty"`
+	Deadline           time.Time     `json:"deadline,omitempty"`
 }
 
 type invocationEventView struct {

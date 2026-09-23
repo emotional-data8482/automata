@@ -2,10 +2,8 @@ package core
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"reflect"
 	"strings"
 	"testing"
 )
@@ -15,17 +13,17 @@ type personResult struct {
 	Age  int    `json:"age"`
 }
 
-// TestRunTypedHappyPath pins the common case: the model calls the injected
-// structured_output tool, and RunTyped decodes its arguments into T.
-func TestRunTypedHappyPath(t *testing.T) {
+// TestTypedHappyPath pins the common case: the model calls the injected
+// structured_output tool, and Decode reads its arguments into T.
+func TestTypedHappyPath(t *testing.T) {
 	provider := &scriptedProvider{turns: []Message{
 		asstTool("s1", structuredOutputToolName, `{"name":"Ada","age":36}`),
 	}}
 	agent := testAgent(provider)
 
-	got, res, err := RunTyped[personResult](context.Background(), agent, "who?")
+	got, res, err := runTyped[personResult](t, agent, "who?")
 	if err != nil {
-		t.Fatalf("RunTyped: %v", err)
+		t.Fatalf("typed run: %v", err)
 	}
 	if got.Name != "Ada" || got.Age != 36 {
 		t.Errorf("decoded = %+v, want {Ada 36}", got)
@@ -35,14 +33,14 @@ func TestRunTypedHappyPath(t *testing.T) {
 	}
 }
 
-// TestRunTypedInjectsSchemaTool pins that the injected tool's JSON schema is
+// TestTypedInjectsSchemaTool pins that the injected tool's JSON schema is
 // derived from T and advertised to the model.
-func TestRunTypedInjectsSchemaTool(t *testing.T) {
+func TestTypedInjectsSchemaTool(t *testing.T) {
 	capt := &toolCapturingProvider{reply: asstTool("s1", structuredOutputToolName, `{"name":"x","age":1}`)}
 	agent := testAgent(capt)
 
-	if _, _, err := RunTyped[personResult](context.Background(), agent, "go"); err != nil {
-		t.Fatalf("RunTyped: %v", err)
+	if _, _, err := runTyped[personResult](t, agent, "go"); err != nil {
+		t.Fatalf("typed run: %v", err)
 	}
 	if capt.toolNames[structuredOutputToolName] == "" {
 		t.Fatalf("structured_output tool not advertised; saw %v", capt.toolNames)
@@ -56,21 +54,21 @@ func TestRunTypedInjectsSchemaTool(t *testing.T) {
 	}
 }
 
-// TestRunTypedForcesToolOnTextFallback pins the fallback: when the model answers
-// with prose, RunTyped issues a second turn forcing the tool with thinking
+// TestTypedForcesToolOnTextFallback pins the fallback: when the model answers
+// with prose, the run issues a second turn forcing the tool with thinking
 // disabled, and decodes that.
-func TestRunTypedForcesToolOnTextFallback(t *testing.T) {
+func TestTypedForcesToolOnTextFallback(t *testing.T) {
 	capt := &forcingProvider{
 		replies: []Message{
 			asstText("Ada is 36 years old."),                                    // turn 1: prose, no tool call
 			asstTool("s2", structuredOutputToolName, `{"name":"Ada","age":36}`), // forced turn
 		},
 	}
-	agent := testAgent(capt).WithDefaultCallOptions(CallOptions{ThinkingBudget: 2048})
+	agent := testAgent(capt).WithCallOptions(CallOptions{ThinkingBudget: 2048})
 
-	got, _, err := RunTyped[personResult](context.Background(), agent, "who?")
+	got, _, err := runTyped[personResult](t, agent, "who?")
 	if err != nil {
-		t.Fatalf("RunTyped: %v", err)
+		t.Fatalf("typed run: %v", err)
 	}
 	if got.Name != "Ada" || got.Age != 36 {
 		t.Errorf("decoded = %+v, want {Ada 36}", got)
@@ -89,35 +87,35 @@ func TestRunTypedForcesToolOnTextFallback(t *testing.T) {
 	}
 }
 
-// TestRunTypedDecodeErrorCorrects pins that malformed arguments surface as a
+// TestTypedDecodeErrorCorrects pins that malformed arguments surface as a
 // typed error carrying the decode cause — and that a model which fixes its
 // malformed JSON on the correction turn still produces a value.
-func TestRunTypedDecodeErrorCorrects(t *testing.T) {
+func TestTypedDecodeErrorCorrects(t *testing.T) {
 	provider := &scriptedProvider{turns: []Message{
 		asstTool("s1", structuredOutputToolName, `{"name":"x","age":"not-a-number"}`),
 		asstTool("s2", structuredOutputToolName, `{"name":"x","age":3}`),
 	}}
 	agent := testAgent(provider)
 
-	got, _, err := RunTyped[personResult](context.Background(), agent, "go")
+	got, _, err := runTyped[personResult](t, agent, "go")
 	if err != nil {
-		t.Fatalf("RunTyped: %v", err)
+		t.Fatalf("typed run: %v", err)
 	}
 	if got.Age != 3 {
 		t.Errorf("decoded = %+v, want age 3", got)
 	}
 }
 
-// TestRunTypedDecodeErrorBudgetExhausted pins that wrong-shaped payloads keep
+// TestTypedDecodeErrorBudgetExhausted pins that wrong-shaped payloads keep
 // shared schema violation detail on the typed error once corrections run out.
-func TestRunTypedDecodeErrorBudgetExhausted(t *testing.T) {
+func TestTypedDecodeErrorBudgetExhausted(t *testing.T) {
 	provider := &scriptedProvider{turns: []Message{
 		asstTool("s1", structuredOutputToolName, `{"name":"x","age":"not-a-number"}`),
 		asstTool("s2", structuredOutputToolName, `{"name":"x","age":"still-not-a-number"}`), // still wrong type
 	}}
 	agent := testAgent(provider)
 
-	_, res, err := RunTyped[personResult](context.Background(), agent, "go")
+	_, res, err := runTyped[personResult](t, agent, "go")
 	if !errors.Is(err, ErrInvalidStructuredOutput) {
 		t.Fatalf("err = %v, want ErrInvalidStructuredOutput", err)
 	}
@@ -128,21 +126,21 @@ func TestRunTypedDecodeErrorBudgetExhausted(t *testing.T) {
 	if !strings.Contains(typed.Violations[0], "age") || !strings.Contains(typed.Violations[0], "expected integer") {
 		t.Errorf("violations = %v, want age integer violation", typed.Violations)
 	}
-	if len(res.Messages) == 0 || res.Steps == 0 {
+	if len(res.Messages) == 0 || res.Turns == 0 {
 		t.Errorf("RunResult not populated alongside the error: %+v", res)
 	}
 }
 
-// TestRunTypedMissingRequiredFieldRejected pins the headline fix: a payload
+// TestTypedMissingRequiredFieldRejected pins the headline fix: a payload
 // missing a required field can never be returned as a zero-filled T.
-func TestRunTypedMissingRequiredFieldRejected(t *testing.T) {
+func TestTypedMissingRequiredFieldRejected(t *testing.T) {
 	provider := &scriptedProvider{turns: []Message{
 		asstTool("s1", structuredOutputToolName, `{"name":"Ada"}`), // age missing
 		asstTool("s2", structuredOutputToolName, `{"name":"Ada"}`), // still missing
 	}}
 	agent := testAgent(provider)
 
-	got, res, err := RunTyped[personResult](context.Background(), agent, "go")
+	got, res, err := runTyped[personResult](t, agent, "go")
 	if !errors.Is(err, ErrInvalidStructuredOutput) {
 		t.Fatalf("err = %v, want ErrInvalidStructuredOutput", err)
 	}
@@ -167,35 +165,35 @@ func TestRunTypedMissingRequiredFieldRejected(t *testing.T) {
 	}
 }
 
-// TestRunTypedWrongTypeRejected pins wrong-typed fields are validation
+// TestTypedWrongTypeRejected pins wrong-typed fields are validation
 // failures, not decode failures, and are corrected the same way.
-func TestRunTypedWrongTypeRejected(t *testing.T) {
+func TestTypedWrongTypeRejected(t *testing.T) {
 	provider := &scriptedProvider{turns: []Message{
 		asstTool("s1", structuredOutputToolName, `{"name":42,"age":36}`),
 		asstTool("s2", structuredOutputToolName, `{"name":"Ada","age":36}`),
 	}}
 	agent := testAgent(provider)
 
-	got, _, err := RunTyped[personResult](context.Background(), agent, "go")
+	got, _, err := runTyped[personResult](t, agent, "go")
 	if err != nil {
-		t.Fatalf("RunTyped: %v", err)
+		t.Fatalf("typed run: %v", err)
 	}
 	if got.Name != "Ada" {
 		t.Errorf("decoded = %+v, want Ada", got)
 	}
 }
 
-// TestRunTypedCorrectionPromptListsViolations pins the correction evidence fed
+// TestTypedCorrectionPromptListsViolations pins the correction evidence fed
 // back to the model: the violation list plus the instruction to call the tool again.
-func TestRunTypedCorrectionPromptListsViolations(t *testing.T) {
+func TestTypedCorrectionPromptListsViolations(t *testing.T) {
 	provider := &capturingProvider{turns: []Message{
 		asstTool("s1", structuredOutputToolName, `{"name":"Ada"}`),
 		asstTool("s2", structuredOutputToolName, `{"name":"Ada","age":36}`),
 	}}
 	agent := testAgent(provider)
 
-	if _, _, err := RunTyped[personResult](context.Background(), agent, "go"); err != nil {
-		t.Fatalf("RunTyped: %v", err)
+	if _, _, err := runTyped[personResult](t, agent, "go"); err != nil {
+		t.Fatalf("typed run: %v", err)
 	}
 	if len(provider.received) != 2 {
 		t.Fatalf("provider saw %d requests, want 2", len(provider.received))
@@ -218,15 +216,15 @@ func TestRunTypedCorrectionPromptListsViolations(t *testing.T) {
 	}
 }
 
-// TestRunTypedCorrectionBudgetZeroDisables pins WithMaxCorrectionTurns(0): the
+// TestTypedCorrectionBudgetZeroDisables pins withCorrections(0): the
 // invalid payload errors immediately with no correction or forced turn.
-func TestRunTypedCorrectionBudgetZeroDisables(t *testing.T) {
+func TestTypedCorrectionBudgetZeroDisables(t *testing.T) {
 	provider := &scriptedProvider{turns: []Message{
 		asstTool("s1", structuredOutputToolName, `{"name":"Ada"}`),
 	}}
 	agent := testAgent(provider)
 
-	_, _, err := RunTyped[personResult](context.Background(), agent, "go", WithMaxCorrectionTurns(0))
+	_, _, err := runTyped[personResult](t, agent, "go", withCorrections(0))
 	if !errors.Is(err, ErrInvalidStructuredOutput) {
 		t.Fatalf("err = %v, want ErrInvalidStructuredOutput", err)
 	}
@@ -235,9 +233,9 @@ func TestRunTypedCorrectionBudgetZeroDisables(t *testing.T) {
 	}
 }
 
-// TestRunTypedCorrectionBudgetTwo pins the budget is configurable and counted
-// per RunTyped call.
-func TestRunTypedCorrectionBudgetTwo(t *testing.T) {
+// TestTypedCorrectionBudgetTwo pins the budget is configurable and counted
+// per typed run.
+func TestTypedCorrectionBudgetTwo(t *testing.T) {
 	provider := &scriptedProvider{turns: []Message{
 		asstTool("s1", structuredOutputToolName, `{"name":"Ada"}`),
 		asstTool("s2", structuredOutputToolName, `{"age":36}`),
@@ -245,9 +243,9 @@ func TestRunTypedCorrectionBudgetTwo(t *testing.T) {
 	}}
 	agent := testAgent(provider)
 
-	got, _, err := RunTyped[personResult](context.Background(), agent, "go", WithMaxCorrectionTurns(2))
+	got, _, err := runTyped[personResult](t, agent, "go", withCorrections(2))
 	if err != nil {
-		t.Fatalf("RunTyped: %v", err)
+		t.Fatalf("typed run: %v", err)
 	}
 	if got.Name != "Grace" {
 		t.Errorf("decoded = %+v, want Grace", got)
@@ -257,69 +255,19 @@ func TestRunTypedCorrectionBudgetTwo(t *testing.T) {
 	}
 }
 
-// TestRunTypedCorrectionProviderErrorPropagates pins that a correction turn
+// TestTypedCorrectionProviderErrorPropagates pins that a correction turn
 // failing for unrelated reasons returns that error, not a validation error.
-func TestRunTypedCorrectionProviderErrorPropagates(t *testing.T) {
+func TestTypedCorrectionProviderErrorPropagates(t *testing.T) {
 	providerErr := errors.New("provider exploded")
 	provider := &failOnSecondProvider{first: asstTool("s1", structuredOutputToolName, `{"name":"Ada"}`), err: providerErr}
 	agent := testAgent(provider)
 
-	_, _, err := RunTyped[personResult](context.Background(), agent, "go")
-	if !errors.Is(err, providerErr) {
+	_, _, err := runTyped[personResult](t, agent, "go")
+	if err == nil || !strings.Contains(err.Error(), providerErr.Error()) {
 		t.Fatalf("err = %v, want provider error propagated", err)
 	}
 	if errors.Is(err, ErrInvalidStructuredOutput) {
 		t.Errorf("provider error masked as validation error")
-	}
-}
-
-func TestRunSessionTypedCorrectionCommitsConversation(t *testing.T) {
-	provider := &scriptedProvider{turns: []Message{
-		asstTool("s1", structuredOutputToolName, `{"name":"Ada"}`),
-		asstTool("s2", structuredOutputToolName, `{"name":"Ada","age":36}`),
-	}}
-	session := testAgent(provider).NewSession()
-	got, result, err := RunSessionTyped[personResult](context.Background(), session, "who?")
-	if err != nil {
-		t.Fatalf("RunSessionTyped: %v", err)
-	}
-	if got.Name != "Ada" || got.Age != 36 {
-		t.Errorf("decoded = %+v, want Ada/36", got)
-	}
-	if !reflect.DeepEqual(session.Messages(), result.Messages) {
-		t.Errorf("corrected result was not committed to the conversation")
-	}
-}
-
-// TestRunSessionTypedCorrectionTranscriptResumable pins the correction
-// exchange is committed to the transcript and survives a JSON round-trip.
-func TestRunSessionTypedCorrectionTranscriptResumable(t *testing.T) {
-	provider := &capturingProvider{turns: []Message{
-		asstTool("s1", structuredOutputToolName, `{"name":"Ada"}`),
-		asstTool("s2", structuredOutputToolName, `{"name":"Ada","age":36}`),
-		asstTool("s3", structuredOutputToolName, `{"name":"Grace","age":37}`),
-	}}
-	agent := testAgent(provider)
-	session := agent.NewSession()
-	if _, _, err := RunSessionTyped[personResult](context.Background(), session, "first"); err != nil {
-		t.Fatalf("first: %v", err)
-	}
-
-	blob, err := json.Marshal(session.Messages())
-	if err != nil {
-		t.Fatalf("marshal transcript: %v", err)
-	}
-	var transcript []Message
-	if err := json.Unmarshal(blob, &transcript); err != nil {
-		t.Fatalf("unmarshal transcript: %v", err)
-	}
-	resumed := agent.testResumeSession(transcript)
-	got, _, err := RunSessionTyped[personResult](context.Background(), resumed, "second")
-	if err != nil {
-		t.Fatalf("resumed RunSessionTyped: %v", err)
-	}
-	if got.Name != "Grace" {
-		t.Errorf("resumed typed result = %+v, want Grace", got)
 	}
 }
 
@@ -376,17 +324,17 @@ func TestExtractJSONCandidates(t *testing.T) {
 	}
 }
 
-// TestRunTypedProseFencedJSON pins the cheap prose path: a fenced ```json
+// TestTypedProseFencedJSON pins the cheap prose path: a fenced ```json
 // payload validates and returns with zero extra provider turns.
-func TestRunTypedProseFencedJSON(t *testing.T) {
+func TestTypedProseFencedJSON(t *testing.T) {
 	provider := &scriptedProvider{turns: []Message{
 		asstText("Here is the answer:\n```json\n{\"name\":\"Ada\",\"age\":36}\n```"),
 	}}
 	agent := testAgent(provider)
 
-	got, _, err := RunTyped[personResult](context.Background(), agent, "who?")
+	got, _, err := runTyped[personResult](t, agent, "who?")
 	if err != nil {
-		t.Fatalf("RunTyped: %v", err)
+		t.Fatalf("typed run: %v", err)
 	}
 	if got.Name != "Ada" || got.Age != 36 {
 		t.Errorf("decoded = %+v", got)
@@ -396,16 +344,16 @@ func TestRunTypedProseFencedJSON(t *testing.T) {
 	}
 }
 
-// TestRunTypedProseBareObject pins that an unfenced JSON object is extracted.
-func TestRunTypedProseBareObject(t *testing.T) {
+// TestTypedProseBareObject pins that an unfenced JSON object is extracted.
+func TestTypedProseBareObject(t *testing.T) {
 	provider := &scriptedProvider{turns: []Message{
 		asstText(`The answer is {"name": "Grace", "age": 37} — hope that helps.`),
 	}}
 	agent := testAgent(provider)
 
-	got, _, err := RunTyped[personResult](context.Background(), agent, "who?")
+	got, _, err := runTyped[personResult](t, agent, "who?")
 	if err != nil {
-		t.Fatalf("RunTyped: %v", err)
+		t.Fatalf("typed run: %v", err)
 	}
 	if got.Name != "Grace" || got.Age != 37 {
 		t.Errorf("decoded = %+v", got)
@@ -415,18 +363,18 @@ func TestRunTypedProseBareObject(t *testing.T) {
 	}
 }
 
-// TestRunTypedProseWrongShapeCorrects pins that valid-JSON-wrong-shape prose
+// TestTypedProseWrongShapeCorrects pins that valid-JSON-wrong-shape prose
 // routes to the correction turn before the forced fallback.
-func TestRunTypedProseWrongShapeCorrects(t *testing.T) {
+func TestTypedProseWrongShapeCorrects(t *testing.T) {
 	provider := &scriptedProvider{turns: []Message{
 		asstText(`{"name":"Ada"}`), // missing age
 		asstTool("s2", structuredOutputToolName, `{"name":"Ada","age":36}`),
 	}}
 	agent := testAgent(provider)
 
-	got, _, err := RunTyped[personResult](context.Background(), agent, "who?")
+	got, _, err := runTyped[personResult](t, agent, "who?")
 	if err != nil {
-		t.Fatalf("RunTyped: %v", err)
+		t.Fatalf("typed run: %v", err)
 	}
 	if got.Age != 36 {
 		t.Errorf("decoded = %+v", got)
@@ -438,17 +386,17 @@ func TestRunTypedProseWrongShapeCorrects(t *testing.T) {
 
 // --- collision safety ------------------------------------------------------
 
-// TestRunTypedToolNameCollisionFailsFast pins that a user tool occupying the
+// TestTypedToolNameCollisionFailsFast pins that a user tool occupying the
 // hidden tool's (namespaced) name fails the run with an explicit error instead
 // of silently shadowing.
-func TestRunTypedToolNameCollisionFailsFast(t *testing.T) {
+func TestTypedToolNameCollisionFailsFast(t *testing.T) {
 	provider := &scriptedProvider{turns: []Message{asstText("unused")}}
 	agent := testAgent(provider)
 	agent.RegisterTool(Func(structuredOutputToolName, "user tool with the same name",
 		func(context.Context, struct{}) (string, error) { return "", nil }))
 
-	_, _, err := RunTyped[personResult](context.Background(), agent, "go")
-	if err == nil || !strings.Contains(err.Error(), "reserved") {
+	_, _, err := runTyped[personResult](t, agent, "go")
+	if err == nil || !strings.Contains(err.Error(), `duplicate tool "automata_structured_output"`) {
 		t.Fatalf("err = %v, want explicit collision error", err)
 	}
 	if provider.calls != 0 {
@@ -470,8 +418,8 @@ func TestStructuredOutputNameIsNamespaced(t *testing.T) {
 	agent := testAgent(provider)
 	agent.RegisterTool(Func("structured_output", "user tool",
 		func(context.Context, struct{}) (string, error) { return "", nil }))
-	if _, _, err := RunTyped[personResult](context.Background(), agent, "go"); err != nil {
-		t.Fatalf("RunTyped with a structured_output user tool: %v", err)
+	if _, _, err := runTyped[personResult](t, agent, "go"); err != nil {
+		t.Fatalf("typed run with a structured_output user tool: %v", err)
 	}
 }
 
@@ -498,18 +446,18 @@ func (p *nativeCapturingProvider) Invoke(_ context.Context, req Request) (Respon
 
 func (p *nativeCapturingProvider) SupportsNativeStructuredOutput() bool { return true }
 
-// TestRunTypedNativeModeSupportedProvider pins the native path: no hidden tool
+// TestTypedNativeModeSupportedProvider pins the native path: no hidden tool
 // is advertised, the schema travels via CallOptions.OutputSchema, and the
 // response text is validated and decoded.
-func TestRunTypedNativeModeSupportedProvider(t *testing.T) {
+func TestTypedNativeModeSupportedProvider(t *testing.T) {
 	provider := &nativeCapturingProvider{turns: []Message{
 		asstText(`{"name":"Ada","age":36}`),
 	}}
 	agent := testAgent(provider)
 
-	got, _, err := RunTyped[personResult](context.Background(), agent, "who?", WithNativeStructuredOutput())
+	got, _, err := runTyped[personResult](t, agent, "who?", withNative())
 	if err != nil {
-		t.Fatalf("RunTyped: %v", err)
+		t.Fatalf("typed run: %v", err)
 	}
 	if got.Name != "Ada" || got.Age != 36 {
 		t.Errorf("decoded = %+v", got)
@@ -526,18 +474,18 @@ func TestRunTypedNativeModeSupportedProvider(t *testing.T) {
 	}
 }
 
-// TestRunTypedNativeModeInvalidPayloadFallsBack pins the shared native correction
+// TestTypedNativeModeInvalidPayloadFallsBack pins the shared native correction
 // path: an unusable native payload is corrected in prose inside the same run.
-func TestRunTypedNativeModeInvalidPayloadFallsBack(t *testing.T) {
+func TestTypedNativeModeInvalidPayloadFallsBack(t *testing.T) {
 	provider := &nativeCapturingProvider{turns: []Message{
 		asstText("I cannot produce that."), // no JSON
 		asstText(`{"name":"Ada","age":36}`),
 	}}
 	agent := testAgent(provider)
 
-	got, _, err := RunTyped[personResult](context.Background(), agent, "who?", WithNativeStructuredOutput())
+	got, _, err := runTyped[personResult](t, agent, "who?", withNative())
 	if err != nil {
-		t.Fatalf("RunTyped: %v", err)
+		t.Fatalf("typed run: %v", err)
 	}
 	if got.Name != "Ada" {
 		t.Errorf("decoded = %+v", got)
@@ -547,17 +495,17 @@ func TestRunTypedNativeModeInvalidPayloadFallsBack(t *testing.T) {
 	}
 }
 
-// TestRunTypedNativeModeUnsupportedProviderUsesHiddenTool pins that the option
+// TestTypedNativeModeUnsupportedProviderUsesHiddenTool pins that the option
 // is inert on providers that only implement the base interface.
-func TestRunTypedNativeModeUnsupportedProviderUsesHiddenTool(t *testing.T) {
+func TestTypedNativeModeUnsupportedProviderUsesHiddenTool(t *testing.T) {
 	provider := &scriptedProvider{turns: []Message{
 		asstTool("s1", structuredOutputToolName, `{"name":"Ada","age":36}`),
 	}}
 	agent := testAgent(provider)
 
-	got, _, err := RunTyped[personResult](context.Background(), agent, "go", WithNativeStructuredOutput())
+	got, _, err := runTyped[personResult](t, agent, "go", withNative())
 	if err != nil {
-		t.Fatalf("RunTyped: %v", err)
+		t.Fatalf("typed run: %v", err)
 	}
 	if got.Name != "Ada" {
 		t.Errorf("decoded = %+v", got)
@@ -565,8 +513,8 @@ func TestRunTypedNativeModeUnsupportedProviderUsesHiddenTool(t *testing.T) {
 	// The hidden tool was injected (scriptedProvider has no capability method).
 	capt := &toolCapturingProvider{reply: asstTool("s1", structuredOutputToolName, `{"name":"x","age":1}`)}
 	agent2 := testAgent(capt)
-	if _, _, err := RunTyped[personResult](context.Background(), agent2, "go", WithNativeStructuredOutput()); err != nil {
-		t.Fatalf("RunTyped: %v", err)
+	if _, _, err := runTyped[personResult](t, agent2, "go", withNative()); err != nil {
+		t.Fatalf("typed run: %v", err)
 	}
 	if capt.toolNames[structuredOutputToolName] == "" {
 		t.Errorf("hidden tool not advertised on non-native provider")
@@ -588,9 +536,9 @@ func (p *failOnSecondProvider) Invoke(_ context.Context, _ Request) (Response, e
 	return Response{}, p.err
 }
 
-// TestRunTypedCoexistsWithRealTools pins that RunTyped works when the agent also
+// TestTypedCoexistsWithRealTools pins that typed output works when the agent also
 // has ordinary tools: the model may call a real tool first, then the terminal.
-func TestRunTypedCoexistsWithRealTools(t *testing.T) {
+func TestTypedCoexistsWithRealTools(t *testing.T) {
 	provider := &scriptedProvider{turns: []Message{
 		asstTool("c1", "lookup", `{"q":"Ada"}`),
 		asstTool("s1", structuredOutputToolName, `{"name":"Ada","age":36}`),
@@ -602,32 +550,51 @@ func TestRunTypedCoexistsWithRealTools(t *testing.T) {
 		return "found", nil
 	}))
 
-	got, _, err := RunTyped[personResult](context.Background(), agent, "go")
+	got, _, err := runTyped[personResult](t, agent, "go")
 	if err != nil {
-		t.Fatalf("RunTyped: %v", err)
+		t.Fatalf("typed run: %v", err)
 	}
 	if got.Name != "Ada" {
 		t.Errorf("decoded = %+v, want name Ada", got)
 	}
 }
 
-// TestRunSessionTypedContinuesConversation verifies typed decisions can be
-// produced repeatedly without discarding the coordinator's prior turns.
-func TestRunSessionTypedContinuesConversation(t *testing.T) {
+// TestTypedConversationContinuesPriorTurns verifies typed decisions can be
+// produced by successive conversation turns without discarding the
+// coordinator's prior turns.
+func TestTypedConversationContinuesPriorTurns(t *testing.T) {
 	provider := &capturingProvider{turns: []Message{
 		asstTool("s1", structuredOutputToolName, `{"name":"Ada","age":36}`),
 		asstTool("s2", structuredOutputToolName, `{"name":"Grace","age":37}`),
 	}}
-	agent := testAgent(provider).WithSystemPrompt("Remember prior decisions.")
-	session := agent.NewSession()
-
-	first, _, err := RunSessionTyped[personResult](context.Background(), session, "first")
+	agent, err := New(provider, AgentConfig{
+		SystemPrompt:     "Remember prior decisions.",
+		StructuredOutput: &StructuredOutputConfig{Schema: OutputSchema[personResult]()},
+	})
 	if err != nil {
-		t.Fatalf("first RunSessionTyped: %v", err)
+		t.Fatal(err)
 	}
-	second, _, err := RunSessionTyped[personResult](context.Background(), session, "second")
+	runtime := newTestRuntime(t)
+	ref, err := runtime.Register("coordinator", "v1", agent)
 	if err != nil {
-		t.Fatalf("second RunSessionTyped: %v", err)
+		t.Fatal(err)
+	}
+	thread := ConversationRef{ID: "decisions"}
+	firstResult, err := runtime.Run(context.Background(), ref, "first", WithConversation(thread, ""))
+	if err != nil {
+		t.Fatalf("first turn: %v", err)
+	}
+	secondResult, err := runtime.Run(context.Background(), ref, "second", WithConversation(thread, firstResult.RunID))
+	if err != nil {
+		t.Fatalf("second turn: %v", err)
+	}
+	first, err := Decode[personResult](firstResult)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := Decode[personResult](secondResult)
+	if err != nil {
+		t.Fatal(err)
 	}
 	if first.Name != "Ada" || second.Name != "Grace" {
 		t.Fatalf("typed results = %+v / %+v, want Ada / Grace", first, second)
@@ -650,83 +617,38 @@ func TestRunSessionTypedContinuesConversation(t *testing.T) {
 	}
 }
 
-// TestRunSessionTypedResumeJSONRoundTrip proves a persisted typed conversation
-// can be resumed and used for another typed decision without reseeding the
-// system prompt.
-func TestRunSessionTypedResumeJSONRoundTrip(t *testing.T) {
-	provider := &capturingProvider{turns: []Message{
-		asstTool("s1", structuredOutputToolName, `{"name":"Ada","age":36}`),
-		asstTool("s2", structuredOutputToolName, `{"name":"Grace","age":37}`),
-	}}
-	agent := testAgent(provider).WithSystemPrompt("sys")
-	session := agent.NewSession()
-	if _, _, err := RunSessionTyped[personResult](context.Background(), session, "first"); err != nil {
-		t.Fatalf("first RunSessionTyped: %v", err)
-	}
-
-	blob, err := json.Marshal(session.Messages())
-	if err != nil {
-		t.Fatalf("marshal transcript: %v", err)
-	}
-	var transcript []Message
-	if err := json.Unmarshal(blob, &transcript); err != nil {
-		t.Fatalf("unmarshal transcript: %v", err)
-	}
-
-	resumed := agent.testResumeSession(transcript)
-	got, _, err := RunSessionTyped[personResult](context.Background(), resumed, "second")
-	if err != nil {
-		t.Fatalf("resumed RunSessionTyped: %v", err)
-	}
-	if got.Name != "Grace" || got.Age != 37 {
-		t.Errorf("resumed typed result = %+v, want Grace/37", got)
-	}
-
-	systems := 0
-	for _, message := range provider.received[1] {
-		if message.Role == "system" {
-			systems++
-		}
-	}
-	if systems != 1 {
-		t.Errorf("resumed typed request saw %d system messages, want 1", systems)
-	}
-}
-
-func TestRunSessionTypedFallbackCommitsConversation(t *testing.T) {
+func TestTypedFallbackCommitsTranscript(t *testing.T) {
 	provider := &forcingProvider{replies: []Message{
 		asstText("Ada is 36 years old."),
 		asstTool("s2", structuredOutputToolName, `{"name":"Ada","age":36}`),
 	}}
-	session := testAgent(provider).NewSession()
-	got, result, err := RunSessionTyped[personResult](context.Background(), session, "who?")
+	got, result, err := runTyped[personResult](t, testAgent(provider), "who?")
 	if err != nil {
-		t.Fatalf("RunSessionTyped: %v", err)
+		t.Fatalf("runTyped: %v", err)
 	}
 	if got.Name != "Ada" || got.Age != 36 {
 		t.Errorf("decoded = %+v, want Ada/36", got)
 	}
-	if len(result.Messages) != 5 || !reflect.DeepEqual(session.Messages(), result.Messages) {
-		t.Errorf("fallback conversation = %+v", result.Messages)
+	if len(result.Messages) != 5 {
+		t.Errorf("fallback transcript = %+v", result.Messages)
 	}
 }
 
-func TestRunSessionTypedMaxStepsReturnsPartialResult(t *testing.T) {
+func TestTypedMaxTurnsReturnsPartialResult(t *testing.T) {
 	provider := &optionsProvider{turns: []Message{
 		withUsage(asstTool("c1", "lookup", `{}`), &Usage{InputTokens: 4, OutputTokens: 2}),
 	}}
-	agent := testAgent(provider).WithMaxSteps(1)
+	agent := testAgent(provider).WithMaxTurns(1)
 	agent.RegisterTool(Func("lookup", "looks up", func(context.Context, struct{}) (string, error) {
 		return "found", nil
 	}))
-	session := agent.NewSession()
 
-	_, result, err := RunSessionTyped[personResult](context.Background(), session, "go")
-	if !errors.Is(err, ErrMaxStepsExceeded) {
-		t.Fatalf("err = %v, want ErrMaxStepsExceeded", err)
+	_, result, err := runTyped[personResult](t, agent, "go")
+	if !errors.Is(err, ErrMaxTurnsExceeded) {
+		t.Fatalf("err = %v, want ErrMaxTurnsExceeded", err)
 	}
-	if result.StopReason != StopMaxSteps || result.Steps != 1 {
-		t.Errorf("partial result stop/steps = %q/%d, want max_steps/1", result.StopReason, result.Steps)
+	if result.StopReason != StopMaxTurns || result.Turns != 1 {
+		t.Errorf("partial result stop/turns = %q/%d, want max_turns/1", result.StopReason, result.Turns)
 	}
 	if result.Usage != (Usage{InputTokens: 4, OutputTokens: 2}) {
 		t.Errorf("partial usage = %+v, want {4 2}", result.Usage)
@@ -734,9 +656,43 @@ func TestRunSessionTypedMaxStepsReturnsPartialResult(t *testing.T) {
 	if got := roles(result.Messages); len(got) != 3 {
 		t.Errorf("partial transcript roles = %v, want user/assistant/tool", got)
 	}
-	if got := roles(session.Messages()); strings.Join(got, ",") != strings.Join(roles(result.Messages), ",") {
-		t.Errorf("committed transcript roles = %v, want %v", got, roles(result.Messages))
+}
+
+// --- helpers --------------------------------------------------------------
+
+type typedRun struct {
+	corrections int
+	native      bool
+}
+
+type typedOption func(*typedRun)
+
+func withCorrections(n int) typedOption { return func(r *typedRun) { r.corrections = n } }
+func withNative() typedOption           { return func(r *typedRun) { r.native = true } }
+
+// runTyped declares T's schema on the fixture agent, with one correction
+// turn unless overridden, runs it through a Runtime, and decodes the
+// accepted output with Decode.
+func runTyped[T any](t testing.TB, agent *Agent, task string, opts ...typedOption) (T, RunResult, error) {
+	t.Helper()
+	cfg := typedRun{corrections: 1}
+	for _, opt := range opts {
+		opt(&cfg)
 	}
+	contract, err := validateStructuredOutputDeclaration(&StructuredOutputConfig{
+		Schema: OutputSchema[T](), MaxCorrections: cfg.corrections, Native: cfg.native,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	agent.structuredOutput = contract
+	var zero T
+	result, err := runAgent(t, agent, task)
+	if err != nil {
+		return zero, result, err
+	}
+	value, err := Decode[T](result)
+	return value, result, err
 }
 
 // --- test providers -------------------------------------------------------

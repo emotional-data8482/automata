@@ -27,11 +27,11 @@ func TestRuntimePruneAppliesEachClassIndependently(t *testing.T) {
 		t.Fatal(err)
 	}
 	runtime := newTestRuntime(t)
-	if err := runtime.Register("agent", "v1", agent); err != nil {
+	if _, err := runtime.Register("agent", "v1", agent); err != nil {
 		t.Fatal(err)
 	}
-	options := SubmitOptions{Scope: "tenant", Key: "job-1"}
-	result, err := runtime.Run(context.Background(), "agent", "v1", "work", options)
+	options := WithIdempotencyKey("tenant", "job-1")
+	result, err := runtime.Run(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "work", options)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,10 +80,10 @@ func TestRuntimePruneAppliesEachClassIndependently(t *testing.T) {
 	if err := handle.Cancel(ctx); !errors.Is(err, ErrRunPruned) {
 		t.Fatalf("cancel of pruned run = %v, want ErrRunPruned", err)
 	}
-	if _, err := runtime.Submit(ctx, "agent", "v1", "work", options); !errors.Is(err, ErrRunPruned) {
+	if _, err := runtime.Submit(ctx, DefinitionRef{ID: "agent", Revision: "v1"}, "work", options); !errors.Is(err, ErrRunPruned) {
 		t.Fatalf("exact admission retry = %v, want ErrRunPruned", err)
 	}
-	if _, err := runtime.Submit(ctx, "agent", "v1", "other work", options); !errors.Is(err, ErrAdmissionConflict) {
+	if _, err := runtime.Submit(ctx, DefinitionRef{ID: "agent", Revision: "v1"}, "other work", options); !errors.Is(err, ErrAdmissionConflict) {
 		t.Fatalf("changed admission under a pruned identity = %v, want ErrAdmissionConflict", err)
 	}
 	if got := executions.Load(); got != 1 {
@@ -107,11 +107,11 @@ func TestRuntimePruneWaitsForUnresolvedEffects(t *testing.T) {
 		<-ctx.Done()
 		return ToolResult{Effect: EffectReport{Status: EffectUnknown}}, ctx.Err()
 	}, ToolEffectPolicy{Kind: ToolEffectMutating}))
-	if err := runtime.Register("agent", "v1", agent); err != nil {
+	if _, err := runtime.Register("agent", "v1", agent); err != nil {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
-	handle, err := runtime.Submit(ctx, "agent", "v1", "work", SubmitOptions{})
+	handle, err := runtime.Submit(ctx, DefinitionRef{ID: "agent", Revision: "v1"}, "work")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -160,17 +160,17 @@ func TestRuntimePruneKeepsGuardsAndConversations(t *testing.T) {
 		t.Fatal(err)
 	}
 	runtime := newTestRuntime(t)
-	if err := runtime.Register("agent", "v1", agent); err != nil {
+	if _, err := runtime.Register("agent", "v1", agent); err != nil {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
-	if _, err := runtime.Run(ctx, "agent", "v1", "first", SubmitOptions{}); err != nil {
+	if _, err := runtime.Run(ctx, DefinitionRef{ID: "agent", Revision: "v1"}, "first"); err != nil {
 		t.Fatal(err)
 	}
 	if report, err := runtime.Prune(ctx, RetentionPolicy{Runs: pruneNow}); err != nil || report.Runs != 1 {
 		t.Fatalf("runs pass = %#v, %v", report, err)
 	}
-	second, err := runtime.Run(ctx, "agent", "v1", "second", SubmitOptions{})
+	second, err := runtime.Run(ctx, DefinitionRef{ID: "agent", Revision: "v1"}, "second")
 	if err != nil || second.Output != "second done" {
 		t.Fatalf("second run = %#v, %v", second, err)
 	}
@@ -179,17 +179,17 @@ func TestRuntimePruneKeepsGuardsAndConversations(t *testing.T) {
 	}
 
 	chat := newTestRuntime(t)
-	if err := chat.Register("chat", "v1", testAgent(&repeatingChildProvider{})); err != nil {
+	if _, err := chat.Register("chat", "v1", testAgent(&repeatingChildProvider{})); err != nil {
 		t.Fatal(err)
 	}
-	first, err := chat.Run(ctx, "chat", "v1", "hello", turnOptions(""))
+	first, err := chat.Run(ctx, DefinitionRef{ID: "chat", Revision: "v1"}, "hello", turnOptions(""))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if report, err := chat.Prune(ctx, RetentionPolicy{History: pruneNow, Runs: pruneNow}); err != nil || report.History != 0 || report.Runs != 0 {
 		t.Fatalf("conversation prune = %#v, %v; want turns kept", report, err)
 	}
-	next, err := chat.Run(ctx, "chat", "v1", "again", turnOptions(first.RunID))
+	next, err := chat.Run(ctx, DefinitionRef{ID: "chat", Revision: "v1"}, "again", turnOptions(first.RunID))
 	if err != nil || len(next.Messages) != 4 {
 		t.Fatalf("turn after prune = %#v, %v", next, err)
 	}
@@ -199,12 +199,12 @@ func TestRuntimePruneKeepsGuardsAndConversations(t *testing.T) {
 // are due, so hosts can bound the work of one call.
 func TestRuntimePruneLimitBoundsOneCall(t *testing.T) {
 	runtime := newTestRuntime(t)
-	if err := runtime.Register("agent", "v1", testAgent(&repeatingChildProvider{})); err != nil {
+	if _, err := runtime.Register("agent", "v1", testAgent(&repeatingChildProvider{})); err != nil {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
 	for range 3 {
-		if _, err := runtime.Run(ctx, "agent", "v1", "work", SubmitOptions{}); err != nil {
+		if _, err := runtime.Run(ctx, DefinitionRef{ID: "agent", Revision: "v1"}, "work"); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -229,14 +229,14 @@ func TestRuntimePruneDeletesRootWithChildren(t *testing.T) {
 	}})
 	newSharedChildDefinition(parent)
 	runtime := newTestRuntime(t)
-	if err := runtime.Register("child", "v1", testAgent(&repeatingChildProvider{})); err != nil {
+	if _, err := runtime.Register("child", "v1", testAgent(&repeatingChildProvider{})); err != nil {
 		t.Fatal(err)
 	}
-	if err := runtime.Register("parent", "v1", parent); err != nil {
+	if _, err := runtime.Register("parent", "v1", parent); err != nil {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
-	result, err := runtime.Run(ctx, "parent", "v1", "go", SubmitOptions{})
+	result, err := runtime.Run(ctx, DefinitionRef{ID: "parent", Revision: "v1"}, "go")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -47,14 +47,14 @@ func conversationRuntime(t *testing.T, provider Provider) *Runtime {
 		t.Fatal(err)
 	}
 	runtime := newTestRuntime(t)
-	if err := runtime.Register("chat", "v1", agent); err != nil {
+	if _, err := runtime.Register("chat", "v1", agent); err != nil {
 		t.Fatal(err)
 	}
 	return runtime
 }
 
-func turnOptions(expectedHead string) SubmitOptions {
-	return SubmitOptions{Conversation: ConversationOptions{Scope: "tenant", ID: "c1", ExpectedHead: expectedHead}}
+func turnOptions(expectedHead string) SubmitOption {
+	return WithConversation(ConversationRef{Scope: "tenant", ID: "c1"}, expectedHead)
 }
 
 // The next turn is seeded from the head's canonical committed history with
@@ -68,11 +68,11 @@ func TestRuntimeConversationContinuesCommittedHistory(t *testing.T) {
 	}}
 	runtime := conversationRuntime(t, provider)
 	ctx := context.Background()
-	first, err := runtime.Run(ctx, "chat", "v1", "hello", turnOptions(""))
+	first, err := runtime.Run(ctx, DefinitionRef{ID: "chat", Revision: "v1"}, "hello", turnOptions(""))
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := runtime.Run(ctx, "chat", "v1", "again", turnOptions(first.RunID))
+	second, err := runtime.Run(ctx, DefinitionRef{ID: "chat", Revision: "v1"}, "again", turnOptions(first.RunID))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,12 +101,12 @@ func TestRuntimeConversationContinuesCommittedHistory(t *testing.T) {
 	if second.Usage != (Usage{InputTokens: 20}) {
 		t.Fatalf("second turn usage = %#v, want local only", second.Usage)
 	}
-	conversation, err := runtime.Conversation(ctx, "tenant", "c1")
+	conversation, err := runtime.Conversation(ctx, ConversationRef{Scope: "tenant", ID: "c1"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if conversation.Head != second.RunID || conversation.ActiveRunID != "" || conversation.Turns != 2 ||
-		conversation.DefinitionID != "chat" || conversation.DefinitionRevision != "v1" {
+		conversation.Definition != (DefinitionRef{ID: "chat", Revision: "v1"}) {
 		t.Fatalf("conversation = %#v", conversation)
 	}
 	for _, runID := range []string{first.RunID, second.RunID} {
@@ -128,45 +128,45 @@ func TestRuntimeConversationRejectsStaleCompetingAndMismatchedTurns(t *testing.T
 	provider := &countingBarrierRuntimeProvider{started: make(chan struct{}), release: make(chan struct{})}
 	runtime := newTestRuntime(t)
 	t.Cleanup(provider.unblock)
-	if err := runtime.Register("chat", "v1", testAgent(provider)); err != nil {
+	if _, err := runtime.Register("chat", "v1", testAgent(provider)); err != nil {
 		t.Fatal(err)
 	}
-	if err := runtime.Register("chat", "v2", testAgent(&countingRuntimeProvider{})); err != nil {
+	if _, err := runtime.Register("chat", "v2", testAgent(&countingRuntimeProvider{})); err != nil {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
-	if _, err := runtime.Submit(ctx, "chat", "v1", "hello", turnOptions("missing")); !errors.Is(err, ErrConversationConflict) {
+	if _, err := runtime.Submit(ctx, DefinitionRef{ID: "chat", Revision: "v1"}, "hello", turnOptions("missing")); !errors.Is(err, ErrConversationConflict) {
 		t.Fatalf("unknown head = %v, want conflict", err)
 	}
-	if _, err := runtime.Submit(ctx, "chat", "v1", "hello", SubmitOptions{Conversation: ConversationOptions{Scope: "tenant"}}); err == nil {
+	if _, err := runtime.Submit(ctx, DefinitionRef{ID: "chat", Revision: "v1"}, "hello", WithConversation(ConversationRef{Scope: "tenant"}, "")); err == nil {
 		t.Fatal("conversation scope without id was accepted")
 	}
-	first, err := runtime.Submit(ctx, "chat", "v1", "hello", turnOptions(""))
+	first, err := runtime.Submit(ctx, DefinitionRef{ID: "chat", Revision: "v1"}, "hello", turnOptions(""))
 	if err != nil {
 		t.Fatal(err)
 	}
 	waitForSignal(t, provider.started, "first turn")
-	if _, err := runtime.Submit(ctx, "chat", "v1", "competing", turnOptions("")); !errors.Is(err, ErrConversationBusy) {
+	if _, err := runtime.Submit(ctx, DefinitionRef{ID: "chat", Revision: "v1"}, "competing", turnOptions("")); !errors.Is(err, ErrConversationBusy) {
 		t.Fatalf("competing turn = %v, want busy", err)
 	}
 	provider.unblock()
 	if _, err := first.Await(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := runtime.Submit(ctx, "chat", "v1", "stale", turnOptions("")); !errors.Is(err, ErrConversationConflict) {
+	if _, err := runtime.Submit(ctx, DefinitionRef{ID: "chat", Revision: "v1"}, "stale", turnOptions("")); !errors.Is(err, ErrConversationConflict) {
 		t.Fatalf("stale head = %v, want conflict", err)
 	}
-	if _, err := runtime.Submit(ctx, "chat", "v2", "other definition", turnOptions(first.ID())); !errors.Is(err, ErrConversationConflict) {
+	if _, err := runtime.Submit(ctx, DefinitionRef{ID: "chat", Revision: "v2"}, "other definition", turnOptions(first.ID())); !errors.Is(err, ErrConversationConflict) {
 		t.Fatalf("different definition = %v, want conflict", err)
 	}
-	conversation, err := runtime.Conversation(ctx, "tenant", "c1")
+	conversation, err := runtime.Conversation(ctx, ConversationRef{Scope: "tenant", ID: "c1"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if conversation.Head != first.ID() || conversation.ActiveRunID != "" || conversation.Turns != 1 {
 		t.Fatalf("conversation = %#v", conversation)
 	}
-	if _, err := runtime.Conversation(ctx, "tenant", "missing"); !errors.Is(err, ErrConversationNotFound) {
+	if _, err := runtime.Conversation(ctx, ConversationRef{Scope: "tenant", ID: "missing"}); !errors.Is(err, ErrConversationNotFound) {
 		t.Fatalf("missing conversation = %v", err)
 	}
 }
@@ -176,24 +176,23 @@ func TestRuntimeConversationRejectsStaleCompetingAndMismatchedTurns(t *testing.T
 func TestRuntimeConversationExactRetryResolvesBeforeHeadCheck(t *testing.T) {
 	runtime := conversationRuntime(t, &repeatingChildProvider{})
 	ctx := context.Background()
-	first, err := runtime.Run(ctx, "chat", "v1", "hello", turnOptions(""))
+	first, err := runtime.Run(ctx, DefinitionRef{ID: "chat", Revision: "v1"}, "hello", turnOptions(""))
 	if err != nil {
 		t.Fatal(err)
 	}
-	options := turnOptions(first.RunID)
-	options.Scope, options.Key = "client", "turn-2"
-	second, err := runtime.Run(ctx, "chat", "v1", "again", options)
+	options := []SubmitOption{turnOptions(first.RunID), WithIdempotencyKey("client", "turn-2")}
+	second, err := runtime.Run(ctx, DefinitionRef{ID: "chat", Revision: "v1"}, "again", options...)
 	if err != nil {
 		t.Fatal(err)
 	}
-	retried, err := runtime.Submit(ctx, "chat", "v1", "again", options)
+	retried, err := runtime.Submit(ctx, DefinitionRef{ID: "chat", Revision: "v1"}, "again", options...)
 	if err != nil || retried.ID() != second.RunID {
 		t.Fatalf("exact retry = %v, %v; want run %s", retried, err, second.RunID)
 	}
-	if _, err := runtime.Submit(ctx, "chat", "v1", "changed", options); !errors.Is(err, ErrAdmissionConflict) {
+	if _, err := runtime.Submit(ctx, DefinitionRef{ID: "chat", Revision: "v1"}, "changed", options...); !errors.Is(err, ErrAdmissionConflict) {
 		t.Fatalf("changed payload = %v, want admission conflict", err)
 	}
-	if _, err := runtime.Submit(ctx, "chat", "v1", "again", turnOptions(first.RunID)); !errors.Is(err, ErrConversationConflict) {
+	if _, err := runtime.Submit(ctx, DefinitionRef{ID: "chat", Revision: "v1"}, "again", turnOptions(first.RunID)); !errors.Is(err, ErrConversationConflict) {
 		t.Fatalf("unkeyed stale turn = %v, want conflict", err)
 	}
 	if got := storedRunCount(t, runtime.store); got != 2 {
@@ -206,7 +205,7 @@ func TestRuntimeConversationConcurrentAdmissionReservesOneRun(t *testing.T) {
 	provider := &countingBarrierRuntimeProvider{started: make(chan struct{}), release: make(chan struct{})}
 	runtime := newTestRuntime(t)
 	t.Cleanup(provider.unblock)
-	if err := runtime.Register("chat", "v1", testAgent(provider)); err != nil {
+	if _, err := runtime.Register("chat", "v1", testAgent(provider)); err != nil {
 		t.Fatal(err)
 	}
 	const competitors = 8
@@ -220,7 +219,7 @@ func TestRuntimeConversationConcurrentAdmissionReservesOneRun(t *testing.T) {
 		go func() {
 			defer done.Done()
 			start.Wait()
-			if _, err := runtime.Submit(context.Background(), "chat", "v1", "hello", turnOptions("")); err != nil {
+			if _, err := runtime.Submit(context.Background(), DefinitionRef{ID: "chat", Revision: "v1"}, "hello", turnOptions("")); err != nil {
 				errs <- err
 				return
 			}
@@ -247,11 +246,11 @@ func TestRuntimeConversationContinuesFailedHistoryButBlocksIncomplete(t *testing
 	provider := &conversationProvider{turns: []Message{{}, asstText("recovered")}}
 	runtime := conversationRuntime(t, provider)
 	ctx := context.Background()
-	failed, err := runtime.Run(ctx, "chat", "v1", "hello", turnOptions(""))
+	failed, err := runtime.Run(ctx, DefinitionRef{ID: "chat", Revision: "v1"}, "hello", turnOptions(""))
 	if err == nil || failed.Status != RunFailed {
 		t.Fatalf("first turn = %s, %v; want failure", failed.Status, err)
 	}
-	next, err := runtime.Run(ctx, "chat", "v1", "try again", turnOptions(failed.RunID))
+	next, err := runtime.Run(ctx, DefinitionRef{ID: "chat", Revision: "v1"}, "try again", turnOptions(failed.RunID))
 	if err != nil || next.Output != "recovered" {
 		t.Fatalf("continuation after failure = %q, %v", next.Output, err)
 	}
@@ -263,11 +262,11 @@ func TestRuntimeConversationContinuesFailedHistoryButBlocksIncomplete(t *testing
 	asker.RegisterTool(WithDurableWait(Func("ask", "ask a human", func(context.Context, struct{}) (string, error) {
 		return "unused", nil
 	}), DurableWaitPolicy{Kind: WaitQuestion}))
-	if err := runtime.Register("asker", "v1", asker); err != nil {
+	if _, err := runtime.Register("asker", "v1", asker); err != nil {
 		t.Fatal(err)
 	}
-	options := SubmitOptions{Conversation: ConversationOptions{ID: "questions"}}
-	waiting, err := runtime.Submit(ctx, "asker", "v1", "hello", options)
+	options := WithConversation(ConversationRef{ID: "questions"}, "")
+	waiting, err := runtime.Submit(ctx, DefinitionRef{ID: "asker", Revision: "v1"}, "hello", options)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -275,11 +274,10 @@ func TestRuntimeConversationContinuesFailedHistoryButBlocksIncomplete(t *testing
 	if err := waiting.Cancel(ctx); err != nil {
 		t.Fatal(err)
 	}
-	options.Conversation.ExpectedHead = waiting.ID()
-	if _, err := runtime.Submit(ctx, "asker", "v1", "continue", options); !errors.Is(err, ErrConversationBlocked) {
+	if _, err := runtime.Submit(ctx, DefinitionRef{ID: "asker", Revision: "v1"}, "continue", WithConversation(ConversationRef{ID: "questions"}, waiting.ID())); !errors.Is(err, ErrConversationBlocked) {
 		t.Fatalf("continuation of incomplete history = %v, want blocked", err)
 	}
-	conversation, err := runtime.Conversation(ctx, "", "questions")
+	conversation, err := runtime.Conversation(ctx, ConversationRef{Scope: "", ID: "questions"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -298,11 +296,11 @@ func TestRuntimeConversationRecoveryReleasesFinalizedTurn(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := runtime.Register("chat", "v1", testAgent(&repeatingChildProvider{})); err != nil {
+	if _, err := runtime.Register("chat", "v1", testAgent(&repeatingChildProvider{})); err != nil {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
-	first, err := runtime.Run(ctx, "chat", "v1", "hello", turnOptions(""))
+	first, err := runtime.Run(ctx, DefinitionRef{ID: "chat", Revision: "v1"}, "hello", turnOptions(""))
 	if err == nil {
 		t.Fatal("injected terminal-commit fault was invisible")
 	}
@@ -313,20 +311,20 @@ func TestRuntimeConversationRecoveryReleasesFinalizedTurn(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = reopened.Close() })
-	if err := reopened.Register("chat", "v1", testAgent(&repeatingChildProvider{})); err != nil {
+	if _, err := reopened.Register("chat", "v1", testAgent(&repeatingChildProvider{})); err != nil {
 		t.Fatal(err)
 	}
 	if err := reopened.Recover(ctx); err != nil {
 		t.Fatal(err)
 	}
-	conversation, err := reopened.Conversation(ctx, "tenant", "c1")
+	conversation, err := reopened.Conversation(ctx, ConversationRef{Scope: "tenant", ID: "c1"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if conversation.Head != first.RunID || conversation.ActiveRunID != "" {
 		t.Fatalf("conversation = %#v, want head %s released", conversation, first.RunID)
 	}
-	next, err := reopened.Run(ctx, "chat", "v1", "again", turnOptions(first.RunID))
+	next, err := reopened.Run(ctx, DefinitionRef{ID: "chat", Revision: "v1"}, "again", turnOptions(first.RunID))
 	if err != nil || next.Output != "child done" {
 		t.Fatalf("next turn = %q, %v", next.Output, err)
 	}
@@ -348,11 +346,11 @@ func TestRuntimeConversationAcknowledgedHooksReleaseTurn(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := runtime.Register("chat", "v1", testAgent(&repeatingChildProvider{})); err != nil {
+	if _, err := runtime.Register("chat", "v1", testAgent(&repeatingChildProvider{})); err != nil {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
-	first, err := runtime.Run(ctx, "chat", "v1", "hello", turnOptions(""))
+	first, err := runtime.Run(ctx, DefinitionRef{ID: "chat", Revision: "v1"}, "hello", turnOptions(""))
 	if err == nil {
 		t.Fatal("injected hook-outcome fault was invisible")
 	}
@@ -363,13 +361,13 @@ func TestRuntimeConversationAcknowledgedHooksReleaseTurn(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = reopened.Close() })
-	if err := reopened.Register("chat", "v1", testAgent(&repeatingChildProvider{})); err != nil {
+	if _, err := reopened.Register("chat", "v1", testAgent(&repeatingChildProvider{})); err != nil {
 		t.Fatal(err)
 	}
 	if err := reopened.Recover(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := reopened.Submit(ctx, "chat", "v1", "again", turnOptions(first.RunID)); !errors.Is(err, ErrConversationBusy) {
+	if _, err := reopened.Submit(ctx, DefinitionRef{ID: "chat", Revision: "v1"}, "again", turnOptions(first.RunID)); !errors.Is(err, ErrConversationBusy) {
 		t.Fatalf("turn during hook attention = %v, want busy", err)
 	}
 	if err := reopened.Handle(first.RunID).AcknowledgeHooks(ctx); err != nil {
@@ -379,7 +377,7 @@ func TestRuntimeConversationAcknowledgedHooksReleaseTurn(t *testing.T) {
 	if err != nil || acknowledged.Status != RunCompleted || acknowledged.Output != "child done" {
 		t.Fatalf("acknowledged turn = %s %q, %v", acknowledged.Status, acknowledged.Output, err)
 	}
-	next, err := reopened.Run(ctx, "chat", "v1", "again", turnOptions(first.RunID))
+	next, err := reopened.Run(ctx, DefinitionRef{ID: "chat", Revision: "v1"}, "again", turnOptions(first.RunID))
 	if err != nil || next.Output != "child done" {
 		t.Fatalf("next turn = %q, %v", next.Output, err)
 	}
@@ -403,7 +401,7 @@ func (p fixedAnswerProvider) Invoke(context.Context, Request) (Response, error) 
 func TestRuntimeConversationTurnsReferenceHistoryWithoutCopying(t *testing.T) {
 	runtime := newTestRuntime(t)
 	answer := strings.Repeat("a", 2048)
-	if err := runtime.Register("chat", "v1", testAgent(fixedAnswerProvider{answer: answer})); err != nil {
+	if _, err := runtime.Register("chat", "v1", testAgent(fixedAnswerProvider{answer: answer})); err != nil {
 		t.Fatal(err)
 	}
 	const turns = 8
@@ -411,7 +409,7 @@ func TestRuntimeConversationTurnsReferenceHistoryWithoutCopying(t *testing.T) {
 	var ownBytes []int
 	var last RunResult
 	for turn := range turns {
-		result, err := runtime.Run(context.Background(), "chat", "v1", fmt.Sprintf("question %d", turn), turnOptions(head))
+		result, err := runtime.Run(context.Background(), DefinitionRef{ID: "chat", Revision: "v1"}, fmt.Sprintf("question %d", turn), turnOptions(head))
 		if err != nil {
 			t.Fatal(err)
 		}

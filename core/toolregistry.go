@@ -19,19 +19,6 @@ func cloneToolDefinition(d ToolDefinition) ToolDefinition {
 	return d
 }
 
-// WithTools registers additional executors for this run, before request
-// preparation. Duplicate/reserved names and malformed definitions fail the run
-// before provider work. Hooks can only select from the resulting registry.
-func WithTools(tools ...Tool) RunOption {
-	snapshot, err := freezeTools(tools, "")
-	return func(c *runConfig) {
-		c.extraTools = append(c.extraTools, snapshot...)
-		if err != nil {
-			c.optionErr = err
-		}
-	}
-}
-
 func registerTools(tools []Tool, terminal string) (map[string]registeredTool, []ToolDefinition, error) {
 	registry := make(map[string]registeredTool, len(tools))
 	definitions := make([]ToolDefinition, 0, len(tools))

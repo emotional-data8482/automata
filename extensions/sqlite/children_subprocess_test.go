@@ -53,11 +53,11 @@ func toolTurn(id, name, input string) core.Message {
 func textTurn(text string) core.Message { return core.AssistantMessage(core.TextBlock{Text: text}) }
 
 func delegateTool() core.Tool {
-	return core.DurableChildTool(core.ToolDefinition{
+	return core.NewChildTool(core.ToolDefinition{
 		Name:        "delegate",
 		Description: "delegate to a durable child",
 		InputSchema: json.RawMessage(`{"type":"object","properties":{"topic":{"type":"string"}},"required":["topic"]}`),
-	}, core.DurableChildPolicy{DefinitionID: "child", Revision: "v1"})
+	}, core.DefinitionRef{ID: "child", Revision: "v1"})
 }
 
 // capParentAgent writes once, delegates to a child, then proposes a second
@@ -110,7 +110,7 @@ func childOwnerRuntime(ctx context.Context, wrap func(core.Store) core.Store, pa
 			fmt.Println("agent-error: " + err.Error())
 			os.Exit(3)
 		}
-		if err := rt.Register(id, "v1", agent); err != nil {
+		if _, err := rt.Register(id, "v1", agent); err != nil {
 			fmt.Println("register-error: " + err.Error())
 			os.Exit(3)
 		}
@@ -119,7 +119,7 @@ func childOwnerRuntime(ctx context.Context, wrap func(core.Store) core.Store, pa
 }
 
 func submitOwnerParent(ctx context.Context, rt *core.Runtime, key string) *core.RunHandle {
-	handle, err := rt.Submit(ctx, "parent", "v1", "work", core.SubmitOptions{Scope: "subprocess", Key: key})
+	handle, err := rt.Submit(ctx, core.DefinitionRef{ID: "parent", Revision: "v1"}, "work", core.WithIdempotencyKey("subprocess", key))
 	if err != nil {
 		fmt.Println("submit-error: " + err.Error())
 		os.Exit(3)
@@ -273,10 +273,10 @@ func reopenChildRuntime(t *testing.T, path string, parent, child *core.Agent) *c
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = reopened.Close() })
-	if err := reopened.Register("child", "v1", child); err != nil {
+	if _, err := reopened.Register("child", "v1", child); err != nil {
 		t.Fatal(err)
 	}
-	if err := reopened.Register("parent", "v1", parent); err != nil {
+	if _, err := reopened.Register("parent", "v1", parent); err != nil {
 		t.Fatal(err)
 	}
 	if err := reopened.Recover(ctx); err != nil {
@@ -335,7 +335,7 @@ func TestChildWaitSurvivesProcessKill(t *testing.T) {
 	if childSnapshot.State != core.RuntimeWaiting || childSnapshot.Parent == nil || childSnapshot.Parent.RunID != parentID {
 		t.Fatalf("reopened child = %s parent %#v", childSnapshot.State, childSnapshot.Parent)
 	}
-	if err := reopened.Handle(childID).ResolveWait(ctx, waitID, core.WaitResolution{Answer: json.RawMessage(`"yes"`), Decision: core.Allow}); err != nil {
+	if err := reopened.Handle(childID).ResolveWait(ctx, waitID, core.WaitResolution{Answer: json.RawMessage(`"yes"`)}); err != nil {
 		t.Fatal(err)
 	}
 	result, err := awaitBounded(t, reopened.Handle(parentID))

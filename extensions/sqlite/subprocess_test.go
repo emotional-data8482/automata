@@ -68,11 +68,11 @@ func runInterruptedOwnerChild() {
 		fmt.Println("agent-error: " + err.Error())
 		os.Exit(3)
 	}
-	if err := runtime.Register("agent", "v1", agent); err != nil {
+	if _, err := runtime.Register("agent", "v1", agent); err != nil {
 		fmt.Println("register-error: " + err.Error())
 		os.Exit(3)
 	}
-	handle, err := runtime.Submit(ctx, "agent", "v1", "work", core.SubmitOptions{Scope: "subprocess", Key: "one"})
+	handle, err := runtime.Submit(ctx, core.DefinitionRef{ID: "agent", Revision: "v1"}, "work", core.WithIdempotencyKey("subprocess", "one"))
 	if err != nil {
 		fmt.Println("submit-error: " + err.Error())
 		os.Exit(3)
@@ -106,11 +106,11 @@ func runEffectDispatchOwnerChild() {
 		fmt.Println("agent-error: " + err.Error())
 		os.Exit(3)
 	}
-	if err := runtime.Register("agent", "v1", agent); err != nil {
+	if _, err := runtime.Register("agent", "v1", agent); err != nil {
 		fmt.Println("register-error: " + err.Error())
 		os.Exit(3)
 	}
-	if _, err := runtime.Submit(ctx, "agent", "v1", "work", core.SubmitOptions{Scope: "subprocess", Key: "effect"}); err != nil {
+	if _, err := runtime.Submit(ctx, core.DefinitionRef{ID: "agent", Revision: "v1"}, "work", core.WithIdempotencyKey("subprocess", "effect")); err != nil {
 		fmt.Println("submit-error: " + err.Error())
 		os.Exit(3)
 	}
@@ -134,11 +134,11 @@ func runStructuredCorrectionOwnerChild() {
 		fmt.Println("agent-error: " + err.Error())
 		os.Exit(3)
 	}
-	if err := runtime.Register("agent", "v1", agent); err != nil {
+	if _, err := runtime.Register("agent", "v1", agent); err != nil {
 		fmt.Println("register-error: " + err.Error())
 		os.Exit(3)
 	}
-	if _, err := runtime.Submit(ctx, "agent", "v1", "produce summary", core.SubmitOptions{Scope: "subprocess", Key: "structured"}); err != nil {
+	if _, err := runtime.Submit(ctx, core.DefinitionRef{ID: "agent", Revision: "v1"}, "produce summary", core.WithIdempotencyKey("subprocess", "structured")); err != nil {
 		fmt.Println("submit-error: " + err.Error())
 		os.Exit(3)
 	}
@@ -387,13 +387,13 @@ func TestInterruptedDispatchedEffectRequiresReconciliation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := reopened.Register("agent", "v1", agent); err != nil {
+	if _, err := reopened.Register("agent", "v1", agent); err != nil {
 		t.Fatal(err)
 	}
 	if err := reopened.Recover(ctx); err != nil {
 		t.Fatal(err)
 	}
-	handle, err := reopened.Submit(ctx, "agent", "v1", "work", core.SubmitOptions{Scope: "subprocess", Key: "effect"})
+	handle, err := reopened.Submit(ctx, core.DefinitionRef{ID: "agent", Revision: "v1"}, "work", core.WithIdempotencyKey("subprocess", "effect"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -454,7 +454,7 @@ func TestInterruptedOwnerRunBecomesAttention(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = reopened.Close() })
-	if err := reopened.Register("agent", "v1", staticAgent(t)); err != nil {
+	if _, err := reopened.Register("agent", "v1", staticAgent(t)); err != nil {
 		t.Fatal(err)
 	}
 	if err := reopened.Recover(ctx); err != nil {
@@ -473,7 +473,7 @@ func TestInterruptedOwnerRunBecomesAttention(t *testing.T) {
 	}
 
 	// The exact admission identity still resolves the same run.
-	handle, err := reopened.Submit(ctx, "agent", "v1", "work", core.SubmitOptions{Scope: "subprocess", Key: "one"})
+	handle, err := reopened.Submit(ctx, core.DefinitionRef{ID: "agent", Revision: "v1"}, "work", core.WithIdempotencyKey("subprocess", "one"))
 	if err != nil || handle.ID() != runID {
 		t.Fatalf("resolved admission = %q, %v; want %q", handle.ID(), err, runID)
 	}
@@ -548,13 +548,13 @@ func TestStructuredCorrectionSurvivesProcessKill(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := reopened.Register("agent", "v1", agent); err != nil {
+	if _, err := reopened.Register("agent", "v1", agent); err != nil {
 		t.Fatal(err)
 	}
 	if err := reopened.Recover(ctx); err != nil {
 		t.Fatal(err)
 	}
-	handle, err := reopened.Submit(ctx, "agent", "v1", "produce summary", core.SubmitOptions{Scope: "subprocess", Key: "structured"})
+	handle, err := reopened.Submit(ctx, core.DefinitionRef{ID: "agent", Revision: "v1"}, "produce summary", core.WithIdempotencyKey("subprocess", "structured"))
 	if err != nil {
 		t.Fatal(err)
 	}

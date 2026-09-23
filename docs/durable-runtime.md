@@ -1,10 +1,11 @@
 # Durable runtime lifecycle
 
-`core.Runtime` is the durable execution lifecycle. It admits a task before
-work, owns worker contexts independently from API/view contexts, and pins an
-immutable `Agent` registration. `loopMachine` is its current internal turn
-driver, not a second public lifecycle; it can be replaced in place as the
-durable transition model grows.
+`core.Runtime` is the only way to run an `Agent`. It admits a task before any
+work, owns worker contexts independently of API and view contexts, pins an
+immutable `Agent` registration, commits every transition, and recovers after
+a restart. Sync calls, live streams, typed output, child agents,
+conversations, and approvals are all views of this one lifecycle.
+`loopMachine` is its internal turn driver, not a public lifecycle.
 
 Persistent construction is explicit:
 
@@ -16,37 +17,44 @@ runtime, err := core.NewRuntime(ctx, core.RuntimeConfig{Store: store})
 if err != nil { return err }
 defer runtime.Close()
 
-agent, err := core.New(provider, core.AgentConfig{
-    SystemPrompt: "Be concise.",
-})
+agent, err := core.New(provider, core.AgentConfig{SystemPrompt: "Be concise."})
 if err != nil { return err }
-if err := runtime.Register("assistant", "2026-09-15", agent); err != nil {
-    return err
-}
+assistant, err := runtime.Register("assistant", "2026-09-15", agent)
+if err != nil { return err }
+if err := runtime.Recover(ctx); err != nil { return err }
 
-handle, err := runtime.Submit(ctx, "assistant", "2026-09-15", task,
-    core.SubmitOptions{Scope: tenantID, Key: externalTaskID})
+handle, err := runtime.Submit(ctx, assistant, task,
+    core.WithIdempotencyKey(tenantID, externalTaskID))
 if err != nil { return err }
 
 result, err := handle.Await(ctx)
 ```
 
-Use `core.NewEphemeralRuntime` only when loss on process exit is intentional.
-An unavailable or invalid persistent store fails construction or admission; the
-runtime never silently substitutes memory.
+Use `core.NewEphemeralRuntime()` only when losing runs on process exit is
+intended (tests, scripts), or `core.NewRuntime` with `core.NewMemoryStore()`
+to configure hooks or an authorizer on an in-memory store. An unavailable or
+invalid persistent store fails construction or admission; the runtime never
+silently substitutes memory. The compiled, output-checked examples in
+`core/example_test.go` show each feature end to end.
 
 ## Identities and registration
 
-`Agent` remains the immutable executable definition. `Register` binds it to an
-application-controlled definition ID and revision. A persisted run pins both;
-registering a different Agent under the same pair is rejected. The revision is
-a host attestation, not proof of Go closure or binary identity. Hosts must
-register the matching executable binding before `Recover`.
+`Agent` is the immutable executable definition. `Register` binds it to an
+application-controlled definition ID and revision and returns the
+`DefinitionRef` that runs, child tools, and conversations pin. Registering a
+different Agent under the same pair is rejected. The revision is a host
+attestation, not proof of Go closure or binary identity: register a new
+revision whenever behavior changes, and register every revision that stored
+runs pin before `Recover`. There are no per-run configuration overrides;
+a variation is a separate revision, which keeps every admission reproducible.
 
-`SubmitOptions.Scope` plus `Key` is the external idempotency identity. An exact
-retry returns the original `RunHandle`; changed task, definition, revision, or
-deadline conflicts. Cancel, reconcile, and wait-resolution commands retain
-historical durable outcomes, including after later run transitions.
+`WithIdempotencyKey(scope, key)` is the external idempotency identity. An
+exact retry returns the original `RunHandle`; a changed task, definition,
+revision, deadline, or conversation returns `ErrAdmissionConflict`. Compute
+a deadline once and reuse it on retries: a deadline recomputed from
+`time.Now()` is a different admission. Cancel, reconcile, and
+wait-resolution commands retain historical durable outcomes, including after
+later run transitions.
 
 ## Three lifetimes
 
@@ -58,7 +66,7 @@ historical durable outcomes, including after later run transitions.
   marked `RuntimeNeedsAttention` (`AttentionProvider` when a provider call was
   in flight); it is never automatically replayed.
 - `RunHandle.Cancel` is the logical cancellation command. A persisted deadline
-  in `SubmitOptions` has the same logical ownership. Both reach every required
+  (`WithDeadline`) has the same logical ownership. Both reach every required
   durable child (see [Durable children](#durable-children)).
 
 `Runtime.Run` is `Submit` plus `Await`. `Runtime.RunStream` admits the same kind
@@ -73,15 +81,19 @@ A run has two kinds of observation:
 
 - **Provisional deltas.** `RunHandle.Observe` and the `RunStream` callback
   deliver live `StreamEvent`s from the worker (text and thinking deltas, tool
-  calls, tool results, usage). Each view has a bounded queue; a slow view
-  misses deltas and never delays the run.
+  calls, tool results, usage). A child run's events also reach every
+  ancestor's views, tagged with `StreamEvent.Agent` (the child tool name) and
+  `InvocationID` (the parent's tool call ID); a nested child keeps the
+  innermost tags. Each view has a bounded queue; a slow view misses deltas and
+  never delays the run.
 - **Committed events.** Every commit that changes a run's state, transcript,
   tool invocations, or waits appends `CommittedEvent`s in the same commit:
   state changes (with attention kind and reason), transcript messages
   appended, tool invocation progress and effect status, and wait creation and
-  resolution. Internal markers (attempt records, budget counters) emit none. Sequence numbers are per run,
-  start at one, and have no holes. Runtime derives the events from the
-  committed writes themselves, so no transition can commit without its event.
+  resolution. Internal markers (attempt records, budget counters) emit none.
+  Sequence numbers are per run, start at one, and have no holes. Runtime
+  derives the events from the committed writes themselves, so no transition
+  can commit without its event.
 
 Read committed events in bounded pages from a cursor:
 
@@ -163,7 +175,7 @@ The provider-neutral `core.Store` contract is a small atomic transaction port:
 Core owns bucket names and versioned encodings; adapters own database details
 and must pass `core/storetest`. `extensions/sqlite` is the supported local
 adapter and keeps its driver out of the root module. It enforces one local
-owner with an OS advisory lock. Storage encoding version 8 is current; stores
+owner with an OS advisory lock. Storage encoding version 9 is current; stores
 written by an earlier version are rejected without being rewritten.
 
 On recovery, admitted-but-unstarted work can run after its exact binding is
@@ -300,8 +312,7 @@ mutating before relying on restart recovery.
 
 `WithDurableWait` suspends a Runtime tool invocation without retaining its
 worker. A question answer becomes the tool result; the wrapped question tool is
-never executed. An approval instead gates dispatch of the wrapped tool. Direct
-`Agent.Run` calls remain process-local and execute the wrapped tool normally.
+never executed. An approval instead gates dispatch of the wrapped tool.
 
 Approvals bind the operation ID, tool, canonical arguments, resource target,
 definition revision, policy context, and expiry into `WaitSnapshot.ActionDigest`.
@@ -337,8 +348,9 @@ runtime, err := core.NewRuntime(ctx, core.RuntimeConfig{
     }),
 })
 // Register the same definition revision, then recover after every restart.
-_ = runtime.Register("writer", "v3", agent)
+writer, _ := runtime.Register("writer", "v3", agent)
 _ = runtime.Recover(ctx)
+handle, _ := runtime.Submit(ctx, writer, task)
 
 snapshot, _ := handle.Snapshot(ctx)
 wait := snapshot.Waits[0] // render wait.Prompt/Target in the host UI
@@ -349,8 +361,9 @@ err = handle.ResolveWait(ctx, wait.ID, core.WaitResolution{
 })
 ```
 
-For a question use `WaitQuestion` and resolve with a valid JSON `Answer` instead
-of a decision. After `Runtime.Close`, reopen the same store, register the same
+For a question use `WaitQuestion` and resolve with a valid JSON `Answer` and no
+decision. An approval's `Decision` must be `core.Allow` or `core.Deny`; the
+zero value is not a decision, so an approval is never granted by omission. After `Runtime.Close`, reopen the same store, register the same
 binding, call `Recover`, inspect the same wait, and resolve it. If the HTTP/CLI
 response is lost, submit the identical `ResolveWait` again: it returns the
 stored outcome even if the run has since completed. A different answer or
@@ -366,14 +379,13 @@ A definition can require its final answer as validated structured data:
 agent, err := core.New(provider, core.AgentConfig{
     Tools: []core.Tool{write},
     StructuredOutput: &core.StructuredOutputConfig{
-        Schema: json.RawMessage(`{
-            "type":"object",
-            "properties":{"summary":{"type":"string"}},
-            "required":["summary"]}`),
-        Native: true,        // request provider-native enforcement when supported
-        MaxCorrections: 1,   // bounded in-run correction turns
+        Schema:         core.OutputSchema[Summary](), // or a raw JSON schema
+        Native:         true, // request provider-native enforcement when supported
+        MaxCorrections: 1,    // bounded in-run correction turns
     },
 })
+// ... after the run:
+summary, err := core.Decode[Summary](result)
 ```
 
 The declaration is frozen with the agent, so a Runtime definition revision pins
@@ -387,7 +399,9 @@ similar) explicitly instead of silently weakening validation. Annotation and
 provider-native metadata (for example `title`, `description`, `format`,
 OpenAI's `strict`, and `$defs`) pass through unchanged for providers that use
 them, while core still enforces only the subset documented in
-`core/schemacontract.go`.
+`core/schemacontract.go`. `core.Decode[T]` validates the accepted payload
+against the schema implied by `T` before decoding it, so a mismatched Go type
+fails loudly instead of zero-filling.
 
 At run time the hidden `automata_structured_output` tool collects the payload
 (or, with `Native` and a provider that supports native structured output, the
@@ -409,46 +423,38 @@ to fix formatting, and a newly proposed duplicate mutation is rejected by the
 configured semantic guard. The correction count persists with the transition
 that re-dispatches the correction, so a restarted run continues with its
 original correction, turn, tool, and provider budgets; with the budget
-exhausted the run fails with `ErrInvalidStructuredOutput` (error kind
+exhausted the run fails with `ErrInvalidStructuredOutput` (failure kind
 `invalid_structured_output`) while retaining accepted receipts and partial
-evidence. When the run's turn limit ends correction with an invalid payload
-still pending, the error kind is `max_steps_invalid_structured_output` and
-`errors.Is` matches both `ErrMaxStepsExceeded` and `ErrInvalidStructuredOutput`.
+evidence; `RunFailure.Violations` persists the last violations, so
+`errors.As` with a `*core.InvalidStructuredOutputError` target works after
+`Await` and after a restart. When the run's turn limit ends correction with an invalid
+payload still pending, the kind is `max_turns_invalid_structured_output` and
+`errors.Is` matches both `ErrMaxTurnsExceeded` and `ErrInvalidStructuredOutput`.
 A known recovery limitation is that restarting after the correction transition
-but before turn-limit classification can report plain `max_steps`: the in-memory
-invalid-cause marker is not restored, although correction counts, violation
-history, budgets, and effect receipts remain persisted.
-
-The direct typed facade shares this engine: [RunTyped]/[RunSessionTyped]
-decode the accepted `RunResult.StructuredOutput` payload after the loop
-finishes. If an Agent already declares [AgentConfig.StructuredOutput], typed
-helpers reuse that pinned declaration instead of installing a second hidden
-tool; choose a Go result type compatible with the declared schema or decoding
-will fail after the run. Direct `Agent.Run` runs of a declared definition also
-enforce the same contract through the same loop, but direct Agent, Session, and
-typed helper entry points remain process-local. Only Runtime promises durable
-admission, persisted correction counts, recovery, and effect preservation.
+but before turn-limit classification can report plain `max_turns`: the
+in-memory invalid-cause marker is not restored, although correction counts,
+violation history, budgets, and effect receipts remain persisted.
 
 ## Durable children
 
-A parent delegates to another registered definition through a
-`DurableChildTool`. The declaration pins the child's definition ID and
-revision and freezes the model-facing input schema:
+A parent delegates to another registered definition through a child tool.
+The declaration pins the child's `DefinitionRef` and freezes the model-facing
+input schema, derived from a Go type by `core.ChildTool[P]` or given
+explicitly to `core.NewChildTool`:
 
 ```go
-if err := runtime.Register("researcher", "v2", researcher); err != nil {
-    return err
+researcher, err := runtime.Register("researcher", "v2", researcherAgent)
+if err != nil { return err }
+
+type ResearchInput struct {
+    Topic string `json:"topic" desc:"the subtopic to research"`
 }
-research := core.DurableChildTool(core.ToolDefinition{
-    Name:        "research",
-    Description: "Research one topic.",
-    InputSchema: json.RawMessage(`{"type":"object",
-        "properties":{"topic":{"type":"string"}},"required":["topic"]}`),
-}, core.DurableChildPolicy{DefinitionID: "researcher", Revision: "v2"})
+research := core.ChildTool[ResearchInput]("research", "Research one topic.", researcher)
 
 lead, err := core.New(provider, core.AgentConfig{Tools: []core.Tool{research}})
 if err != nil { return err }
-if err := runtime.Register("lead", "v1", lead); err != nil { return err }
+leadRef, err := runtime.Register("lead", "v1", lead)
+if err != nil { return err }
 ```
 
 Each call is admitted as an ordinary durable child run. The child run, its link
@@ -461,12 +467,17 @@ closed when the pinned child binding is not registered. An admission replay
 after a crash resolves the same child, and completed siblings are never rerun.
 Children are never retried implicitly.
 
-Runtime never infers durable children from Agent values. `Register` rejects a
-process-local `AsTool` or `AsToolFunc` adapter, directly or behind first-party
-wrappers. It also rejects a child tool wrapped for retry, durable waits, or an
-effect policy, and a parent that would intercept child calls with a
-process-local `Approver`, per-call timeout, or rate limiter. The declaration's
-`Execute` always fails, so direct `Agent.Run` cannot invoke it by accident.
+Runtime never infers children from Agent values; composition is always an
+explicit, pinned child tool. `Register` rejects a child tool wrapped for
+retry, durable waits, or an effect policy, and a parent that would bound
+child calls with a per-call timeout or rate limiter (the child inherits the
+parent's deadline and enforces its own policy instead). A child tool's
+`Execute` always fails: only Runtime admission consumes it.
+
+A tool that runs another agent itself, for example on a separate ephemeral
+runtime inside `Execute`, is an opaque host tool: its work is not linked,
+budgeted, cancelled, or recovered with the parent. Use a child tool whenever
+the nested work should be part of the parent's durable run.
 
 The parent's worker returns while children run. When a child terminalizes,
 Runtime consumes the child wait once and makes the parent runnable; recovery
@@ -495,10 +506,8 @@ cap. A child invocation consumes one reservation from its parent. Every known
 tool call in a descendant reserves against its own caps and every capped
 ancestor, atomically with the descendant's batch creation. `PerTool` caps stay
 local to their run, zero stays unlimited, and turn and provider limits are
-per run. A process-local agent that a Runtime tool runs internally (for example
-`inner.Run(ctx, ...)` inside a `Func`) charges the same persisted caps for each
-of its known calls. Counters live on the persisted records, survive restarts,
-and are never charged again when a batch is replayed.
+per run. Counters live on the persisted records, survive restarts, and are
+never charged again when a batch is replayed.
 
 `RunResult.Usage` stays local to one run. `RunSnapshot.Accounting.Tree` totals `Usage`,
 `ProviderAttempts`, and `UnknownAttempts` across the run and its linked
@@ -538,22 +547,24 @@ still suspended, so its own deadline is enforced as for a waiting run.
 A Runtime conversation serializes runs of one definition into turns:
 
 ```go
-first, err := runtime.Run(ctx, "assistant", "v1", "Summarize the report.",
-    core.SubmitOptions{Conversation: core.ConversationOptions{
-        Scope: tenantID, ID: threadID}})
+thread := core.ConversationRef{Scope: tenantID, ID: threadID}
+first, err := runtime.Run(ctx, assistant, "Summarize the report.",
+    core.WithConversation(thread, ""))
 if err != nil { return err }
 
-next, err := runtime.Run(ctx, "assistant", "v1", "Now list the risks.",
-    core.SubmitOptions{Conversation: core.ConversationOptions{
-        Scope: tenantID, ID: threadID, ExpectedHead: first.RunID}})
+next, err := runtime.Run(ctx, assistant, "Now list the risks.",
+    core.WithConversation(thread, first.RunID))
 ```
 
 The first turn pins the definition and revision. Each later turn names the
 committed head it continues. Admission reserves the conversation's single
 active slot: a competing turn returns `ErrConversationBusy`, and a stale
 `ExpectedHead` or a different definition returns `ErrConversationConflict`.
-With `Scope` and `Key`, an exact retry resolves its original run before these
-checks, so a lost acknowledgement never turns into a conflict.
+With `WithIdempotencyKey`, an exact retry resolves its original run before
+these checks, so a lost acknowledgement never turns into a conflict. Without
+one, recover a turn whose admission acknowledgement was lost from
+`Runtime.Conversation`: its `ActiveRunID` (or, once it finished, `Head`)
+identifies the admitted turn.
 
 A turn starts from the head's committed transcript plus the new task, appended
 exactly once. Provider-native blocks are preserved, `RunResult.Messages` holds
@@ -634,28 +645,99 @@ reproduce the measurements.
 
 ## Transformation, observation, and history
 
-- `PreSendHook` remains an immutable request transformation supplied by the
+- `PreSendHook` is an immutable request transformation supplied by the
   registered Agent.
-- Agent `RunObserver`s remain direct-run compatibility callbacks and are not
-  invoked by Runtime. `RunHandle.Observe` and stream callbacks are bounded,
-  provisional local views; callback success is never storage acknowledgement.
-
-The old checkpoint callback was removed. Durable commits belong to Runtime;
-committed hooks consume those commits rather than acting as storage authority.
-Integrations that need reconnectable delivery rather than an in-process hook
-attempt read committed events from a cursor (see [Observation](#observation)).
+- `RunHandle.Observe` and stream callbacks are bounded, provisional local
+  views; callback success is never storage acknowledgement. Committed hooks
+  consume commits rather than acting as storage authority. Integrations that
+  need reconnectable delivery read committed events from a cursor (see
+  [Observation](#observation)).
 
 Canonical conversation data remains JSON-encoded `[]core.Message`, with
 `Message.Blocks` as the source of truth. Pending provider/tool work is not
 fabricated as canonical history.
 
-## Direct entry points
+## Errors after persistence
 
-`Agent.Run`, `Agent.RunStream`, `Session`, `RunTyped`, `RunSessionTyped`,
-`AsTool`, and `AsToolFunc` remain direct, process-local transitional entry
-points; T09 migrates or removes them. None of them persists anything or
-survives a restart, and the `Session` mutex is not a durable concurrency
-primitive. The durable equivalents are Runtime conversations for `Session`,
-`DurableChildTool` for `AsTool`/`AsToolFunc`, and a declared
-`StructuredOutput` for typed results. New durable code should start with
-`Runtime`.
+An awaited run's error is rebuilt from its persisted `RunFailure`, so it is
+the same in the process that ran it and after a restart. `errors.Is` matches
+the sentinel of its kind (`context.Canceled`, `context.DeadlineExceeded`,
+`ErrMaxTurnsExceeded`, `ErrEmptyResponse`, `ErrInvalidStructuredOutput`, and
+the completion sentinels through `*CompletionError`), and `errors.As` finds a
+`*CompletionError` or a `*InvalidStructuredOutputError` with its violations. A
+tool's or provider's own error types keep only their message; inspect
+`RunSnapshot.Failure` and the tool batches for structured evidence.
+
+## Operating envelope
+
+The supported deployment is one process that exclusively owns one SQLite
+store on a local filesystem. `extensions/sqlite` enforces this with an OS
+advisory lock: a second owner fails with `ErrOwned`. What is tested is
+process-crash recovery (subprocess kills at every durable boundary), not
+power loss, network filesystems, or several processes sharing one store. A
+platform can run many independently owned runtimes, each with its own store;
+failing a run over to another machine needs an ownership protocol this
+library does not provide.
+
+Within that envelope Runtime guarantees: an acknowledged admission survives;
+a committed provider turn, tool outcome, wait resolution, or child link is
+never repeated; a dispatched tool without a committed outcome is reported
+uncertain rather than replayed; an interrupted provider call is never
+silently resent; and every command has a durable receipt that answers an
+exact retry.
+
+It does not make external systems transactional with the store. Mutating
+tools should send `ToolOperationFromContext(ctx).IdempotencyKey` to their
+destinations and report their effect truthfully; `Reconcile` is the repair
+path when they cannot.
+
+## Storage upgrades and backups
+
+The store records its encoding version (currently 9). A build opens only
+stores of its own version and rejects others at `NewRuntime`, without
+rewriting them, so a failed upgrade never damages data. No released version
+has shipped `Runtime`; version 9 is the first supported encoding, and
+earlier pre-release stores must be drained (every run terminal) and
+discarded. A future encoding change will ship with an explicit migration
+tool and its own version; the runtime will never migrate implicitly.
+
+Back up a SQLite store with the runtime closed (`Runtime.Close`, then copy
+the database file together with its `-wal` file), or while it is open with
+SQLite's online backup, for example `VACUUM INTO 'backup.db'` from another
+connection, which reads a consistent snapshot through WAL. The
+`.owner.lock` file only enforces single ownership and is not part of a
+backup. Restoring a backup rewinds the
+runtime: runs admitted after the backup are unknown to it, and work that
+happened in between may happen again, so treat a restore like a crash whose
+uncertain work needs reconciliation against your destinations.
+
+## Recovery runbook
+
+After any restart:
+
+1. Open the store and register every definition revision the store's runs
+   pin. A run whose binding is missing needs attention with
+   `ErrDefinitionNotRegistered` in its reason; register the revision and
+   call `Recover` again.
+2. Call `Recover`. It starts admitted work, resumes interrupted runs from
+   their last committed transition, and arms deadlines and wait expiries.
+3. List runs that need attention from your own index of admitted work (for
+   example your ticket table) or from committed `CommittedRunState` events,
+   and inspect `RunSnapshot.Attention`:
+
+| `Attention.Kind` | Meaning | Action |
+| --- | --- | --- |
+| `execution` with an uncertain invocation | A tool was dispatched and its outcome was lost. | Check the destination by the invocation's operation ID, then `Reconcile` with the authoritative outcome; the run continues without re-executing the tool. |
+| `execution` with a payload reason | A payload is too large or unreadable. | Raise `RuntimeConfig.MaxPayloadBytes` and `Recover`, reconcile the oversized invocation, or `Cancel`. |
+| `provider` | A provider call may have been sent and billed; its response is lost. | Accept the cost by raising `ProviderRecoveryPolicy.MaxFreshAttempts` and calling `Recover`, or `Cancel`. |
+| `hooks` | Committed-run hook delivery was interrupted. | Check what the hooks may have done, then `AcknowledgeHooks`. |
+| `child` | A child run is blocking the parent; `BlockingRunID` names it. | Act on that child (it may only be settling after a cancel); the parent continues when it settles. |
+
+4. `Cancel` is always available and records the run as canceled while
+   keeping all effect evidence.
+5. Retry lost responses exactly: resubmitting with the same idempotency key,
+   resolving a wait again, or repeating a reconciliation returns the stored
+   outcome instead of doing the work twice.
+
+`examples/durable_host` runs this procedure end to end across processes,
+including a crash between an external write and its commit.

@@ -60,7 +60,7 @@ the root module dependency-light and preserve provider-specific behavior in
   from every affected nested module.
 - For dependency-boundary or release work, also test affected published modules
   with `GOWORK=off go test ./...`.
-- Run race tests for changes to sessions, streams, tool batches, accumulators,
+- Run race tests for changes to the runtime, streams, tool batches, children, accumulators,
   hooks, or other concurrent state.
 
 Never run `scripts/release.sh`, create tags, push, or publish unless the user

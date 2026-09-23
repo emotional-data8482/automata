@@ -5,8 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/emotional-data8482/automata/tracing"
 	"log/slog"
+
+	"github.com/emotional-data8482/automata/tracing"
 )
 
 type loopState uint8
@@ -61,7 +62,6 @@ type loopMachine struct {
 	result     RunResult
 	err        error
 	step       int
-	policy     *toolPolicyState
 	tools      []ToolDefinition
 	registry   map[string]registeredTool
 	hooks      []PreSendHook
@@ -80,7 +80,7 @@ func (m *loopMachine) transition(next loopState) {
 		panic("provider request not prepared")
 	}
 
-	if m.state == loopStateExecuteTools && !(m.cfg.durableBatch != nil && m.err != nil) {
+	if m.state == loopStateExecuteTools && m.err == nil {
 		msgs := m.loop.messages
 		if len(msgs) < len(m.calls) {
 			panic("tool results not committed")
@@ -124,7 +124,6 @@ func (m *loopMachine) drive() (RunResult, error) {
 			m.result.Turns = m.cfg.scope.turns
 			m.result.ProviderAttempts = m.cfg.scope.providerAttempts
 			m.result.Usage = m.cfg.scope.usage
-			m.cfg.scope.checkpoint(m.loop.messages)
 			m.cfg.scope.result = cloneRunResult(m.result)
 			next = loopStateDone
 		}
@@ -134,9 +133,6 @@ func (m *loopMachine) drive() (RunResult, error) {
 }
 
 func (m *loopMachine) persistTransition(kind string) error {
-	if m.cfg.durableTransition == nil {
-		return nil
-	}
 	result := cloneRunResult(m.result)
 	result.RunID = m.cfg.scope.id
 	result.Messages = m.loop.snapshot()
@@ -176,21 +172,25 @@ func (m *loopMachine) structuredCorrections() int {
 func (m *loopMachine) start() loopState {
 	l, ctx, task, mode, cfg := m.loop, m.ctx, m.task, m.mode, m.cfg
 	a := l.agent
-	policy := cfg.scope.policy
+	policy := a.toolPolicy
 
 	ctx, span := a.tracer.Start(ctx, "agent.run",
 		tracing.String("task", task),
-		tracing.Int("max_steps", a.maxSteps),
+		tracing.Int("max_turns", a.maxTurns),
 		tracing.String("mode", mode),
-		tracing.String("tool_policy.timeout", policy.policy.Timeout.String()),
-		tracing.Int("tool_policy.max_calls", policy.policy.MaxCalls),
-		tracing.Int("tool_policy.max_parallel", policy.policy.MaxParallel),
+		tracing.String("tool_policy.timeout", policy.Timeout.String()),
+		tracing.Int("tool_policy.max_calls", policy.MaxCalls),
+		tracing.Int("tool_policy.max_parallel", policy.MaxParallel),
 	)
 	m.ctx, m.span = ctx, span
 
 	log := spanLogger(span, l.log)
-	m.log, m.policy = log, policy
-	log.InfoContext(ctx, "starting run", "task", task, "max_steps", a.maxSteps, "mode", mode)
+	m.log = log
+	if cfg.resume {
+		log.InfoContext(ctx, "resuming run", "turns", cfg.scope.turns, "max_turns", a.maxTurns, "mode", mode)
+	} else {
+		log.InfoContext(ctx, "starting run", "task", task, "max_turns", a.maxTurns, "mode", mode)
+	}
 
 	if !cfg.resume {
 		l.messages = append(l.messages, UserMessage(task))
@@ -278,8 +278,8 @@ func (m *loopMachine) structuredProseOutcome(text string) loopState {
 			if err := m.persistTransition("response_classified"); err != nil {
 				return m.fail(&durableTransitionFailure{cause: err})
 			}
-			span.SetAttributes(tracing.Int("steps", m.result.Steps))
-			log.InfoContext(ctx, "run complete via structured output", "steps", m.result.Steps)
+			span.SetAttributes(tracing.Int("turns", m.cfg.scope.turns))
+			log.InfoContext(ctx, "run complete via structured output", "turns", m.cfg.scope.turns)
 			return loopStateFinish
 		}
 		invalid = &InvalidStructuredOutputError{Violations: violations}
@@ -318,26 +318,25 @@ func (m *loopMachine) structuredProseOutcome(text string) loopState {
 	}
 	span.RecordError(invalid)
 	span.SetStatus(invalid)
-	log.WarnContext(ctx, "structured output correction budget exhausted", "steps", m.result.Steps)
+	log.WarnContext(ctx, "structured output correction budget exhausted", "turns", m.cfg.scope.turns)
 	return m.fail(invalid)
 }
 
 func (m *loopMachine) prepareTurn() loopState {
 	l, ctx, a, result, step, log, span := m.loop, m.ctx, m.loop.agent, &m.result, m.step, m.log, m.span
-	_, _, _, _, _, _, _ = l, ctx, a, result, step, log, span
 
 	if err := ctx.Err(); err != nil {
 		m.result.StopReason = StopCancelled
 		return m.fail(err)
 	}
-	if m.cfg.scope.turns >= m.cfg.scope.config.maxTurns {
-		err := fmt.Errorf("%w (%d)", ErrMaxStepsExceeded, a.maxSteps)
+	if m.cfg.scope.turns >= a.maxTurns {
+		err := fmt.Errorf("%w (%d)", ErrMaxTurnsExceeded, a.maxTurns)
 		if state := m.cfg.structuredOutput; state != nil && state.lastInvalid != nil {
 			err = errors.Join(err, state.lastInvalid)
 		}
 		span.SetStatus(err)
-		log.WarnContext(ctx, "exceeded max steps", "max_steps", a.maxSteps)
-		result.StopReason = StopMaxSteps
+		log.WarnContext(ctx, "exceeded max turns", "max_turns", a.maxTurns)
+		result.StopReason = StopMaxTurns
 		return m.fail(err)
 	}
 	m.cfg.scope.turns++
@@ -388,7 +387,6 @@ func (m *loopMachine) prepareTurn() loopState {
 			span.RecordError(hookErr)
 			span.SetStatus(hookErr)
 			log.ErrorContext(ctx, "pre-send hook failed", "step", step, "err", hookErr)
-			result.Steps = step
 			return m.fail(fmt.Errorf("pre-send hook failed at step %d: %w", step, hookErr))
 		}
 		hookSpan.End()
@@ -413,8 +411,7 @@ func (m *loopMachine) prepareTurn() loopState {
 	return loopStateInvokeProvider
 }
 func (m *loopMachine) invokeProvider() loopState {
-	l, ctx, a, result, step, log, span := m.loop, m.ctx, m.loop.agent, &m.result, m.step, m.log, m.span
-	_, _, _, _, _, _, _ = l, ctx, a, result, step, log, span
+	l, ctx, a, result, step, log := m.loop, m.ctx, m.loop.agent, &m.result, m.step, m.log
 
 	// Runtime records the attempt before sending it: after a crash, an open
 	// attempt record means the provider may have received this request, so
@@ -431,7 +428,6 @@ func (m *loopMachine) invokeProvider() loopState {
 		invokeSpan.SetStatus(err)
 		invokeSpan.End()
 		log.ErrorContext(ctx, "provider invocation failed", "step", step, "err", err)
-		result.Steps = step
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			result.StopReason = StopCancelled
 		}
@@ -453,22 +449,18 @@ func (m *loopMachine) invokeProvider() loopState {
 	}
 	invokeSpan.End()
 
-	result.Steps = step + 1
-
 	m.response = response
 	return loopStateClassifyResponse
 }
 func (m *loopMachine) classifyResponse() loopState {
-	l, ctx, a, result, step, log, span := m.loop, m.ctx, m.loop.agent, &m.result, m.step, m.log, m.span
-	_, _, _, _, _, _, _ = l, ctx, a, result, step, log, span
+	l, ctx, result, log, span := m.loop, m.ctx, &m.result, m.log, m.span
 
 	response := m.response
 	msg, rejection := reconcileAssistant(response.Message)
 	toolUses := msg.ToolUses()
 	m.calls = toolUses
-	stopReason, rawStopReason := normalizeResponseStop(response, toolUses)
+	stopReason, rawStopReason := normalizeResponseStop(response)
 	result.ProviderStopReason = stopReason
-	result.RawProviderStopReason = rawStopReason
 	result.RawStopReason = rawStopReason
 	if response.completionErr != nil && (stopReason == StopEndTurn || stopReason == StopToolUse) {
 		stopReason = StopIncomplete
@@ -535,8 +527,8 @@ func (m *loopMachine) classifyResponse() loopState {
 		if err := m.persistTransition("response_classified"); err != nil {
 			return m.fail(&durableTransitionFailure{cause: err})
 		}
-		span.SetAttributes(tracing.Int("steps", result.Steps))
-		log.InfoContext(ctx, "run complete", "steps", result.Steps)
+		span.SetAttributes(tracing.Int("turns", m.cfg.scope.turns))
+		log.InfoContext(ctx, "run complete", "turns", m.cfg.scope.turns)
 		return loopStateFinish
 	}
 
@@ -548,8 +540,7 @@ func (m *loopMachine) classifyResponse() loopState {
 	return loopStateExecuteTools
 }
 func (m *loopMachine) executeTools() loopState {
-	l, ctx, a, result, step, log, span := m.loop, m.ctx, m.loop.agent, &m.result, m.step, m.log, m.span
-	_, _, _, _, _, _, _ = l, ctx, a, result, step, log, span
+	l, ctx, step, log, span := m.loop, m.ctx, m.step, m.log, m.span
 
 	cfg, toolUses := m.cfg, m.calls
 	log.DebugContext(ctx, "executing tools", "step", step, "count", len(toolUses))
@@ -559,9 +550,10 @@ func (m *loopMachine) executeTools() loopState {
 		l.emit(StreamEvent{Kind: StreamToolCall, ToolCall: call})
 	}
 
-	// Terminal tool (RunTyped): if the model invoked it, capture its raw
-	// arguments and end the run without executing anything. Every sibling call
-	// still receives a synthetic result so the transcript stays well-formed.
+	// Terminal structured-output tool: if the model invoked it, validate its
+	// arguments and end or correct the run without executing anything. Every
+	// sibling call still receives a synthetic result so the transcript stays
+	// well-formed.
 	if cfg.terminalTool != "" {
 		terminalFound := false
 		var input json.RawMessage
@@ -573,7 +565,6 @@ func (m *loopMachine) executeTools() loopState {
 			if len(input) == 0 {
 				input = json.RawMessage("{}")
 			}
-			result.terminalToolInput = input
 			terminalFound = true
 		}
 		if terminalFound {
@@ -623,7 +614,7 @@ func (m *loopMachine) executeTools() loopState {
 			}
 			if len(violations) == 0 {
 				m.result.StopReason = StopEndTurn
-				log.InfoContext(ctx, "run complete via terminal tool", "tool", cfg.terminalTool, "steps", result.Steps)
+				log.InfoContext(ctx, "run complete via terminal tool", "tool", cfg.terminalTool, "turns", m.cfg.scope.turns)
 				return loopStateFinish
 			}
 			invalid := &InvalidStructuredOutputError{Violations: violations}
@@ -635,22 +626,13 @@ func (m *loopMachine) executeTools() loopState {
 			}
 			span.RecordError(invalid)
 			span.SetStatus(invalid)
-			log.WarnContext(ctx, "structured output correction budget exhausted", "steps", result.Steps)
+			log.WarnContext(ctx, "structured output correction budget exhausted", "turns", m.cfg.scope.turns)
 			m.result.StopReason = StopEndTurn
 			return m.fail(invalid)
 		}
 	}
 
-	// Snapshot messages for the approver — captures history up to and
-	// including the assistant message that requested these tool calls.
-	approverMessages := l.messages
-	var results []Message
-	var fatalErr error
-	if cfg.durableBatch != nil {
-		results, fatalErr = cfg.durableBatch(ctx, l, toolUses, approverMessages, m.policy)
-	} else {
-		results, fatalErr = l.executeToolBatch(ctx, toolUses, approverMessages, m.policy)
-	}
+	results, fatalErr := cfg.durableBatch(ctx, l, toolUses)
 	if len(results) != len(toolUses) {
 		if fatalErr == nil {
 			fatalErr = errors.New("tool batch returned incomplete results")
@@ -666,13 +648,11 @@ func (m *loopMachine) executeTools() loopState {
 		span.SetStatus(fatalErr)
 		return m.fail(fatalErr)
 	}
-	m.cfg.scope.checkpoint(l.messages)
 	m.step++
 	return loopStatePrepareTurn
 }
 func (m *loopMachine) failCompletion(reason StopReason, raw string, cause error) loopState {
-	l, ctx, a, result, step, log, span := m.loop, m.ctx, m.loop.agent, &m.result, m.step, m.log, m.span
-	_, _, _, _, _, _, _ = l, ctx, a, result, step, log, span
+	l, ctx, result, log, span := m.loop, m.ctx, &m.result, m.log, m.span
 
 	for _, call := range m.calls {
 		l.emit(StreamEvent{Kind: StreamToolCall, ToolCall: call})
@@ -691,8 +671,8 @@ func (m *loopMachine) failCompletion(reason StopReason, raw string, cause error)
 	err := &CompletionError{Reason: reason, RawReason: raw, Cause: cause}
 	span.RecordError(err)
 	span.SetStatus(err)
-	span.SetAttributes(tracing.Int("steps", result.Steps))
+	span.SetAttributes(tracing.Int("turns", m.cfg.scope.turns))
 	log.WarnContext(ctx, "provider completion was not final",
-		"reason", reason, "raw_reason", raw, "steps", result.Steps)
+		"reason", reason, "raw_reason", raw, "turns", m.cfg.scope.turns)
 	return m.fail(err)
 }

@@ -81,8 +81,10 @@ type durableWaitPolicyProvider interface {
 }
 
 // WithDurableWait attaches a durable question or approval policy to a tool.
-// The policy is used only by Runtime; direct Agent runs retain the existing
-// process-local Approver and execute the wrapped tool normally.
+// A call suspends its run without holding a worker until the host answers
+// with [RunHandle.ResolveWait]. An answered question becomes the tool result
+// without executing the tool; an allowed approval dispatches the exact
+// approved call; a denial is returned to the model.
 func WithDurableWait(tool Tool, policy DurableWaitPolicy) Tool {
 	return &durableWaitTool{Tool: tool, policy: policy}
 }
@@ -141,12 +143,23 @@ func (f ApprovalAuthorizerFunc) AuthorizeApproval(ctx context.Context, request A
 	return f(ctx, request)
 }
 
+// Decision answers a durable approval. The zero value is not a decision, so
+// an approval is never granted by omission.
+type Decision string
+
+const (
+	// Allow dispatches the exact approved action.
+	Allow Decision = "allow"
+	// Deny returns "denied: <Reason>" to the model as the tool result.
+	Deny Decision = "deny"
+)
+
 // WaitResolution answers a durable wait. Question answers must contain valid
-// JSON. Approval decisions support only Allow or Deny: modified actions require
-// a new model-requested invocation and approval.
+// JSON and no decision. Approvals must be Allow or Deny: a modified action
+// needs a new model-requested invocation and approval.
 type WaitResolution struct {
 	Answer       json.RawMessage `json:"answer,omitempty"`
-	Decision     Outcome         `json:"decision,omitempty"`
+	Decision     Decision        `json:"decision,omitempty"`
 	Reason       string          `json:"reason,omitempty"`
 	Actor        string          `json:"actor,omitempty"`
 	ActionDigest string          `json:"action_digest,omitempty"`

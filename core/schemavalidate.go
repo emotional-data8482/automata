@@ -7,10 +7,8 @@ import (
 	"strings"
 )
 
-// validateTypedPayload checks raw — a JSON payload a model produced for a
-// typed run (a [RunTyped]/[RunSessionTyped] structured-output tool call, a
-// parsed prose answer, a provider-native structured response, or a structured
-// child value) — against the schema implied by T. It is the Go-typed entry
+// validateTypedPayload checks raw — an accepted structured payload being
+// decoded by [Decode] — against the schema implied by T. It is the Go-typed entry
 // point of the one supported schema contract shared with tool input values
 // and declared final-output schemas (see schemacontract.go): T's schema is
 // compiled with the same rules, and the payload is validated by the same

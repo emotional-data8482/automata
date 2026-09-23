@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"sync"
 	"time"
+
+	"github.com/emotional-data8482/automata/tracing"
 )
 
 var (
@@ -39,7 +41,7 @@ type storedToolInvocation struct {
 	Result          ToolResult          `json:"result"`
 	Effect          EffectReport        `json:"effect"`
 	Error           string              `json:"error,omitempty"`
-	ErrorKind       string              `json:"error_kind,omitempty"`
+	ErrorKind       FailureKind         `json:"error_kind,omitempty"`
 	ErrorStopReason StopReason          `json:"error_stop_reason,omitempty"`
 	ErrorRawReason  string              `json:"error_raw_reason,omitempty"`
 	Fatal           bool                `json:"fatal,omitempty"`
@@ -320,31 +322,6 @@ func chargeDurableBudget(tx StoreTransaction, record *storedRuntimeRun, capped [
 	return usage, nil
 }
 
-// reserveNestedCall charges one known tool call that a process-local agent,
-// running inside runID's tool execution, reserved for itself. It persists the
-// charge on runID's subtree cap and every capped ancestor immediately, so
-// nested work cannot exceed a durable cap or lose its charges on restart.
-func (r *Runtime) reserveNestedCall(runID string) (toolBudgetUsage, error) {
-	var usage toolBudgetUsage
-	err := r.transaction(context.Background(), true, func(tx StoreTransaction) error {
-		record, err := getRuntimeRun(tx, runID)
-		if err != nil {
-			return err
-		}
-		if record.State != RuntimeRunning {
-			// A canceled or no longer owned run admits no new nested work.
-			return context.Canceled
-		}
-		// Nested tool names belong to the nested agent, so no local per-tool
-		// cap of this run applies.
-		if usage, err = reserveDurableInvocation(tx, &record, ""); err != nil {
-			return err
-		}
-		return putRuntimeRun(tx, record)
-	})
-	return usage, err
-}
-
 // prepareDurableBatch creates the run's pending tool batch or reloads it. It
 // reports whether it created the batch and whether it committed the run as
 // waiting; a suspended worker must return without dispatching, because only
@@ -427,7 +404,7 @@ func (r *Runtime) prepareDurableBatch(ctx context.Context, runID string, l *loop
 					invocation.State = ToolInvocationCompleted
 					invocation.Result = resultFromMessage(message)
 					invocation.Effect = EffectReport{Status: EffectNotApplied}
-				} else if child, childErr := durableChildDeclaration(registered.executor); childErr != nil {
+				} else if child, childErr := childDeclaration(registered.executor); childErr != nil {
 					return childErr
 				} else if child != nil {
 					// Durable child invocation. The reservation above charged this
@@ -443,7 +420,7 @@ func (r *Runtime) prepareDurableBatch(ctx context.Context, runID string, l *loop
 						invocation.Result = ErrorResult("invalid child arguments: " + err.Error())
 						invocation.Effect = EffectReport{Status: EffectNotApplied}
 					} else {
-						receipt, admitErr := r.admitChildRun(tx, record, invocation, child.policy, string(call.Input))
+						receipt, admitErr := r.admitChildRun(tx, record, invocation, child.child, string(call.Input))
 						if admitErr != nil {
 							return admitErr
 						}
@@ -690,7 +667,7 @@ func emitStoredToolResult(l *loop, invocation storedToolInvocation, err error) {
 	})
 }
 
-func (r *Runtime) executeDurableToolBatch(ctx context.Context, runID string, l *loop, calls []ToolUseBlock, messages []Message, policy *toolPolicyState) ([]Message, error) {
+func (r *Runtime) executeDurableToolBatch(ctx context.Context, runID string, l *loop, calls []ToolUseBlock, policy ToolPolicy) ([]Message, error) {
 	batch, invocations, created, suspended, err := r.prepareDurableBatch(ctx, runID, l, calls)
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -754,7 +731,7 @@ func (r *Runtime) executeDurableToolBatch(ctx context.Context, runID string, l *
 	}
 	close(jobs)
 	workers := len(jobs)
-	if max := policy.policy.MaxParallel; max > 0 && workers > max {
+	if max := policy.MaxParallel; max > 0 && workers > max {
 		workers = max
 	}
 	batchCtx, cancelBatch := context.WithCancelCause(ctx)
@@ -778,7 +755,7 @@ func (r *Runtime) executeDurableToolBatch(ctx context.Context, runID string, l *
 			for invocation := range jobs {
 				call := invocation.Call
 				if cause := context.Cause(batchCtx); cause != nil {
-					canonical := ErrorResult(canceledToolResult(cause))
+					canonical := ErrorResult(canceledToolResult)
 					returned := ToolResult{Effect: EffectReport{Status: EffectNotApplied}}
 					if err := r.completeToolInvocation(ctx, invocation, returned, batchCtx.Err(), canonical, false); err != nil {
 						recordWorkErr(err)
@@ -794,15 +771,7 @@ func (r *Runtime) executeDurableToolBatch(ctx context.Context, runID string, l *
 				var authorityErr error
 				op := ToolOperation{ID: current.OperationID, RunID: runID, BatchID: batch.BatchID, Invocation: current.Ordinal, IdempotencyKey: current.OperationID}
 				execCtx := withToolOperation(batchCtx, op)
-				if current.WaitID != "" {
-					execCtx = withDurableApproval(execCtx)
-				}
-				execCtx = withDurableToolDispatch(execCtx, func() error {
-					// Nested process-local tools may inherit this context until T07 turns
-					// children into durable runs. Only the outer binding owns this dispatch.
-					if dispatchAttempted {
-						return nil
-					}
+				dispatch := func() error {
 					dispatchAttempted = true
 					// This check is intentionally inside the dispatch callback: approval,
 					// timeout, and rate-limit work above may block. No host callback is held
@@ -831,8 +800,8 @@ func (r *Runtime) executeDurableToolBatch(ctx context.Context, runID string, l *
 					}
 					dispatched = true
 					return nil
-				})
-				result, executeErr := l.safelyExecuteTool(execCtx, call, messages, policy, current.Budget)
+				}
+				result, executeErr := l.safelyExecuteTool(execCtx, call, policy, current.Budget, dispatch)
 				if dispatchAttempted && !dispatched {
 					if authorityErr != nil {
 						canonical := ErrorResult("denied: " + authorityErr.Error())
@@ -869,7 +838,7 @@ func (r *Runtime) executeDurableToolBatch(ctx context.Context, runID string, l *
 						cancelBatch(executeErr)
 					})
 					if !first && (errors.Is(executeErr, context.Canceled) || errors.Is(executeErr, context.DeadlineExceeded)) {
-						canonical = ErrorResult(canceledToolResult(context.Cause(batchCtx)))
+						canonical = ErrorResult(canceledToolResult)
 						fatal = false
 					}
 				}
@@ -1069,7 +1038,7 @@ func (r *Runtime) recoverToolBatch(ctx context.Context, record storedRuntimeRun)
 		} else if hasUncertain {
 			current.State = RuntimeNeedsAttention
 			current.AttentionReason = ErrToolEffectUncertain.Error()
-			current.AttentionKind = "execution"
+			current.AttentionKind = AttentionExecution
 		} else {
 			current.State = RuntimeReady
 			current.AttentionReason = ""
@@ -1222,4 +1191,35 @@ func (h *RunHandle) Reconcile(ctx context.Context, operationID string, resolutio
 		err = h.runtime.wakeParentFromChild(context.WithoutCancel(ctx), h.runID)
 	}
 	return err
+}
+
+// policyDeniedToolResult is the model-visible result of a call its budget
+// denied when the batch was created.
+func (l *loop) policyDeniedToolResult(
+	ctx context.Context,
+	call ToolUseBlock,
+	usage toolBudgetUsage,
+	err error,
+) Message {
+	a := l.agent
+	_, span := a.tracer.Start(ctx, "tool.execute",
+		tracing.String("tool", call.Name),
+		tracing.String("policy.outcome", "budget_exhausted"),
+		tracing.Int("policy.budget_used", usage.used),
+		tracing.Int("policy.budget_max", usage.max),
+		tracing.Int("policy.tool_budget_used", usage.toolUsed),
+		tracing.Int("policy.tool_budget_max", usage.toolMax),
+	)
+	span.RecordError(err)
+	span.SetStatus(err)
+	span.End()
+
+	content := "denied: " + err.Error()
+	blocks := Blocks{TextBlock{Text: content}}
+	l.log.DebugContext(ctx, "tool call denied by policy", "tool", call.Name, "err", err)
+	l.emit(StreamEvent{
+		Kind: StreamToolResult, ToolCall: call, Result: content,
+		ResultBlocks: blocks, IsError: true, Err: err,
+	})
+	return ToolResultBlockMessage(call.ID, blocks, true)
 }

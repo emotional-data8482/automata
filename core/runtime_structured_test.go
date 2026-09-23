@@ -76,7 +76,7 @@ func runtimeWithAgent(t *testing.T, f *structuredFixture, agent *Agent) *Runtime
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = runtime.Close() })
-	if err := runtime.Register("agent", "v1", agent); err != nil {
+	if _, err := runtime.Register("agent", "v1", agent); err != nil {
 		t.Fatal(err)
 	}
 	return runtime
@@ -96,7 +96,7 @@ func TestRuntimeStructuredCorrectionKeepsReceiptsAndBlocksDuplicates(t *testing.
 	}
 	agent := newStructuredAgent(t, &scriptedProvider{turns: turns}, []Tool{f.writeTool()}, summaryContract(), 8)
 	runtime := runtimeWithAgent(t, f, agent)
-	handle, err := runtime.Submit(context.Background(), "agent", "v1", "produce summary", SubmitOptions{})
+	handle, err := runtime.Submit(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "produce summary")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -156,7 +156,7 @@ func TestRuntimeStructuredCorrectionBudgetExhaustedFails(t *testing.T) {
 	cfg := &StructuredOutputConfig{Schema: json.RawMessage(summarySchema)} // MaxCorrections: 0
 	agent := newStructuredAgent(t, &scriptedProvider{turns: turns}, []Tool{f.writeTool()}, cfg, 8)
 	runtime := runtimeWithAgent(t, f, agent)
-	handle, err := runtime.Submit(context.Background(), "agent", "v1", "produce summary", SubmitOptions{})
+	handle, err := runtime.Submit(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "produce summary")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -274,7 +274,7 @@ func seedCorrectedRun(t *testing.T, f *structuredFixture, runID string) {
 	record := storedRuntimeRun{
 		Version: runtimeEncodingVersion, RunID: runID, DefinitionID: "agent", DefinitionRevision: "v1",
 		Task: "produce summary", State: RuntimeRunning, Generation: 4,
-		Result:         RunResult{RunID: runID, Turns: 2, Steps: 2, FinalMessage: messages[3]},
+		Result:         RunResult{RunID: runID, Turns: 2, FinalMessage: messages[3]},
 		Corrections:    1,
 		LastTransition: "batch_committed",
 		EffectiveTools: []string{"write", structuredOutputToolName},
@@ -422,7 +422,7 @@ func TestRuntimeNativeStructuredOutputFallsBackWithoutProviderSupport(t *testing
 	cfg := &StructuredOutputConfig{Schema: json.RawMessage(summarySchema), Native: true, MaxCorrections: 1}
 	agent := newStructuredAgent(t, &scriptedProvider{turns: turns}, nil, cfg, 8)
 	runtime := runtimeWithAgent(t, f, agent)
-	handle, err := runtime.Submit(context.Background(), "agent", "v1", "produce summary", SubmitOptions{})
+	handle, err := runtime.Submit(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "produce summary")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -469,7 +469,7 @@ func TestRuntimeNativeStructuredOutputKeepsSchemaFidelity(t *testing.T) {
 	provider := &structuredNativeProvider{turns: turns}
 	agent := newStructuredAgent(t, provider, nil, cfg, 8)
 	runtime := runtimeWithAgent(t, f, agent)
-	handle, err := runtime.Submit(context.Background(), "agent", "v1", "produce summary", SubmitOptions{})
+	handle, err := runtime.Submit(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "produce summary")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -517,7 +517,7 @@ func TestRuntimeNativeStructuredOutputCorrectsWithinOneLifecycle(t *testing.T) {
 	cfg := &StructuredOutputConfig{Schema: json.RawMessage(summarySchema), Native: true, MaxCorrections: 1}
 	agent := newStructuredAgent(t, &structuredNativeProvider{turns: turns}, nil, cfg, 8)
 	runtime := runtimeWithAgent(t, f, agent)
-	handle, err := runtime.Submit(context.Background(), "agent", "v1", "produce summary", SubmitOptions{})
+	handle, err := runtime.Submit(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "produce summary")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -537,18 +537,22 @@ func TestRuntimeNativeStructuredOutputCorrectsWithinOneLifecycle(t *testing.T) {
 	}
 }
 
-// TestRunTypedUsesDeclaredStructuredOutput pins that the typed facade adapts to
-// an agent's pinned declared contract instead of installing a second hidden tool.
-func TestRunTypedUsesDeclaredStructuredOutput(t *testing.T) {
+// TestDecodeReadsDeclaredStructuredOutput pins that Decode reads the accepted
+// payload of a definition's pinned declared contract.
+func TestDecodeReadsDeclaredStructuredOutput(t *testing.T) {
 	typedAgent, err := New(&scriptedProvider{turns: []Message{
 		asstCalls(structuredCall("s1", `{"summary":"done"}`)),
 	}}, AgentConfig{StructuredOutput: summaryContract()})
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, result, err := RunTyped[struct {
+	result, err := runAgent(t, typedAgent, "work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := Decode[struct {
 		Summary string `json:"summary"`
-	}](context.Background(), typedAgent, "work")
+	}](result)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -578,7 +582,7 @@ func (p *incompleteStructuredStreamProvider) InvokeStream(context.Context, Reque
 func TestDeclaredStructuredOutputRejectsIncompleteStreamPartial(t *testing.T) {
 	provider := &incompleteStructuredStreamProvider{}
 	agent := newStructuredAgent(t, provider, nil, summaryContract(), 8)
-	result, err := agent.RunStream(context.Background(), "produce summary", nil)
+	result, err := runAgentStream(t, agent, "produce summary", nil)
 	var completion *CompletionError
 	if !errors.As(err, &completion) || completion.Reason != StopIncomplete {
 		t.Fatalf("RunStream error = %v, want incomplete CompletionError", err)
@@ -596,33 +600,17 @@ func TestDeclaredStructuredOutputRejectsIncompleteStreamPartial(t *testing.T) {
 	}
 }
 
-func TestDeclaredStructuredOutputRunStreamAndSessionParity(t *testing.T) {
+func TestDeclaredStructuredOutputRunStreamParity(t *testing.T) {
 	streamAgent := newStructuredAgent(t, &scriptedProvider{turns: []Message{
 		asstCalls(structuredCall("s1", `{"summary":5}`)),
 		asstCalls(structuredCall("s2", `{"summary":"stream"}`)),
 	}}, nil, summaryContract(), 8)
-	streamResult, err := streamAgent.RunStream(context.Background(), "work", nil)
+	streamResult, err := runAgentStream(t, streamAgent, "work", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if string(streamResult.StructuredOutput) != `{"summary":"stream"}` || streamResult.Turns != 2 {
 		t.Fatalf("stream result = %#v", streamResult)
-	}
-
-	sessionAgent := newStructuredAgent(t, &scriptedProvider{turns: []Message{
-		asstCalls(structuredCall("s1", `{"summary":5}`)),
-		asstCalls(structuredCall("s2", `{"summary":"session"}`)),
-	}}, nil, summaryContract(), 8)
-	session := sessionAgent.NewSession()
-	sessionResult, err := session.Run(context.Background(), "work")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(sessionResult.StructuredOutput) != `{"summary":"session"}` || sessionResult.Turns != 2 {
-		t.Fatalf("session result = %#v", sessionResult)
-	}
-	if len(session.Messages()) != len(sessionResult.Messages) {
-		t.Fatalf("session transcript length = %d, result transcript length = %d", len(session.Messages()), len(sessionResult.Messages))
 	}
 }
 
@@ -637,10 +625,10 @@ func TestRuntimeStructuredDeadlineDuringCorrectionDoesNotResurrect(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := runtime.Register("agent", "v1", agent); err != nil {
+	if _, err := runtime.Register("agent", "v1", agent); err != nil {
 		t.Fatal(err)
 	}
-	handle, err := runtime.Submit(context.Background(), "agent", "v1", "work", SubmitOptions{Deadline: deadline})
+	handle, err := runtime.Submit(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "work", WithDeadline(deadline))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -658,7 +646,7 @@ func TestRuntimeStructuredDeadlineDuringCorrectionDoesNotResurrect(t *testing.T)
 		t.Fatal(err)
 	}
 	defer recovered.Close()
-	if err := recovered.Register("agent", "v1", newStructuredAgent(t, &scriptedProvider{turns: []Message{asstCalls(structuredCall("late", `{"summary":"late"}`))}}, nil, summaryContract(), 8)); err != nil {
+	if _, err := recovered.Register("agent", "v1", newStructuredAgent(t, &scriptedProvider{turns: []Message{asstCalls(structuredCall("late", `{"summary":"late"}`))}}, nil, summaryContract(), 8)); err != nil {
 		t.Fatal(err)
 	}
 	if err := recovered.Recover(context.Background()); err != nil {
@@ -704,7 +692,7 @@ func TestRuntimeNativeProviderAcceptedRestartFinalizesWithoutReplay(t *testing.T
 	record := storedRuntimeRun{
 		Version: runtimeEncodingVersion, RunID: "native-provider-accepted", DefinitionID: "agent", DefinitionRevision: "v1",
 		Task: "produce summary", State: RuntimeRunning, Generation: 4,
-		Result:         RunResult{RunID: "native-provider-accepted", Turns: 2, Steps: 2, FinalMessage: messages[len(messages)-1]},
+		Result:         RunResult{RunID: "native-provider-accepted", Turns: 2, FinalMessage: messages[len(messages)-1]},
 		Corrections:    1,
 		LastTransition: "provider_accepted",
 	}
@@ -738,8 +726,8 @@ func TestRuntimeNativeProviderAcceptedRestartFinalizesWithoutReplay(t *testing.T
 func TestDeclaredStructuredOutputMaxTurnsExhaustionKeepsInvalidCause(t *testing.T) {
 	provider := &scriptedProvider{turns: []Message{asstCalls(structuredCall("s1", `{"summary":5}`))}}
 	agent := newStructuredAgent(t, provider, nil, summaryContract(), 1)
-	result, err := agent.Run(context.Background(), "work")
-	if !errors.Is(err, ErrMaxStepsExceeded) || !errors.Is(err, ErrInvalidStructuredOutput) {
+	result, err := runAgent(t, agent, "work")
+	if !errors.Is(err, ErrMaxTurnsExceeded) || !errors.Is(err, ErrInvalidStructuredOutput) {
 		t.Fatalf("err = %v, want max turns joined with invalid structured output", err)
 	}
 	if result.Status != RunLimitReached || provider.calls != 1 || len(result.StructuredOutput) != 0 {
@@ -755,15 +743,15 @@ func TestRuntimeStructuredMaxTurnsSnapshotReopenKeepsInvalidCause(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := runtime.Register("agent", "v1", agent); err != nil {
+	if _, err := runtime.Register("agent", "v1", agent); err != nil {
 		t.Fatal(err)
 	}
-	handle, err := runtime.Submit(context.Background(), "agent", "v1", "produce summary", SubmitOptions{})
+	handle, err := runtime.Submit(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "produce summary")
 	if err != nil {
 		t.Fatal(err)
 	}
 	result, err := handle.Await(context.Background())
-	if !errors.Is(err, ErrMaxStepsExceeded) || !errors.Is(err, ErrInvalidStructuredOutput) {
+	if !errors.Is(err, ErrMaxTurnsExceeded) || !errors.Is(err, ErrInvalidStructuredOutput) {
 		t.Fatalf("await error = %v, want max turns joined with invalid structured output", err)
 	}
 	if result.Status != RunLimitReached || provider.calls != 1 || len(result.StructuredOutput) != 0 {
@@ -773,7 +761,7 @@ func TestRuntimeStructuredMaxTurnsSnapshotReopenKeepsInvalidCause(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if snapshot.State != RuntimeTerminal || (snapshot.Failure == nil || snapshot.Failure.Kind != FailureMaxStepsInvalidStructuredOutput) {
+	if snapshot.State != RuntimeTerminal || (snapshot.Failure == nil || snapshot.Failure.Kind != FailureMaxTurnsInvalidStructuredOutput) {
 		t.Fatalf("snapshot = %#v", snapshot)
 	}
 	runID := handle.ID()
@@ -790,11 +778,11 @@ func TestRuntimeStructuredMaxTurnsSnapshotReopenKeepsInvalidCause(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if reopenedSnapshot.State != RuntimeTerminal || (reopenedSnapshot.Failure == nil || reopenedSnapshot.Failure.Kind != FailureMaxStepsInvalidStructuredOutput) {
+	if reopenedSnapshot.State != RuntimeTerminal || (reopenedSnapshot.Failure == nil || reopenedSnapshot.Failure.Kind != FailureMaxTurnsInvalidStructuredOutput) {
 		t.Fatalf("reopened snapshot = %#v", reopenedSnapshot)
 	}
 	reopenedResult, err := reopened.Handle(runID).Await(context.Background())
-	if !errors.Is(err, ErrMaxStepsExceeded) || !errors.Is(err, ErrInvalidStructuredOutput) {
+	if !errors.Is(err, ErrMaxTurnsExceeded) || !errors.Is(err, ErrInvalidStructuredOutput) {
 		t.Fatalf("reopened await error = %v, want both sentinels", err)
 	}
 	if reopenedResult.Status != RunLimitReached || len(reopenedResult.StructuredOutput) != 0 {
@@ -809,7 +797,7 @@ func TestDeclaredStructuredOutputCorrectionSiblingResultDoesNotClaimCompletion(t
 		asstCalls(structuredCall("s2", `{"summary":"done"}`)),
 	}
 	agent := newStructuredAgent(t, &scriptedProvider{turns: turns}, []Tool{f.writeTool()}, summaryContract(), 8)
-	result, err := agent.Run(context.Background(), "work")
+	result, err := runAgent(t, agent, "work")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -827,28 +815,6 @@ func TestDeclaredStructuredOutputCorrectionSiblingResultDoesNotClaimCompletion(t
 	}
 	if !strings.Contains(siblingText, "correction requested") || strings.Contains(siblingText, "run completed") {
 		t.Fatalf("sibling correction result text = %q", siblingText)
-	}
-}
-
-func TestNativeDeclaredSchemaCannotBeClearedOrReplacedByRunOptions(t *testing.T) {
-	patches := []CallOptionsPatch{
-		{OutputSchema: Setting[json.RawMessage]{Set: true}},
-		{OutputSchema: Setting[json.RawMessage]{Set: true, Value: json.RawMessage(`{"type":"object","properties":{"other":{"type":"string"}}}`)}},
-	}
-	for _, patch := range patches {
-		provider := &structuredNativeProvider{turns: []Message{asstText(`{"summary":"pinned"}`)}}
-		cfg := &StructuredOutputConfig{Schema: json.RawMessage(summarySchema), Native: true, MaxCorrections: 1}
-		agent := newStructuredAgent(t, provider, nil, cfg, 8)
-		result, err := agent.Run(context.Background(), "work", WithCallOptions(patch))
-		if err != nil {
-			t.Fatal(err)
-		}
-		if string(result.StructuredOutput) != `{"summary":"pinned"}` {
-			t.Fatalf("result = %#v", result)
-		}
-		if string(provider.lastRequest.Options.OutputSchema) != summarySchema {
-			t.Fatalf("native schema = %q, want pinned %s", provider.lastRequest.Options.OutputSchema, summarySchema)
-		}
 	}
 }
 
@@ -871,16 +837,16 @@ func TestDeclaredStructuredOutputRejectsUnsupportedSchema(t *testing.T) {
 	}
 }
 
-// TestDirectDeclaredStructuredRunValidatesAndCorrects pins that direct
+// TestDeclaredStructuredRunValidatesAndCorrects pins that direct
 // process-local runs enforce the same declared contract through the same loop.
-func TestDirectDeclaredStructuredRunValidatesAndCorrects(t *testing.T) {
+func TestDeclaredStructuredRunValidatesAndCorrects(t *testing.T) {
 	f := newStructuredFixture()
 	turns := []Message{
 		asstCalls(structuredCall("s1", `{"summary":5}`)),
 		asstCalls(structuredCall("s2", `{"summary":"ok"}`)),
 	}
 	agent := newStructuredAgent(t, &scriptedProvider{turns: turns}, nil, summaryContract(), 8)
-	result, err := agent.Run(context.Background(), "work")
+	result, err := runAgent(t, agent, "work")
 	if err != nil {
 		t.Fatal(err)
 	}

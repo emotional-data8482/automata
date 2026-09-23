@@ -11,22 +11,22 @@ import (
 	"strings"
 )
 
-// structuredOutputToolName is the name of the hidden tool [RunTyped] and
-// [RunSessionTyped] inject to collect the typed result. It is namespaced under
-// the automata_ prefix so a user tool called "structured_output" cannot collide
-// with it; a user tool that deliberately occupies the namespaced name makes the
-// typed run fail fast (see RunSessionTyped).
+// structuredOutputToolName is the name of the hidden tool a declared
+// structured-output contract injects to collect the final payload. It is
+// namespaced under the automata_ prefix so a user tool called
+// "structured_output" cannot collide with it; a user tool that occupies the
+// namespaced name is rejected by [New].
 const structuredOutputToolName = "automata_structured_output"
 
 // ErrInvalidStructuredOutput is matched (via errors.Is) by the
-// [InvalidStructuredOutputError] returned when a typed run cannot produce a
-// payload that satisfies the schema implied by T.
+// [InvalidStructuredOutputError] returned when a run cannot produce a payload
+// that satisfies its declared schema, or when [Decode] rejects a payload.
 var ErrInvalidStructuredOutput = errors.New("invalid structured output")
 
 // InvalidStructuredOutputError reports a structured-output payload that failed
-// schema validation (or could not be decoded at all). It is returned by
-// [RunTyped] and [RunSessionTyped] after correction attempts are exhausted —
-// never a silently zero-filled T. Match it with errors.Is(err,
+// schema validation (or could not be decoded at all). A run returns it after
+// its correction budget is exhausted, and [Decode] returns it instead of a
+// silently zero-filled value. Match it with errors.Is(err,
 // ErrInvalidStructuredOutput); extract the per-field violations with
 // errors.As. The accompanying [RunResult] is still populated as far as the run
 // progressed.
@@ -62,101 +62,6 @@ func (e *InvalidStructuredOutputError) Unwrap() error { return e.Cause }
 // the failure with errors.Is without discarding the violation detail.
 func (e *InvalidStructuredOutputError) Is(target error) bool {
 	return target == ErrInvalidStructuredOutput
-}
-
-// WithMaxCorrectionTurns bounds how many correction turns [RunTyped] and
-// [RunSessionTyped] spend feeding validation errors back to the model before
-// returning [ErrInvalidStructuredOutput]. The default is 1; 0 disables
-// correction entirely (an invalid payload errors immediately). Each correction
-// is a full provider turn on the same session, so the worst case for one typed
-// call is 1 (initial) + budget (corrections) + 1 (forced fallback) turns.
-func WithMaxCorrectionTurns(n int) RunOption {
-	if n < 0 {
-		n = 0
-	}
-	return func(c *runConfig) { c.maxCorrectionTurns = &n }
-}
-
-// WithNativeStructuredOutput opts a typed run into provider-native,
-// schema-enforced output: when the run's provider implements
-// [StructuredOutputProvider] and reports support, the schema derived from T is
-// sent via [CallOptions.OutputSchema] and the hidden structured-output tool is
-// not injected. The response text is parsed and validated with the same
-// validator as the tool path; if a supported native provider returns an
-// unusable payload, the run asks the provider to correct it within the same
-// structured-output correction budget.
-//
-// Providers that do not implement the capability interface or report no
-// support use the hidden-tool path, so the option is safe to set
-// unconditionally.
-func WithNativeStructuredOutput() RunOption {
-	return func(c *runConfig) { c.nativeStructuredOutput = true }
-}
-
-// RunTyped runs the agent in a fresh [Session] and decodes its final answer into
-// T. It is the one-shot counterpart to [RunSessionTyped].
-func RunTyped[T any](ctx context.Context, a *Agent, task string, opts ...RunOption) (T, RunResult, error) {
-	return RunSessionTyped[T](ctx, a.NewSession(), task, opts...)
-}
-
-// RunSessionTyped continues session and decodes the agent's final structured
-// answer into T. It is a typed authoring adapter over the same structured-output
-// engine used by [AgentConfig.StructuredOutput]: the schema derived from T is
-// installed for this run, correction turns are handled by the loop, and the
-// accepted [RunResult.StructuredOutput] payload is decoded after the run
-// completes. If the agent definition already declares a structured-output
-// contract, that pinned declaration is used instead of injecting a second hidden
-// tool.
-func RunSessionTyped[T any](ctx context.Context, session *Session, task string, opts ...RunOption) (value T, result RunResult, runErr error) {
-	session.runMu.Lock()
-	defer session.runMu.Unlock()
-
-	var knobs runConfig
-	for _, opt := range opts {
-		if opt != nil {
-			opt(&knobs)
-		}
-	}
-	maxCorrections := 1
-	if knobs.maxCorrectionTurns != nil {
-		maxCorrections = *knobs.maxCorrectionTurns
-	}
-
-	cfg := session.agent.newRunConfig(opts)
-	if session.agent.structuredOutput == nil {
-		for _, tool := range session.agent.tools {
-			if tool.Definition().Name == structuredOutputToolName {
-				return value, RunResult{}, fmt.Errorf("typed run: %q is reserved for structured output; rename the tool", structuredOutputToolName)
-			}
-		}
-		contract, err := validateStructuredOutputDeclaration(&StructuredOutputConfig{
-			Schema:         typedRootSchema[T](),
-			Native:         knobs.nativeStructuredOutput,
-			MaxCorrections: maxCorrections,
-		})
-		if err != nil {
-			return value, RunResult{}, err
-		}
-		session.agent.installStructuredOutputContract(&cfg, contract)
-	}
-
-	scope, err := session.agent.beginRun(ctx, cfg, session.Messages(), session.commit, "typed")
-	if err != nil {
-		return value, scope.result, err
-	}
-	result, runErr = session.runPhase(scope, task, cfg)
-	result, runErr = scope.finish(result, runErr)
-	if runErr != nil {
-		return value, result, runErr
-	}
-	if len(result.StructuredOutput) == 0 {
-		return value, result, fmt.Errorf("model did not produce structured output")
-	}
-	decoded, derr := decodeAndValidate[T](result.StructuredOutput)
-	if derr != nil {
-		return value, result, derr
-	}
-	return decoded, result, nil
 }
 
 // StructuredOutputConfig declares a required validated final output for an
@@ -271,10 +176,7 @@ func (structuredOutputTool) Execute(context.Context, json.RawMessage) (ToolResul
 // either provider-native enforcement via CallOptions.OutputSchema, or the
 // hidden structured-output terminal tool.
 func (a *Agent) installStructuredOutput(cfg *runConfig) {
-	a.installStructuredOutputContract(cfg, a.structuredOutput)
-}
-
-func (a *Agent) installStructuredOutputContract(cfg *runConfig, declared *structuredOutputContract) {
+	declared := a.structuredOutput
 	if declared == nil {
 		return
 	}
@@ -332,35 +234,41 @@ func structuredMissingPrompt(toolName string) string {
 	return "Return the final answer as structured data: a single JSON object matching the required schema, as your entire final message."
 }
 
-// typedRootSchema returns the JSON schema (the same object buildSchema
-// advertises as the tool's parameters) used as the root schema for
-// provider-native structured output.
-func typedRootSchema[T any]() json.RawMessage {
-	var zero T
-	raw, _ := json.Marshal(objectSchema(reflect.TypeOf(zero), map[reflect.Type]bool{}))
+// OutputSchema returns the JSON schema derived from T, for
+// [StructuredOutputConfig].Schema. T must be a struct: its exported fields
+// become properties, fields without omitempty are required, and a desc tag
+// becomes the property description, exactly as for [Func] arguments.
+//
+//	agent, err := core.New(provider, core.AgentConfig{
+//		StructuredOutput: &core.StructuredOutputConfig{
+//			Schema:         core.OutputSchema[Verdict](),
+//			MaxCorrections: 1,
+//		},
+//	})
+func OutputSchema[T any]() json.RawMessage {
+	raw, _ := json.Marshal(objectSchema(reflect.TypeFor[T](), map[reflect.Type]bool{}))
 	return raw
 }
 
-// decodeNativePayload parses the final message text of a native structured
-// output response: the whole trimmed text first (a schema-enforced response is
-// normally bare JSON), then the prose extraction candidates. Every candidate
-// passes through the same validated decode as tool payloads.
-func decodeNativePayload[T any](text string) (T, error) {
-	trimmed := strings.TrimSpace(text)
-	if trimmed == "" {
-		return *new(T), fmt.Errorf("empty structured output payload")
+// Decode returns a run's accepted structured output as T. The payload is
+// validated against the schema implied by T before it is decoded, so a
+// missing required field or a mistyped value returns an
+// [InvalidStructuredOutputError] rather than a zero-filled T. A run without
+// structured output, including one that failed before accepting a payload,
+// returns an error matching [ErrInvalidStructuredOutput].
+//
+// Decode works on any [RunResult]: the one returned by [Runtime.Run] or
+// [RunHandle.Await], or RunSnapshot.Result of a child run.
+func Decode[T any](result RunResult) (T, error) {
+	if len(result.StructuredOutput) == 0 {
+		var zero T
+		return zero, &InvalidStructuredOutputError{Cause: errors.New("run has no structured output")}
 	}
-	candidates := []json.RawMessage{json.RawMessage(trimmed)}
-	candidates = append(candidates, extractJSONCandidates(trimmed)...)
-	var lastErr error
-	for _, cand := range candidates {
-		val, verr := decodeAndValidate[T](cand)
-		if verr == nil {
-			return val, nil
-		}
-		lastErr = verr
+	value, err := decodeAndValidate[T](result.StructuredOutput)
+	if err != nil {
+		return value, err
 	}
-	return *new(T), lastErr
+	return value, nil
 }
 
 // decodeAndValidate decodes raw into T and validates it against the schema

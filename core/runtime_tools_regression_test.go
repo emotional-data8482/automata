@@ -22,12 +22,12 @@ func TestRuntimeToolTimeoutRetainsAuthoritativeEffect(t *testing.T) {
 				result.Effect = report
 				return result, ctx.Err()
 			}, ToolEffectPolicy{Kind: ToolEffectMutating}))
-			if err := runtime.Register("agent", "v1", agent); err != nil {
+			if _, err := runtime.Register("agent", "v1", agent); err != nil {
 				t.Fatal(err)
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
-			result, runErr := runtime.Run(ctx, "agent", "v1", "work", SubmitOptions{})
+			result, runErr := runtime.Run(ctx, DefinitionRef{ID: "agent", Revision: "v1"}, "work")
 			snapshot, err := runtime.Handle(result.RunID).Snapshot(ctx)
 			if err != nil {
 				t.Fatal(err)
@@ -63,12 +63,12 @@ func TestRuntimeCancelDuringUncertainToolRemainsTerminal(t *testing.T) {
 		<-ctx.Done()
 		return ToolResult{Effect: EffectReport{Status: EffectUnknown}}, ctx.Err()
 	}, ToolEffectPolicy{Kind: ToolEffectMutating}))
-	if err := runtime.Register("agent", "v1", agent); err != nil {
+	if _, err := runtime.Register("agent", "v1", agent); err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	handle, err := runtime.Submit(ctx, "agent", "v1", "work", SubmitOptions{})
+	handle, err := runtime.Submit(ctx, DefinitionRef{ID: "agent", Revision: "v1"}, "work")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -140,12 +140,12 @@ func TestRuntimeRecoveryRetainsFatalBatchOutcome(t *testing.T) {
 			agent.RegisterTool(effectTool("write", &executions, func(context.Context) (ToolResult, error) {
 				return ToolResult{Effect: EffectReport{Status: EffectApplied, Receipt: "write-1"}}, errors.New("fatal write error")
 			}, ToolEffectPolicy{Kind: ToolEffectMutating}))
-			if err := runtime.Register("agent", "v1", agent); err != nil {
+			if _, err := runtime.Register("agent", "v1", agent); err != nil {
 				t.Fatal(err)
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
-			result, err := runtime.Run(ctx, "agent", "v1", "work", SubmitOptions{})
+			result, err := runtime.Run(ctx, DefinitionRef{ID: "agent", Revision: "v1"}, "work")
 			if err == nil {
 				t.Fatal("injected persistence failure was invisible")
 			}
@@ -161,7 +161,7 @@ func TestRuntimeRecoveryRetainsFatalBatchOutcome(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer recovered.Close()
-			if err := recovered.Register("agent", "v1", agent); err != nil {
+			if _, err := recovered.Register("agent", "v1", agent); err != nil {
 				t.Fatal(err)
 			}
 			if err := recovered.Recover(ctx); err != nil {

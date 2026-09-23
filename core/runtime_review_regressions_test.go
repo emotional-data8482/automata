@@ -31,10 +31,10 @@ func TestRuntimeOversizedBatchIsNotRerunByRecovery(t *testing.T) {
 		calls.Add(1)
 		return strings.Repeat("y", 2500), nil
 	}))
-	if err := runtime.Register("agent", "v1", agent); err != nil {
+	if _, err := runtime.Register("agent", "v1", agent); err != nil {
 		t.Fatal(err)
 	}
-	result, err := runtime.Run(context.Background(), "agent", "v1", "go", SubmitOptions{})
+	result, err := runtime.Run(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "go")
 	t.Logf("first run: err=%v", err)
 	if !errors.Is(err, ErrRunNeedsAttention) {
 		t.Fatalf("want attention, got %v", err)
@@ -120,13 +120,13 @@ func TestRuntimeOversizedChildProjectionNeedsAttentionWithoutStrandingRecovery(t
 		asstText("parent done"),
 	}})
 	newSharedChildDefinition(parent)
-	if err := runtime.Register("child", "v1", testAgent(&scriptedProvider{turns: []Message{asstText(strings.Repeat("z", 3700))}})); err != nil {
+	if _, err := runtime.Register("child", "v1", testAgent(&scriptedProvider{turns: []Message{asstText(strings.Repeat("z", 3700))}})); err != nil {
 		t.Fatal(err)
 	}
-	if err := runtime.Register("parent", "v1", parent); err != nil {
+	if _, err := runtime.Register("parent", "v1", parent); err != nil {
 		t.Fatal(err)
 	}
-	handle, err := runtime.Submit(context.Background(), "parent", "v1", "go", SubmitOptions{})
+	handle, err := runtime.Submit(context.Background(), DefinitionRef{ID: "parent", Revision: "v1"}, "go")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -185,13 +185,13 @@ func TestRuntimeDriverDoesNotSpinOnChildAttentionWithExpiredWait(t *testing.T) {
 	defer runtime.Close()
 	parent := testAgent(&scriptedProvider{turns: []Message{asstTool("c1", "delegate", `{"topic":"tea"}`), asstText("parent done")}})
 	newSharedChildDefinition(parent)
-	if err := runtime.Register("child", "v1", testAgent(&repeatingChildProvider{})); err != nil {
+	if _, err := runtime.Register("child", "v1", testAgent(&repeatingChildProvider{})); err != nil {
 		t.Fatal(err)
 	}
-	if err := runtime.Register("parent", "v1", parent); err != nil {
+	if _, err := runtime.Register("parent", "v1", parent); err != nil {
 		t.Fatal(err)
 	}
-	childResult, err := runtime.Run(context.Background(), "child", "v1", "seed", SubmitOptions{})
+	childResult, err := runtime.Run(context.Background(), DefinitionRef{ID: "child", Revision: "v1"}, "seed")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -271,7 +271,7 @@ func TestRuntimeRecoveryBeforeRegistrationResumesAfterIt(t *testing.T) {
 	provider := &countingTextProvider{}
 	agent := testAgent(provider)
 	agent.RegisterTool(Func("extra", "ordinary work", func(context.Context, struct{}) (string, error) { return "ok", nil }))
-	if err := runtime.Register("agent", "v1", agent); err != nil {
+	if _, err := runtime.Register("agent", "v1", agent); err != nil {
 		t.Fatal(err)
 	}
 	if err := runtime.Recover(context.Background()); err != nil {
@@ -372,14 +372,14 @@ func TestRuntimePruneSkipsDamagedRunAndContinues(t *testing.T) {
 			defer runtime.Close()
 			agent := testAgent(&scriptedProvider{turns: []Message{asstTool("e1", "extra", `{}`), asstText("done"), asstText("second")}})
 			agent.RegisterTool(Func("extra", "ordinary work", func(context.Context, struct{}) (string, error) { return "original", nil }))
-			if err := runtime.Register("agent", "v1", agent); err != nil {
+			if _, err := runtime.Register("agent", "v1", agent); err != nil {
 				t.Fatal(err)
 			}
-			damaged, err := runtime.Run(context.Background(), "agent", "v1", "one", SubmitOptions{})
+			damaged, err := runtime.Run(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "one")
 			if err != nil {
 				t.Fatal(err)
 			}
-			healthy, err := runtime.Run(context.Background(), "agent", "v1", "two", SubmitOptions{})
+			healthy, err := runtime.Run(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "two")
 			if err != nil {
 				t.Fatal(err)
 			}

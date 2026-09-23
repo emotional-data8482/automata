@@ -30,7 +30,7 @@ func (t *countingTool) Execute(context.Context, json.RawMessage) (ToolResult, er
 
 // TestToolExecuteNotRetriedByLoop is the regression test for the double-retry
 // bug: even when a tool returns a retryable error, the loop must call Execute
-// exactly once. Retrying there would replay a whole sub-agent run, re-emitting
+// exactly once. Retrying there would replay a whole child run, re-emitting
 // its stream events and double-counting usage. The error is still fed back to
 // the model as a recoverable tool result.
 func TestToolExecuteNotRetriedByLoop(t *testing.T) {
@@ -44,9 +44,9 @@ func TestToolExecuteNotRetriedByLoop(t *testing.T) {
 	agent := testAgent(provider)
 	agent.RegisterTool(tool)
 
-	out, err := agent.Run(context.Background(), "go")
-	var toolErr *retryableToolErr
-	if !errors.As(err, &toolErr) || provider.calls != 1 || len(transcriptToolResults(out.Messages)) != 1 {
+	out, err := runAgent(t, agent, "go")
+	// A tool's Go error is fatal; only its message survives persistence.
+	if err == nil || err.Error() != "transient" || provider.calls != 1 || len(transcriptToolResults(out.Messages)) != 1 {
 		t.Fatalf("result=%+v err=%v", out, err)
 	}
 	if got := tool.calls.Load(); got != 1 {
@@ -71,7 +71,7 @@ func TestUnknownToolIsRecoverable(t *testing.T) {
 	}))
 
 	var ghostEvent *StreamEvent
-	out, err := agent.RunStream(context.Background(), "go", func(ev StreamEvent) {
+	out, err := runAgentStream(t, agent, "go", func(ev StreamEvent) {
 		if ev.Kind == StreamToolResult && ev.ToolCall.ID == "g1" {
 			e := ev
 			ghostEvent = &e
@@ -126,11 +126,10 @@ func TestUnknownToolIsRecoverable(t *testing.T) {
 // synthetic canceled result. Transcript order follows model order rather than
 // completion order.
 func TestParallelToolBatchRecordsEveryOutcome(t *testing.T) {
-	approvalErr := errors.New("approval exploded")
+	fatalErr := errors.New("tool exploded")
 	done := make(chan struct{})
 	recovered := make(chan struct{})
 	blockedStarted := make(chan struct{})
-	var fatalExecuted atomic.Bool
 
 	provider := &capturingProvider{turns: []Message{
 		AssistantMessage(
@@ -140,25 +139,19 @@ func TestParallelToolBatchRecordsEveryOutcome(t *testing.T) {
 			toolUse("r1", "recover", `{}`),
 		),
 	}}
-	agent := testAgent(provider).WithApprover(ApproverFunc(func(_ context.Context, call ToolUseBlock, _ []Message) (Decision, error) {
-		if call.ID != "f1" {
-			return Decision{Outcome: Allow}, nil
-		}
-		// Do not fail the batch until the other three calls have reached known
-		// states: two completed and one is blocked awaiting cancellation.
-		<-done
-		<-recovered
-		<-blockedStarted
-		return Decision{}, approvalErr
-	}))
+	agent := testAgent(provider)
 	agent.RegisterTool(Func("blocked", "waits for cancellation", func(ctx context.Context, _ struct{}) (string, error) {
 		close(blockedStarted)
 		<-ctx.Done()
 		return "", ctx.Err()
 	}))
-	agent.RegisterTool(Func("fatal", "approval fails", func(_ context.Context, _ struct{}) (string, error) {
-		fatalExecuted.Store(true)
-		return "", errors.New("fatal tool should not execute")
+	agent.RegisterTool(FuncResult("fatal", "fails the run", func(_ context.Context, _ struct{}) (ToolResult, error) {
+		// Do not fail the batch until the other three calls have reached known
+		// states: two completed and one is blocked awaiting cancellation.
+		<-done
+		<-recovered
+		<-blockedStarted
+		return ToolResult{}, fatalErr
 	}))
 	agent.RegisterTool(Func("done", "completes normally", func(_ context.Context, _ struct{}) (string, error) {
 		close(done)
@@ -169,12 +162,9 @@ func TestParallelToolBatchRecordsEveryOutcome(t *testing.T) {
 		return ErrorResult("recoverable failure"), nil
 	}))
 
-	res, err := agent.Run(context.Background(), "go")
-	if !errors.Is(err, approvalErr) {
-		t.Fatalf("err = %v, want approval error", err)
-	}
-	if fatalExecuted.Load() {
-		t.Error("fatal tool executed despite approver failure")
+	res, err := runAgent(t, agent, "go")
+	if err == nil || !strings.Contains(err.Error(), fatalErr.Error()) {
+		t.Fatalf("err = %v, want the tool's fatal error", err)
 	}
 
 	results := transcriptToolResults(res.Messages)

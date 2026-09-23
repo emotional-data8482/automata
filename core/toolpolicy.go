@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"maps"
-	"sync"
 	"time"
 )
 
@@ -50,12 +49,13 @@ type ToolLimits struct {
 // The zero value preserves the historical behavior: no deadline or call
 // budget, no rate limiting, and one goroutine per call in a parallel batch.
 //
-// A policy belongs to an Agent by default and may be replaced for one run with
-// the [WithToolPolicy] RunOption. PerTool entries add a named-tool call budget
-// and may override Timeout and RateLimiter.
+// A policy belongs to an Agent definition. Its call caps are pinned on each
+// run at admission and shared with child runs as persisted subtree caps.
+// PerTool entries add a named-tool call budget and may override Timeout and
+// RateLimiter.
 type ToolPolicy struct {
-	// Timeout is the default deadline for each approved tool execution. It
-	// includes a configured rate-limiter wait but not approval time.
+	// Timeout is the default deadline for each tool execution. It includes a
+	// configured rate-limiter wait but not time suspended on a durable wait.
 	Timeout time.Duration
 	// MaxCalls caps known tool requests in one run. Reservations happen in model
 	// order before approval so batch overflow is deterministic. Unknown and
@@ -117,30 +117,13 @@ func (p ToolPolicy) limitsFor(name string) ToolLimits {
 	return limits
 }
 
-// A budget counter is guarded by the root scope's mutex. Descendant runs add
-// local counters to the inherited slice while retaining that mutex, making a
-// reservation across every ancestor/local hard cap atomic.
+// toolBudgetCounter is one persisted cap read into a reservation check. The
+// store transaction that charges it makes the check and charge atomic across
+// the run's own caps and every capped ancestor.
 type toolBudgetCounter struct {
 	max  int
 	used int
 	tool string
-}
-
-type toolBudgetScope struct {
-	mu     *sync.Mutex
-	totals []*toolBudgetCounter
-	// durable, when set, charges one call against the persisted subtree caps
-	// of the enclosing Runtime run and its ancestors. Process-local runs
-	// nested inside that run's tools inherit it with the scope.
-	durable func() (toolBudgetUsage, error)
-}
-
-type toolBudgetContextKey struct{}
-
-type toolPolicyState struct {
-	policy  ToolPolicy
-	scope   toolBudgetScope
-	perTool map[string]*toolBudgetCounter
 }
 
 type toolBudgetUsage struct {
@@ -180,92 +163,6 @@ func pinnedToolCaps(policy ToolPolicy) storedToolBudget {
 		}
 	}
 	return caps
-}
-
-// withDurableBudget makes the persisted records the only total budget of a
-// Runtime run's scope. The run's own calls reserve through its durable batch;
-// nested process-local runs started by its tools charge the same records via
-// charge. It returns ctx carrying the replaced scope.
-func (s *toolPolicyState) withDurableBudget(ctx context.Context, charge func() (toolBudgetUsage, error)) context.Context {
-	s.scope.totals = nil
-	s.scope.durable = charge
-	return context.WithValue(ctx, toolBudgetContextKey{}, s.scope)
-}
-
-func newToolPolicyState(ctx context.Context, policy ToolPolicy) (context.Context, *toolPolicyState, error) {
-	policy = policy.clone()
-	if err := policy.validate(); err != nil {
-		return ctx, nil, err
-	}
-
-	inherited, _ := ctx.Value(toolBudgetContextKey{}).(toolBudgetScope)
-	if inherited.mu == nil {
-		inherited.mu = &sync.Mutex{}
-	}
-	state := &toolPolicyState{
-		policy: policy,
-		scope: toolBudgetScope{
-			mu:      inherited.mu,
-			totals:  append([]*toolBudgetCounter(nil), inherited.totals...),
-			durable: inherited.durable,
-		},
-		perTool: make(map[string]*toolBudgetCounter),
-	}
-	if policy.MaxCalls > 0 {
-		state.scope.totals = append(state.scope.totals, &toolBudgetCounter{max: policy.MaxCalls})
-	}
-	for name, limits := range policy.PerTool {
-		if limits.MaxCalls > 0 {
-			state.perTool[name] = &toolBudgetCounter{max: limits.MaxCalls, tool: name}
-		}
-	}
-
-	// Only total call budgets are inherited. A parent's per-tool budget applies
-	// to calls on that parent, not coincidentally same-named tools in a child.
-	ctx = context.WithValue(ctx, toolBudgetContextKey{}, state.scope)
-	return ctx, state, nil
-}
-
-// reserve atomically consumes all inherited/local total budgets plus the local
-// named-tool budget. The caller invokes it serially in model order for one
-// batch; the shared lock makes concurrent nested-agent batches safe as well.
-func (s *toolPolicyState) reserve(tool string) (toolBudgetUsage, error) {
-	perTool := s.perTool[tool]
-	if len(s.scope.totals) == 0 && perTool == nil && s.scope.durable == nil {
-		return toolBudgetUsage{}, nil
-	}
-
-	s.scope.mu.Lock()
-	defer s.scope.mu.Unlock()
-
-	counters := s.scope.totals
-	if perTool != nil {
-		counters = append(append([]*toolBudgetCounter(nil), counters...), perTool)
-	}
-	var usage toolBudgetUsage
-	if s.scope.durable != nil {
-		// Check the local counters first so a local denial charges nothing
-		// durably; the durable charge itself is atomic in its transaction.
-		if denied, err := checkBudgetCounters(counters); err != nil {
-			return denied, err
-		}
-		var err error
-		if usage, err = s.scope.durable(); err != nil {
-			return usage, err
-		}
-	}
-	if denied, err := chargeBudgetCounters(counters); err != nil {
-		return denied, err
-	}
-
-	if n := len(s.scope.totals); n > 0 {
-		nearest := s.scope.totals[n-1]
-		usage.used, usage.max = nearest.used, nearest.max
-	}
-	if perTool != nil {
-		usage.toolUsed, usage.toolMax = perTool.used, perTool.max
-	}
-	return usage, nil
 }
 
 // chargeBudgetCounters checks every counter, then increments all of them. A

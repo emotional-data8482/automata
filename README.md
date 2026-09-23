@@ -1,39 +1,41 @@
 # automata
 
-Composable agent primitives in Go, built for traceability and developer
-ergonomics in multi-agent systems — the kind of reliability you need when
-agents run inside a web server, not a notebook.
+Durable, provider-neutral agent execution in Go: an agent's run is admitted
+before it starts, every step is committed as it happens, and a restarted
+process continues the same run without repeating work that already happened.
+It is built for agents inside web servers and job workers, not notebooks.
 
-- **Primitives, not a platform.** `core` is a small set of orthogonal pieces —
-  `Agent`, `Tool`, `Provider`, stream events — that compose into orchestrators,
-  sub-agents, and pipelines. No magic, no hidden state.
+- **One lifecycle.** An `Agent` is an immutable definition. A `Runtime` runs
+  it, either on a persistent store (`extensions/sqlite`) or explicitly in
+  memory. Sync calls, live streams, typed output, child agents,
+  conversations, and approvals are all views of that one durable run.
+- **Honest about side effects.** A tool call that was dispatched but never
+  reported an outcome is surfaced as *uncertain*, and a provider request
+  whose response was lost needs attention. Neither is replayed silently.
+  You reconcile from the destination, and the run continues.
 - **A block-based message model that never degrades a provider.** A `Message`
-  is a list of typed `Block`s — text, thinking (with its signature), tool_use,
-  tool_result (with an error flag), images — a superset of what any single
-  provider exposes. Claude's thinking blocks round-trip through tool loops
-  instead of being dropped; native `is_error` survives; nothing is flattened to
-  a lowest common denominator. `RawBlock` carries provider-specific blocks so a
-  new provider feature never blocks on a core release.
-- **Traceable by construction.** Every run emits structured `slog` logs and
-  `tracing` spans; every streaming run emits a documented, tested event
-  contract (see [docs/streaming.md](docs/streaming.md)) you can fold into a
-  UI, an SSE endpoint, or a log with `core.StreamAccumulator`.
-- **Dependency-light core.** The root module depends only on
-  `golang.org/x/sync`. Vendor SDKs and API keys live in isolated
-  `extensions/*` modules.
+  is typed `Block`s: text, thinking with its signature, tool_use,
+  tool_result with an error flag, and images. `RawBlock` carries
+  provider-native content that must round-trip.
+- **Observable.** Live streams deliver provisional deltas for UIs. Committed
+  events are durable facts that an observer reads from a cursor and resumes
+  after a disconnect or restart. Runs emit `slog` logs and `tracing` spans.
+- **Dependency-free core.** The root module has no requirements. Vendor
+  SDKs and database drivers live in separate `extensions/*` modules.
 
 ## Layout
 
 | Module / package | What it is |
 | --- | --- |
-| `core` | Agent, Runtime, Session, Tool, Provider, streaming, hooks, approval |
+| `core` | `Agent` definitions, `Runtime`, tools, child agents, conversations, approvals, streaming, and the storage port |
+| `core/storetest` | Conformance suite for `core.Store` adapters |
 | `tools` (module) | First-party tools: `HTTPFetch`, `ReadFile`/`WriteFile` (sandboxed), `Shell` (allow-listed), `WebSearch` |
-| `extensions/claude` (module) | Anthropic provider (`core.StreamProvider`); thinking, images, prompt caching |
+| `extensions/sqlite` (module) | The supported persistent store: one exclusive local owner, WAL, `synchronous=FULL` |
+| `extensions/claude` (module) | Anthropic provider; thinking, images, prompt caching, native structured output |
 | `extensions/openai` (module) | OpenAI Chat Completions provider (stdlib-only); any OpenAI-compatible base URL |
 | `extensions/tavily` (module) | Tavily backend for `tools.WebSearch` |
-| `extensions/sqlite` (module) | Optional persistent local store for `core.Runtime`; exclusive single-process ownership |
 | `retry`, `tracing` | Backoff policy and span interfaces used by core |
-| `examples/*` (modules) | Runnable demos, including a multi-agent deep-research TUI |
+| `examples/*` (modules) | Runnable demos (see [Examples](#examples)) |
 
 Extensions and examples are separate Go modules tied together by `go.work`,
 so importing `core` never pulls a vendor SDK into your build.
@@ -54,378 +56,497 @@ workspace, commits, tags root + all published modules, and pushes. Because
 tag is on the remote, the script then refreshes the submodules' `go.sum` files
 in a small follow-up commit and verifies each module still builds against the
 published pins (`GOWORK=off`). Run it without `--push` to stop after tagging
-for review. Note the deliberate module conventions: published modules
-(`tools`, `extensions/*`) carry no `replace` directives — in-repo development
-resolves through `go.work`, and `replace` in a dependency is ignored
-downstream, so they must require real tagged versions — while `examples/*`
+for review. Published modules must require real tagged versions and carry
+no `replace` directives when tagged: a dependency's `replace` is ignored
+downstream. In-repo development uses `go.work`; the unreleased
+`extensions/sqlite` module temporarily replaces core with the local source,
+and the release script drops that replacement before tagging. `examples/*`
 keep `replace` directives as dev conveniences and are never tagged.
 
 ## Quickstart
 
-For restartable execution, use the explicit durable lifecycle described in
-[docs/durable-runtime.md](docs/durable-runtime.md). Construct a
-`core.Runtime` with `extensions/sqlite`, register an immutable `Agent` revision,
-then submit and await a `RunHandle`. Use `core.NewEphemeralRuntime` only when
-loss on process exit is intentional. Storage failure never falls back to
-memory. Durable child runs (`core.DurableChildTool`) and serialized
-conversation turns (`SubmitOptions.Conversation`) use the same lifecycle.
-
-The direct `Agent.Run`, session, and typed helpers shown below are currently
-process-local APIs; they are not persistent Runtime entry points. They are not
-protected as legacy surfaces and will be replaced or routed through Runtime as
-their durable equivalents land.
+Define an agent, register it with a runtime, and run a task. `provider` is
+any `core.Provider`, for example `claude.New(model, apiKey)` from
+`extensions/claude`.
 
 ```go
-package main
-
-import (
- "context"
- "fmt"
- "os"
-
- "github.com/emotional-data8482/automata/core"
- "github.com/emotional-data8482/automata/extensions/claude"
- "github.com/emotional-data8482/automata/tools"
-)
-
-type weatherArgs struct {
- City string `json:"city" desc:"city to look up"`
+// ExampleRuntime in core/example_test.go
+runtime, err := core.NewEphemeralRuntime()
+if err != nil {
+	panic(err)
 }
+defer runtime.Close()
 
-func main() {
- agent := core.New(claude.New("claude-sonnet-4-6", os.Getenv("ANTHROPIC_API_KEY"))).
-  WithSystemPrompt("You are a concise assistant.")
-
- // A typed tool: the JSON schema is derived from the struct fields.
- agent.RegisterTool(core.Func("weather", "Get the weather for a city",
-  func(ctx context.Context, a weatherArgs) (string, error) {
-   return "sunny in " + a.City, nil
-  }))
-
- // A first-party tool: fetch a page as readable text.
- agent.RegisterTool(tools.HTTPFetch())
-
- res, err := agent.Run(context.Background(), "What's the weather in Paris?")
- if err != nil {
-  panic(err)
- }
- fmt.Println(res.Output)
- fmt.Printf("(%d steps, %d output tokens)\n", res.Steps, res.Usage.OutputTokens)
-}
-```
-
-`Run` returns a `RunResult` — the final `Output` text, the full `FinalMessage`
-(blocks included), the run's `Messages` transcript, summed `Usage`, `Steps`, and
-a `StopReason`. It is populated as far as the run got even when `err` is
-non-nil, so a run that exhausts its step budget still hands back its partial
-transcript and usage. Per-call provider options (temperature, max tokens, stop
-sequences, tool choice, thinking budget) are set with
-`agent.WithDefaultCallOptions(...)` or per run with
-`agent.Run(ctx, task, core.WithCallOptions(...))`.
-
-## Bounded tool execution
-
-Use `ToolPolicy` to enforce deadlines, call budgets, rate limits, and bounded
-parallelism outside model prompts:
-
-```go
-agent.WithToolPolicy(core.ToolPolicy{
- Timeout:     10 * time.Second,
- MaxCalls:    50,
- MaxParallel: 4,
- PerTool: map[string]core.ToolLimits{
-  "http_fetch": {Timeout: 3 * time.Second, MaxCalls: 10, RateLimiter: limiter},
- },
+agent, err := core.New(provider, core.AgentConfig{
+	SystemPrompt: "You are a concise assistant.",
+	MaxTurns:     5,
+	Tools: []core.Tool{core.Func("weather", "Get the weather for a city",
+		func(ctx context.Context, in WeatherArgs) (string, error) {
+			return "sunny in " + in.City, nil
+		})},
 })
-
-// A per-run policy replaces the agent default.
-res, err := agent.Run(ctx, task,
- core.WithToolPolicy(core.ToolPolicy{MaxCalls: 10, MaxParallel: 2}))
-```
-
-Policy-created tool timeouts are recoverable error results; cancellation of the
-parent run remains fatal. Call budgets reserve known requests in model order
-before approval, overflow calls receive explicit transcript results, and total
-budgets are shared atomically through nested `AsTool` runs (durable children
-share them as persisted subtree caps instead). Tools and limiters
-must honor context cancellation—Go cannot forcibly stop a function that ignores
-its context. The zero policy preserves existing behavior.
-
-Call reservations happen before `Approver`; approved calls then apply timeout,
-rate-limit wait, and execution (including any internal `WithToolRetry` attempts).
-A child may add stricter local limits, while timeouts/rate limiters/parallelism
-otherwise remain agent-local. See the
-[tool-execution project notes](planning/archive/tool-execution-safety/README.md)
-for the complete accounting and composition decisions.
-
-## Sessions and transcripts
-
-`Agent.Run` is one-shot. For multi-turn conversations — and for the audit
-trail — use a `Session`: every run continues the same conversation, and the
-full transcript (system prompt, tasks, replies, tool calls and results) is
-plain data you can persist and resume. The transcript is recorded even when a
-run fails, so you can always see what happened.
-
-```go
-sess := agent.NewSession()
-draft, _ := sess.Run(ctx, "Draft a refund policy for our SaaS")
-final, _ := sess.Run(ctx, "Make it friendlier and add a 30-day clause")
-fmt.Println(final.Output) // each Run returns a RunResult
-
-// Persist anywhere; resume later, even in another process. Every block type —
-// text, thinking (with signature), tool calls and results, images — round-trips
-// through JSON, so the resumed conversation is byte-for-byte the same.
-blob, _ := json.Marshal(sess.Messages())
-var transcript []core.Message
-_ = json.Unmarshal(blob, &transcript)
-sess = agent.ResumeSession(transcript)
-_ = draft
-```
-
-For durable execution, use `Runtime`. The old callback-based checkpoint hook
-was removed because callback success is not proof of durable commit. Runtime
-instead supports named, timeout-bounded `CommittedRunHook`s that run after the
-execution result commits; their outcomes are persisted in `RunSnapshot` and do
-not rewrite the execution result. `Session` remains a process-local
-conversation API. For durable, serialized turns that survive restarts, submit
-Runtime runs with `SubmitOptions.Conversation`; see
-[Conversations](docs/durable-runtime.md#conversations).
-
-## Typed results
-
-`core.RunTyped[T]` returns the agent's final answer decoded into a Go struct.
-The typed helpers use the same structured-output engine as
-`AgentConfig.StructuredOutput`: the accepted payload is validated, stored on
-`RunResult.StructuredOutput`, and then decoded into `T`. For an agent without a
-declared output contract, the helper derives a JSON schema from `T` and uses the
-hidden `automata_structured_output` tool; if the model answers in prose, core
-first tries to parse an embedded payload and only forces the tool on one more
-turn as a last resort. The agent's regular tools still work alongside it.
-
-```go
-type Person struct {
- Name string `json:"name"`
- Age  int    `json:"age" desc:"age in years"`
+if err != nil {
+	panic(err)
+}
+assistant, err := runtime.Register("assistant", "v1", agent)
+if err != nil {
+	panic(err)
 }
 
-p, res, err := core.RunTyped[Person](ctx, agent, "Who is Ada Lovelace?")
-// p.Name == "Ada Lovelace"; res carries usage/steps/transcript.
+ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+defer cancel()
+result, err := runtime.Run(ctx, assistant, "What's the weather in Paris?")
+if err != nil {
+	// result still holds the transcript, usage, and turns so far.
+	panic(fmt.Sprintf("failed after %d turns: %v", result.Turns, err))
+}
+fmt.Println(result.Output)
+fmt.Println(result.Turns, "turns")
 ```
 
-If the agent already declares `AgentConfig.StructuredOutput`, typed helpers
-reuse that pinned schema instead of injecting another terminal tool; choose a Go
-result type compatible with the declaration. Use `RunSessionTyped` to keep a
-process-local conversation across typed decisions:
+`Run` returns a `RunResult` with the final `Output` text, the `FinalMessage`
+(blocks included), the run's `Messages` transcript, summed `Usage`, `Turns`,
+and a `StopReason`. It is populated as far as the run got even when `err` is
+non-nil. `NewEphemeralRuntime` keeps runs in memory, which suits tests,
+scripts, and short-lived work. Use a persistent store when a run must survive
+the process.
+
+## Durable execution
 
 ```go
-sess := agent.NewSession()
-first, _, err := core.RunSessionTyped[Person](ctx, sess, "Choose the first action")
+// ExampleNewRuntime in core/example_test.go
+// In production: store, err := sqlite.Open(ctx, "automata.db")
+store := core.NewMemoryStore()
+runtime, err := core.NewRuntime(ctx, core.RuntimeConfig{Store: store})
+if err != nil {
+	panic(err)
+}
+defer runtime.Close()
 
-blob, _ := json.Marshal(sess.Messages())
-var transcript []core.Message
-_ = json.Unmarshal(blob, &transcript)
-sess = agent.ResumeSession(transcript)
-
-next, res, err := core.RunSessionTyped[Person](ctx, sess, "Choose the next action")
-_, _, _, _ = first, next, res, err
-```
-
-### Validation guarantee
-
-The returned value is validated against the same schema the model was shown
-before it is returned: required fields (exported fields without `omitempty`)
-are present, types match (`int` fields get integral numbers, and so on), and
-nested structs, slices, and string-keyed maps are checked recursively. Unknown
-JSON fields are ignored, matching `json.Unmarshal`. A payload that fails
-validation is never returned as a zero-filled `T` — this is a deliberate
-behavior change: models that previously "succeeded" while omitting fields now
-produce a typed error after correction.
-
-When validation fails, the violations are fed back to the model as a new user
-turn on the same session and it is asked to call the tool again. The default
-budget is one correction turn; `core.WithMaxCorrectionTurns(n)` changes it (0
-disables correction). When attempts are exhausted — or the final forced turn
-still produces an invalid payload — the run returns an error matching
-`core.ErrInvalidStructuredOutput` via `errors.Is`, with the per-field
-violations available via `errors.As(*core.InvalidStructuredOutputError)`. The
-`RunResult` is still populated as far as the run got.
-
-Raw declared schemas, typed helper schemas, tool input schemas, and native
-output schemas share one supported contract. Core enforces object properties,
-required fields, arrays, enum, nullable single-type unions, and selected string
-and numeric bounds; unsupported assertion keywords such as `$ref`, `oneOf`, and
-`const` are rejected instead of ignored. Provider-facing annotations and native
-metadata such as `title`, `description`, `format`, and OpenAI `strict` are
-preserved for adapters while core enforces its documented subset.
-
-The full sequence per typed call is bounded: 1 (initial) + correction budget +
-1 (forced fallback) provider turns at worst. Prose answers that already
-contain valid JSON (a fenced ```json block or a bare object) are parsed and
-validated with no extra provider turn. Each phase commits its canonical
-transcript to the owning process-local Session. For durable correction and
-effect preservation, declare the output contract on the Agent and run it through
-`Runtime`; direct typed helpers remain process-local transitional APIs.
-
-### Provider-native structured output
-
-By default the hidden tool is the provider-neutral mechanism. Pass
-`core.WithNativeStructuredOutput()` or set `StructuredOutput.Native` to opt into
-provider-native schema enforcement when the provider supports it — the OpenAI
-Chat Completions extension maps the schema onto `response_format: json_schema`
-(strict variant when the schema has no free-form objects), and the Claude
-extension maps it onto `output_config.format`. Providers without native support
-silently use the hidden-tool path, so the option is safe to set
-unconditionally. Native responses are parsed from the reply text and validated
-by the same validator; an unusable native payload corrects within the run's
-bounded correction budget.
-
-### Tool name
-
-The hidden tool is named `automata_structured_output` (namespaced so a user
-tool called `structured_output` cannot collide with it). Registering a tool
-with that exact name makes typed runs fail fast with an explicit error. The
-name appears in persisted transcripts (as plain history — resumed sessions are
-unaffected by the 0.3-era rename from `structured_output`).
-
-## Rich tool results
-
-Tools can return block-based content — mixed text and images — instead of only
-a string. `core.FuncResult[P]` is `core.Func` for rich outputs: the same typed
-schema generation, but the handler returns a `core.ToolResult`, which the run
-loop records as block-based `ToolResultBlock` content in the transcript:
-
-```go
-type shotArgs struct {
-    Target string `json:"target" desc:"what to capture"`
+// Register every definition stored runs may pin, then adopt their work.
+summarizer, err := runtime.Register("summarizer", "2026-09-23", agent)
+if err != nil {
+	panic(err)
+}
+if err := runtime.Recover(ctx); err != nil {
+	panic(err)
 }
 
-agent.RegisterTool(core.FuncResult("screenshot", "Capture an image",
-    func(ctx context.Context, a shotArgs) (core.ToolResult, error) {
-        png, err := capture(ctx, a.Target)
-        if err != nil {
-            return core.ToolResult{}, err // recoverable: the model sees the error
-        }
-        return core.BlockResult(
-            core.TextBlock{Text: "captured " + a.Target},
-            core.ImageBlock{MediaType: "image/png", Data: png},
-        ), nil
-    }))
+// The external task ID makes admission idempotent. An exact retry repeats
+// the same task and options, deadline included.
+admission := []core.SubmitOption{
+	core.WithIdempotencyKey("tickets", "42"),
+	core.WithDeadline(time.Now().Add(10 * time.Minute)),
+}
+handle, err := runtime.Submit(ctx, summarizer, "Summarize ticket 42", admission...)
+if err != nil {
+	panic(err)
+}
+result, err := handle.Await(ctx)
+if err != nil {
+	panic(err)
+}
+fmt.Println(result.Output)
+
+retry, err := runtime.Submit(ctx, summarizer, "Summarize ticket 42", admission...)
+if err != nil {
+	panic(err)
+}
+fmt.Println(retry.ID() == handle.ID())
 ```
 
-Result constructors: `TextResult`, `BlockResult`, `ErrorResult`, `ImageResult`
-(inline base64), and `URLImageResult` (by reference). Existing string tools
-(`Tool`, `Func`, `AsTool`, `WithToolRetry`) are unaffected and keep working —
-`FuncResult` returns a `Tool` and registers through the same paths, and a tool
-may implement the optional `core.ResultTool` interface (`ExecuteResult`) to opt
-in while keeping `Execute` for text-only consumers.
+- **Three lifetimes.** The context passed to `Submit`, `Run`, `Await`, or a
+  stream bounds only that call. Once admission commits, disconnecting does
+  not cancel the run. `Runtime.Close` stops workers at a safe boundary.
+  `RunHandle.Cancel` and a `WithDeadline` deadline are the only logical
+  cancellations, and both reach every child run.
+- **Identity.** `WithIdempotencyKey(scope, key)` maps your task or workflow
+  ID to exactly one run. An exact retry, even after a lost response or a
+  restart, returns the original run. A changed task, definition, deadline, or
+  conversation returns `ErrAdmissionConflict`.
+- **Restart.** A new process opens the same store, registers the same
+  definition revisions, and calls `Recover`. Admitted work starts, accepted
+  turns and completed tool calls are not repeated, suspended runs keep
+  waiting, and anything uncertain needs attention.
+- **Definitions are pinned.** A run pins the definition ID and revision it
+  was admitted with. Register a new revision when an agent's behavior
+  changes; registering a different `Agent` under an existing revision is
+  rejected.
 
-Streaming consumers keep reading `StreamEvent.Result` (the text view); richer
-consumers can inspect `StreamEvent.ResultBlocks`, mirrored on
-`ToolCallView.ResultBlocks` in `StreamAccumulator` views.
+[docs/durable-runtime.md](docs/durable-runtime.md) is the full lifecycle
+reference: recovery, provider attempts, tool effects and reconciliation,
+waits, children, conversations, observation, retention, operating bounds,
+and the operations runbook.
 
-Provider support differs: Anthropic passes text and image tool-result content
-natively (order preserved); OpenAI Chat Completions is text-only, so non-text
-blocks degrade to a documented placeholder (`[non-text tool result block:
-image/png]`) rather than being dropped. Keep rich results small — image data
-lands in the transcript base64-encoded and, where supported, is sent to the
-provider verbatim.
+## Tools
 
-## Multi-agent: sub-agents are just tools
-
-An `Agent` becomes a tool on another agent with `core.AsTool` — the type
-parameter defines the JSON schema the orchestrator's model fills in:
+`core.Func` derives a tool's JSON schema from a Go struct. Exported fields
+are properties, fields without `omitempty` are required, and a `desc` tag
+describes a field. `core.FuncResult` returns a `core.ToolResult` for rich
+content (text and image blocks):
 
 ```go
-orch.RegisterTool(core.AsTool[researchParams](researcher, "researcher",
- "Delegate a focused research assignment."))
+// Fragment
+screenshot := core.FuncResult("screenshot", "Capture an image",
+	func(ctx context.Context, in ShotArgs) (core.ToolResult, error) {
+		png, err := capture(ctx, in.Target)
+		if err != nil {
+			return core.ErrorResult("capture failed: " + err.Error()), nil // model-visible
+		}
+		return core.BlockResult(
+			core.TextBlock{Text: "captured " + in.Target},
+			core.ImageBlock{MediaType: "image/png", Data: png},
+		), nil
+	})
 ```
 
-`AsTool` forwards the raw JSON arguments as the sub-agent's task. When you'd
-rather hand the sub-agent natural language (no "you will receive JSON…"
-boilerplate in its prompt), use `AsToolFunc` with a renderer:
+An `ErrorResult`, an unknown tool name, and invalid arguments are
+recoverable, because the model sees them. A Go error returned by a tool is
+fatal to the run, and so is logical cancellation. Only the error's message
+survives persistence, and awaited errors are rebuilt from it: `errors.Is`
+still matches the runtime's sentinels, but not a tool's own error types.
+
+Declare what a tool does to the outside world so recovery can be honest
+about it:
 
 ```go
-orch.RegisterTool(core.AsToolFunc[researchParams](researcher, "researcher",
- "Delegate a focused research assignment.",
- func(p researchParams) string {
-  return fmt.Sprintf("Research: %s\nQuestions:\n- %s",
-   p.Topic, strings.Join(p.Questions, "\n- "))
- }))
-```
-
-`AsTool` and `AsToolFunc` run the sub-agent inside the parent's tool call, in
-process; the child is lost on restart, and `Runtime` rejects them. For durable
-composition, register the child as its own definition and declare it with
-`core.DurableChildTool`. Each call then becomes a linked child run with its own
-record, and the child shares the parent's persisted caps and cancellation. See
-[Durable children](docs/durable-runtime.md#durable-children).
-
-## Watch every agent work
-
-`RunStream` delivers a live event stream — including events from nested
-sub-agents, tagged with the sub-agent's name. `StreamAccumulator` folds the
-deltas into per-agent state so rendering is a snapshot, not bookkeeping:
-
-```go
-var acc core.StreamAccumulator
-res, err := orch.RunStream(ctx, topic, func(ev core.StreamEvent) {
- acc.Add(ev)
- for _, v := range acc.Views() { // top-level first, then sub-agents
-  fmt.Printf("[%s] %d tool calls, %d tokens\n",
-   v.Agent, len(v.ToolCalls), v.Usage.OutputTokens)
- }
+// Fragment
+publish = core.WithToolEffectPolicy(publish, core.ToolEffectPolicy{
+	Kind:  core.ToolEffectMutating, // every return must report EffectApplied, EffectNotApplied, or EffectUnknown
+	Scope: "reports",
+	SemanticKey: func(raw json.RawMessage) (string, error) { // rejects a second write of the same report
+		var in PublishInput
+		err := json.Unmarshal(raw, &in)
+		return in.Path, err
+	},
 })
-_ = res // RunStream returns the same RunResult as Run
 ```
 
-The full ordering and tagging contract is documented in
-[docs/streaming.md](docs/streaming.md).
+Inside a tool, `core.ToolOperationFromContext(ctx)` returns a stable
+operation ID to send as the destination's idempotency key. A crash between
+dispatch and the committed outcome leaves the call `ToolInvocationUncertain`.
+`RunHandle.Reconcile` records the authoritative outcome without running the
+tool again.
+
+`ToolPolicy` enforces deadlines, call budgets, rate limits, and bounded
+parallelism outside the prompt:
+
+```go
+// Fragment
+core.AgentConfig{ToolPolicy: core.ToolPolicy{
+	Timeout:     10 * time.Second,
+	MaxCalls:    50, // shared by the whole run tree, persisted across restarts
+	MaxParallel: 4,
+	PerTool: map[string]core.ToolLimits{
+		"http_fetch": {Timeout: 3 * time.Second, MaxCalls: 10, RateLimiter: limiter},
+	},
+}}
+```
+
+Policy timeouts and budget denials are recoverable tool results. Tools and
+limiters must honor context cancellation, because Go cannot stop a function
+that ignores its context.
+
+## Typed output
+
+A definition can require validated structured output. `core.OutputSchema[T]`
+derives the schema, and `core.Decode[T]` validates and decodes the accepted
+payload:
+
+```go
+// ExampleDecode in core/example_test.go
+agent, err := core.New(provider, core.AgentConfig{
+	StructuredOutput: &core.StructuredOutputConfig{
+		Schema:         core.OutputSchema[Person](),
+		MaxCorrections: 1,
+	},
+})
+if err != nil {
+	panic(err)
+}
+biographer, err := runtime.Register("biographer", "v1", agent)
+if err != nil {
+	panic(err)
+}
+result, err := runtime.Run(ctx, biographer, "Who wrote the first program?")
+if err != nil {
+	panic(err)
+}
+person, err := core.Decode[Person](result)
+if err != nil {
+	panic(err)
+}
+fmt.Printf("%s, %d (%d turns)\n", person.Name, person.Age, result.Turns)
+```
+
+Invalid output is corrected inside the same run, within its turn budget:
+the violations go back to the model, and tool calls that already happened
+are not repeated. The accepted payload is `RunResult.StructuredOutput`,
+separate from the model-facing `Output` text. When correction is exhausted,
+the run fails with an error that matches `core.ErrInvalidStructuredOutput`;
+`errors.As` extracts the per-field violations from
+`*core.InvalidStructuredOutputError`. Set `StructuredOutputConfig.Native` to
+use provider-native schema enforcement when the provider supports it (Claude
+`output_config`, OpenAI `response_format`). Other providers fall back to a
+hidden `automata_structured_output` tool. Schemas share one supported subset.
+Unsupported assertion keywords such as `$ref`, `oneOf`, and `const` are
+rejected at `core.New`.
+
+## Child agents
+
+`core.ChildTool[P]` delegates to another registered definition. Every call
+becomes a child run of its own, linked to the parent's call:
+
+```go
+// ExampleChildTool in core/example_test.go
+researcher, err := runtime.Register("researcher", "v1", must(core.New(researcherProvider, core.AgentConfig{
+	SystemPrompt: `You receive {"topic": ...}. Research it and reply with notes.`,
+})))
+if err != nil {
+	panic(err)
+}
+lead, err := runtime.Register("lead", "v1", must(core.New(leadProvider, core.AgentConfig{
+	Tools: []core.Tool{
+		core.ChildTool[ResearchRequest]("research", "Research one topic.", researcher),
+	},
+	// Call caps are shared by the whole run tree.
+	ToolPolicy: core.ToolPolicy{MaxCalls: 10},
+})))
+if err != nil {
+	panic(err)
+}
+
+var views core.StreamAccumulator
+result, err := runtime.RunStream(ctx, lead, "Write a report on tides.", views.Add)
+if err != nil {
+	panic(err)
+}
+fmt.Println(result.Output)
+for _, view := range views.Views() {
+	fmt.Printf("%q (call %q): %s\n", view.Agent, view.InvocationID, view.Text)
+}
+```
+
+The parent's worker is released while children run. Children share the
+parent's call caps, deadline, and cancellation, are never retried
+implicitly, and keep their own transcripts, effects, and receipts. The
+child's task is the model's validated arguments as JSON, and the parent
+receives the child's structured output or final message. Read a child's
+typed output with `core.Decode` on the child run's snapshot
+(`ToolInvocationSnapshot.ChildRunID` links down).
+
+## Conversations
+
+```go
+// ExampleWithConversation in core/example_test.go
+writer, err := runtime.Register("writer", "v1", must(core.New(provider, core.AgentConfig{})))
+if err != nil {
+	panic(err)
+}
+thread := core.ConversationRef{Scope: "tenant-1", ID: "refund-policy"}
+first, err := runtime.Run(ctx, writer, "Draft a refund policy.", core.WithConversation(thread, ""))
+if err != nil {
+	panic(err)
+}
+// The next turn names the head it continues; a stale or concurrent turn
+// is rejected rather than merged.
+second, err := runtime.Run(ctx, writer, "Make it 30 days.", core.WithConversation(thread, first.RunID))
+if err != nil {
+	panic(err)
+}
+fmt.Println(second.Output)
+fmt.Println(len(second.Messages), "messages in the conversation")
+```
+
+A conversation has at most one active turn: a competing turn returns
+`ErrConversationBusy`. Each turn references the committed history of the
+previous one instead of copying it.
+
+## Approvals and questions
+
+`core.WithDurableWait` suspends a run on a tool call until the host answers.
+The run holds no worker while it waits, and the wait survives restarts:
+
+```go
+// ExampleWithDurableWait in core/example_test.go
+refund := core.WithDurableWait(
+	core.Func("refund", "Refund an order.", func(ctx context.Context, in RefundInput) (string, error) {
+		return fmt.Sprintf("refunded %d to %s", in.Amount, in.Order), nil
+	}),
+	core.DurableWaitPolicy{
+		Kind:   core.WaitApproval,
+		Target: func(raw json.RawMessage) (string, error) { return string(raw), nil },
+	})
+runtime, err := core.NewRuntime(ctx, core.RuntimeConfig{
+	Store: core.NewMemoryStore(),
+	// Consulted when an approval is accepted and again before dispatch.
+	Authorizer: core.ApprovalAuthorizerFunc(func(ctx context.Context, check core.ApprovalAuthorization) error {
+		if check.Actor != "support-lead" {
+			return errors.New("not allowed")
+		}
+		return nil
+	}),
+})
+if err != nil {
+	panic(err)
+}
+defer runtime.Close()
+support, err := runtime.Register("support", "v1", must(core.New(provider, core.AgentConfig{Tools: []core.Tool{refund}})))
+if err != nil {
+	panic(err)
+}
+
+handle, err := runtime.Submit(ctx, support, "Refund order A-7.")
+if err != nil {
+	panic(err)
+}
+wait := pendingWait(ctx, handle)
+fmt.Println("approve?", wait.Tool, wait.Target)
+err = handle.ResolveWait(ctx, wait.ID, core.WaitResolution{
+	Decision:     core.Allow,
+	Actor:        "support-lead",
+	ActionDigest: wait.ActionDigest, // binds the approval to this exact call
+})
+if err != nil {
+	panic(err)
+}
+result, err := handle.Await(ctx)
+if err != nil {
+	panic(err)
+}
+fmt.Println(result.Output)
+```
+
+An approval binds the exact call, arguments, target, definition revision,
+and policy context into its `ActionDigest`. The configured `Authorizer` is
+consulted when the approval is accepted and again immediately before
+dispatch. Repeating the same resolution returns the stored outcome, while a
+different one returns `ErrWaitConflict`. A `WaitQuestion` wait makes the
+host's JSON answer the tool result.
+
+## Observing runs
+
+`Runtime.RunStream` and `RunHandle.Observe` deliver provisional live events:
+text and thinking deltas, tool calls, tool results, and usage. Child-run
+events are included, tagged with `StreamEvent.Agent` (the child tool's name)
+and `InvocationID` (the call that started it). `core.StreamAccumulator` folds
+them into per-agent views for rendering. Live views are bounded and drop
+events rather than slow the run.
+
+Committed events are the durable record. Read them in pages from a cursor:
+
+```go
+// ExampleRunHandle_Events in core/example_test.go
+var cursor uint64 // persist this to resume after a restart
+for {
+	page, err := handle.WaitEvents(ctx, cursor, 256)
+	if errors.Is(err, core.ErrEventGap) {
+		// Retention removed events behind the cursor: resynchronize.
+		snapshot, err := handle.Snapshot(ctx)
+		if err != nil {
+			panic(err)
+		}
+		cursor = snapshot.EventSequence
+		continue
+	}
+	if err != nil {
+		panic(err)
+	}
+	for _, event := range page.Events {
+		if event.Kind == core.CommittedRunState {
+			fmt.Println("state:", event.State)
+		}
+	}
+	cursor = page.Next
+	if last := page.Events[len(page.Events)-1]; last.Kind == core.CommittedRunState && last.State == core.RuntimeTerminal {
+		break
+	}
+}
+```
+
+`RunHandle.Snapshot` is the authoritative full view of a run, with its
+transcript, tool batches and effects, waits, attention, failure, and
+accounting across child runs.
 
 ## Long conversations
 
-For multi-turn sessions and long tool loops, `core.Compactor` is a pre-send hook
-that summarizes older turns to stay within a token budget (keeping the system
-prompt and recent turns intact, never splitting a tool call from its result),
-and the Claude provider's `WithConversationCache()` caches the message prefix so
-each turn re-reads it cheaply. See [docs/context.md](docs/context.md).
-
-## Web search
-
-`tools.WebSearch` is vendor-neutral; backends implement `tools.Searcher` in
-their own modules:
-
-```go
-researcher.RegisterTool(tools.WebSearch(tavily.New(os.Getenv("TAVILY_API_KEY"))))
-```
+`core.Compactor` is a pre-send hook that summarizes older turns to stay
+within a token budget. It keeps the system prompt and recent turns intact,
+never separates a tool call from its result, and only changes what is sent,
+never the committed transcript. The Claude provider's
+`WithConversationCache()` caches the message prefix.
 
 ## Examples
 
-- `examples/claude` — minimal tool-using agent.
-- `examples/durable_typed` — credential-free fake-provider Runtime demo showing
-  a mutating tool, an invalid structured payload, correction to a typed domain
-  value, and one external write; then a durable child with typed output inside
-  a two-turn Runtime conversation:
+Examples that call a model need credentials; the others run offline.
+
+- `examples/durable_host` — offline. A small platform host where each command
+  runs in its own process. It stops a run at an approval, approves it from
+  a later process, crashes one process right after an external write,
+  reconciles from the destination, and resumes committed events from a
+  saved cursor. It verifies exactly one write per ticket:
+
+  ```sh
+  go run ./examples/durable_host demo
+  ```
+
+- `examples/durable_typed` — offline, on a temporary SQLite store. It
+  corrects invalid structured output without repeating an accepted write,
+  then delegates to a typed child inside a two-turn conversation:
 
   ```sh
   go run ./examples/durable_typed
   ```
 
-- `examples/typed_agents` — sub-agents registered as typed tools (`AsToolFunc`,
-  and `RunTyped` wrapped in a `Func` for a typed-in/typed-out child) driving a
-  `RunSessionTyped` triage session that checkpoints to JSON and resumes between
-  turns. Needs `ANTHROPIC_API_KEY`:
-
-  ```sh
-  go run ./examples/typed_agents
-  ```
-
-- `examples/deep_research` — orchestrator + researcher + writer with a live
-  Bubble Tea TUI rendered entirely from a `StreamAccumulator`. Needs
-  `ANTHROPIC_API_KEY` and `TAVILY_API_KEY`:
+- `examples/claude`, `examples/openai` — a minimal streaming tool-using
+  agent (`ANTHROPIC_API_KEY`, or `OPENAI_API_KEY` for any OpenAI-compatible
+  endpoint).
+- `examples/deep_research` — an orchestrator that delegates to researcher
+  and writer child runs, rendered live in a Bubble Tea TUI from a
+  `StreamAccumulator`. Needs `ANTHROPIC_API_KEY` and `TAVILY_API_KEY`:
 
   ```sh
   go run ./examples/deep_research "the impact of GLP-1 drugs on US healthcare costs"
   ```
+
+## Upgrading from v0.4
+
+This release makes `Runtime` the only way to run an agent. The direct entry
+points, which were process-local and lost on restart, are removed:
+
+| v0.4 | Now |
+| --- | --- |
+| `agent.Run(ctx, task, opts...)` | `ref, _ := rt.Register(id, rev, agent)`, then `rt.Run(ctx, ref, task)` |
+| `agent.RunStream(ctx, task, onEvent)` | `rt.RunStream(ctx, ref, task, onEvent)` |
+| `agent.RunBackground(...)` | `rt.Submit(...)`, then `handle.Await(ctx)` |
+| `agent.NewSession()`, `ResumeSession`, `Session.Run` | `rt.Run(ctx, ref, task, core.WithConversation(thread, head))` |
+| `core.RunTyped[T]`, `RunSessionTyped[T]` | `AgentConfig.StructuredOutput{Schema: core.OutputSchema[T]()}`, then `core.Decode[T](result)` |
+| `core.AsTool[P]`, `AsToolFunc[P]` | `core.ChildTool[P](name, description, childRef)` (the child receives JSON) |
+| `core.DurableChildTool(def, DurableChildPolicy{...})` | `core.NewChildTool(def, ref)` |
+| `WithCallOptions`, `WithMaxTurns`, `WithToolPolicy`, `WithTools`, `WithMaxCorrectionTurns`, `WithNativeStructuredOutput` | Set them on `AgentConfig` and register a new revision. |
+| `AgentConfig.DefaultCallOptions` | `AgentConfig.CallOptions` |
+| `AgentConfig.Approver`, `ApproverFunc`, `AllowAll` | `core.WithDurableWait` approvals with `RuntimeConfig.Authorizer` |
+| `AgentConfig.Observers`, `WithObserver`, `RunEvent`, `Checkpoint` | Live views (`RunStream`, `Observe`) and committed events (`RunHandle.Events`) |
+| `SubmitOptions{Scope, Key, Deadline, Conversation}` | `core.WithIdempotencyKey`, `core.WithDeadline`, `core.WithConversation` |
+| `Register(...) error` | `Register(...) (core.DefinitionRef, error)` |
+| `Conversation(ctx, scope, id)` | `Conversation(ctx, core.ConversationRef{...})` |
+| `RunResult.Steps`, `RawProviderStopReason` | `RunResult.Turns`, `RawStopReason` |
+| `ErrMaxStepsExceeded`, `ErrInvalidMaxSteps`, `StopMaxSteps`, `StopNormal` | `ErrMaxTurnsExceeded`, `ErrInvalidMaxTurns`, `StopMaxTurns`, `StopEndTurn` |
+| `WaitResolution{Decision: core.Modify}` | Not supported: a changed action needs a new model call and approval. |
+
+Behavior changes to expect:
+
+- **Streaming.** Runs stream from providers that support it, even through
+  `Run`.
+- **Errors after `Await`.** They are rebuilt from the persisted failure.
+  Sentinel errors, `*CompletionError`, and `*InvalidStructuredOutputError`
+  still match with `errors.Is` or `errors.As`. A tool's or provider's own
+  error types keep only their message.
+- **Nesting.** A tool that runs another agent inside itself is not part of
+  the parent's durable run. Use `ChildTool` for composition.
+- **Storage.** The encoding is version 9. No released version shipped the
+  runtime, so earlier pre-release stores are rejected, not migrated. See
+  [storage upgrades](docs/durable-runtime.md#storage-upgrades-and-backups).
 
 ## Agent skill
 
@@ -434,7 +555,3 @@ building Automata applications at
 [`.codex/skills/automata-go/`](.codex/skills/automata-go/SKILL.md). Agents that
 discover project skills can load it directly. To use it globally in other
 projects, copy that directory to `~/.agents/skills/automata-go/`.
-
-## Roadmap
-
-See [docs/roadmap.md](docs/roadmap.md).

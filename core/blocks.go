@@ -35,8 +35,8 @@ type ThinkingBlock struct {
 func (ThinkingBlock) blockType() string { return "thinking" }
 
 // ToolUseBlock is a tool call the model requested. Input is the raw JSON object
-// of arguments (kept as [json.RawMessage] so transcripts render real JSON and
-// an [Approver] can rewrite it without a decode/encode round-trip).
+// of arguments, kept as [json.RawMessage] so transcripts render real JSON and
+// approval digests cover the exact bytes the model produced.
 type ToolUseBlock struct {
 	ID    string          `json:"id"`
 	Name  string          `json:"name"`

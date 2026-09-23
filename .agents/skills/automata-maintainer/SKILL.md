@@ -40,22 +40,24 @@ passed") in every report.
   `planning/projects/` status as history when marked completed and as design
   context only when proposed — never as implemented behavior.
 
-## 3. Identify the lifecycle before applying invariants
+## 3. Identify the layer before applying invariants
 
-State which lifecycle the change touches, because their invariants differ:
+`core.Runtime` is the only execution lifecycle; the direct `Agent.Run`,
+`Session`, `RunTyped`, and `AsTool` entry points were removed in T09. State
+which layer the change touches:
 
-- **Process-local** — `Agent.Run`/`RunStream`, `Session`, `RunTyped`,
-  `RunBackground`. `README.md` marks these as transitional toward `Runtime`;
-  do not freeze their APIs as stable contract or attach Runtime guarantees to
-  them prematurely.
-- **Durable** — `core.Runtime` (`Register`, `Submit`, `Run`, `RunStream`,
-  `Recover`, `Close`), `RunHandle` (`Await`, `Cancel`, `Snapshot`, `Observe`),
-  committed-run hooks, the `core.Store` contract and its adapters, recovery,
-  and tool-effect reconciliation. `docs/durable-runtime.md` is authoritative.
-- **Shared** — the block model and transcript ordering, the streaming event
-  contract (`docs/streaming.md`), and provider-neutral boundaries.
+- **Runtime** — admission, transitions, recovery, waits, children,
+  conversations, observation, retention, the `core.Store` contract and its
+  adapters, and tool-effect reconciliation. `docs/durable-runtime.md` is
+  authoritative.
+- **Definition** — `Agent`/`AgentConfig`, tools and wrappers, tool policy,
+  structured output, and the typed helpers (`ChildTool`, `OutputSchema`,
+  `Decode`). Anything that changes execution must be pinned by a registered
+  revision or persisted with the admission.
+- **Shared** — the block model and transcript ordering, the live stream event
+  contract, and provider-neutral boundaries.
 
-Preserve regardless of lifecycle: partial `RunResult` data on failure; tool
+Preserve everywhere: partial `RunResult` data on failure; tool
 results committed in model request order; parent-run cancellation and
 deadlines fatal, while policy and tool-owned timeouts stay model-visible and
 recoverable; no implicit retries of side-effecting tools or sub-agent runs;

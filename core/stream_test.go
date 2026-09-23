@@ -125,7 +125,7 @@ func (p *scriptedProvider) Invoke(context.Context, Request) (Response, error) {
 
 // recordingProvider implements both Provider and StreamProvider, replaying the
 // same scripted Messages on either path and recording which path each turn took.
-// It lets tests assert whether a sub-agent ran streaming (InvokeStream) or
+// It lets tests assert whether a run streamed (InvokeStream) or
 // non-streaming (Invoke).
 type recordingProvider struct {
 	turns       []Message
@@ -210,7 +210,7 @@ func TestRunStreamEmitsTextToolCallAndResult(t *testing.T) {
 	}))
 
 	var got []StreamEvent
-	out, err := agent.RunStream(context.Background(), "go", func(ev StreamEvent) {
+	out, err := runAgentStream(t, agent, "go", func(ev StreamEvent) {
 		got = append(got, ev)
 	})
 	if err != nil {
@@ -267,7 +267,7 @@ func TestRunStreamSkipsGapToolSlots(t *testing.T) {
 	}))
 
 	var calls, results int
-	out, err := agent.RunStream(context.Background(), "go", func(ev StreamEvent) {
+	out, err := runAgentStream(t, agent, "go", func(ev StreamEvent) {
 		switch ev.Kind {
 		case StreamToolCall:
 			calls++
@@ -301,7 +301,7 @@ func TestRunStreamToolResultCarriesError(t *testing.T) {
 	}))
 
 	var result *StreamEvent
-	if _, err := agent.RunStream(context.Background(), "go", func(ev StreamEvent) {
+	if _, err := runAgentStream(t, agent, "go", func(ev StreamEvent) {
 		if ev.Kind == StreamToolResult {
 			e := ev
 			result = &e
@@ -339,7 +339,7 @@ func TestRunStreamFallbackEmitsToolEvents(t *testing.T) {
 
 	var kinds []StreamEventKind
 	var result string
-	out, err := agent.RunStream(context.Background(), "go", func(ev StreamEvent) {
+	out, err := runAgentStream(t, agent, "go", func(ev StreamEvent) {
 		kinds = append(kinds, ev.Kind)
 		if ev.Kind == StreamToolResult {
 			result = ev.Result
@@ -374,7 +374,7 @@ func TestRunStreamEmitsUsage(t *testing.T) {
 
 	var usage *Usage
 	var usageEvents int
-	if _, err := agent.RunStream(context.Background(), "go", func(ev StreamEvent) {
+	if _, err := runAgentStream(t, agent, "go", func(ev StreamEvent) {
 		if ev.Kind == StreamUsage {
 			usageEvents++
 			usage = ev.Usage
@@ -398,8 +398,8 @@ func TestRunStreamTransportFailurePreservesPartialResult(t *testing.T) {
 		{Err: io.ErrUnexpectedEOF},
 	}}}
 
-	res, err := testAgent(provider).RunStream(context.Background(), "go", nil)
-	if !errors.Is(err, ErrIncompleteResponse) || !errors.Is(err, io.ErrUnexpectedEOF) {
+	res, err := runAgentStream(t, testAgent(provider), "go", nil)
+	if !errors.Is(err, ErrIncompleteResponse) || !strings.Contains(err.Error(), io.ErrUnexpectedEOF.Error()) {
 		t.Fatalf("err = %v, want incomplete response wrapping unexpected EOF", err)
 	}
 	if res.Output != "partial stream" || res.FinalMessage.Text() != "partial stream" {
@@ -411,80 +411,6 @@ func TestRunStreamTransportFailurePreservesPartialResult(t *testing.T) {
 	if len(res.Messages) == 0 || res.Messages[len(res.Messages)-1].Text() != "partial stream" {
 		t.Errorf("partial transcript = %+v, want final partial assistant message", res.Messages)
 	}
-}
-
-// TestAsToolStreamsSubAgentEvents verifies that when a parent run is streaming,
-// an AsTool sub-agent runs in streaming mode and forwards its events into the
-// parent stream tagged with the tool's name — and that a plain Run instead
-// routes the sub-agent through its non-streaming path.
-func TestAsToolStreamsSubAgentEvents(t *testing.T) {
-	subCall := toolUse("s1", "subagent", "{}")
-	final := "done"
-	subText := "sub result"
-
-	// Streaming parent: sub-agent should stream and its text should arrive tagged.
-	t.Run("streaming propagates tagged events", func(t *testing.T) {
-		subProvider := &recordingProvider{turns: []Message{asstText(subText)}}
-		sub := testAgent(subProvider)
-
-		orch := testAgent(&recordingProvider{turns: []Message{
-			AssistantMessage(subCall),
-			asstText(final),
-		}})
-		orch.RegisterTool(AsTool[struct{}](sub, "subagent", "a sub-agent"))
-
-		var subTexts []StreamEvent
-		var topText []StreamEvent
-		out, err := orch.RunStream(context.Background(), "go", func(ev StreamEvent) {
-			if ev.Kind != StreamText {
-				return
-			}
-			switch ev.Agent {
-			case "subagent":
-				subTexts = append(subTexts, ev)
-			case "":
-				topText = append(topText, ev)
-			}
-		})
-		if err != nil {
-			t.Fatalf("RunStream: %v", err)
-		}
-		if out.Output != final {
-			t.Errorf("output = %q, want %q", out.Output, final)
-		}
-		if subProvider.streamCalls != 1 || subProvider.syncCalls != 0 {
-			t.Errorf("sub-agent path: streamCalls=%d syncCalls=%d, want 1/0", subProvider.streamCalls, subProvider.syncCalls)
-		}
-		if len(subTexts) != 1 || subTexts[0].Text != subText {
-			t.Errorf("tagged sub-agent text events = %+v, want one %q", subTexts, subText)
-		}
-		if len(topText) != 1 || topText[0].Text != final {
-			t.Errorf("top-level text events = %+v, want one %q", topText, final)
-		}
-	})
-
-	// Non-streaming parent: sub-agent should run through Invoke, not InvokeStream.
-	t.Run("plain Run does not stream sub-agent", func(t *testing.T) {
-		subProvider := &recordingProvider{turns: []Message{asstText(subText)}}
-		sub := testAgent(subProvider)
-
-		orch := testAgent(&recordingProvider{turns: []Message{
-			AssistantMessage(subCall),
-			asstText(final),
-		}})
-		orch.RegisterTool(AsTool[struct{}](sub, "subagent", "a sub-agent"))
-
-		out, err := orch.Run(context.Background(), "go")
-		if err != nil {
-			t.Fatalf("Run: %v", err)
-		}
-		if out.Output != final {
-			t.Errorf("output = %q, want %q", out.Output, final)
-		}
-		if subProvider.syncCalls != 1 || subProvider.streamCalls != 0 {
-			t.Errorf("sub-agent path: syncCalls=%d streamCalls=%d, want 1/0", subProvider.syncCalls, subProvider.streamCalls)
-		}
-	})
 }
 
 // TestRunStreamTurnOrdering pins the per-turn event ordering contract: a
@@ -508,7 +434,7 @@ func TestRunStreamTurnOrdering(t *testing.T) {
 	}))
 
 	var got []StreamEvent
-	out, err := agent.RunStream(context.Background(), "go", func(ev StreamEvent) {
+	out, err := runAgentStream(t, agent, "go", func(ev StreamEvent) {
 		got = append(got, ev)
 	})
 	if err != nil {
@@ -551,36 +477,44 @@ func TestRunStreamTurnOrdering(t *testing.T) {
 	}
 }
 
-// TestAsToolNestedTagsAndUsage runs a three-level agent tree (orchestrator →
-// mid → leaf) and pins two contracts at once: the innermost Agent tag wins on
-// nested sub-agents, and tagged StreamUsage events let a StreamAccumulator
-// attribute usage per agent while Totals sums everything.
-func TestAsToolNestedTagsAndUsage(t *testing.T) {
+// TestChildRunNestedTagsAndUsage runs a three-level durable tree
+// (orchestrator → mid → leaf) and pins two contracts at once: the innermost
+// Agent tag wins on nested child runs, and tagged StreamUsage events let a
+// StreamAccumulator attribute usage per agent while Totals sums everything.
+func TestChildRunNestedTagsAndUsage(t *testing.T) {
+	runtime := newTestRuntime(t)
 	leafText := "leaf-says"
 	leafProvider := &recordingProvider{turns: []Message{
 		withUsage(asstText(leafText), &Usage{InputTokens: 5, OutputTokens: 3}),
 	}}
-	leaf := testAgent(leafProvider)
+	leaf, err := runtime.Register("leaf", "v1", testAgent(leafProvider))
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	midText := "mid-says"
 	midProvider := &recordingProvider{turns: []Message{
 		withUsage(asstTool("L1", "leaf", "{}"), &Usage{InputTokens: 7, OutputTokens: 2}),
 		withUsage(asstText(midText), &Usage{InputTokens: 9, OutputTokens: 4}),
 	}}
-	mid := testAgent(midProvider)
-	mid.RegisterTool(AsTool[struct{}](leaf, "leaf", "leaf sub-agent"))
+	mid, err := runtime.Register("mid", "v1", testAgent(midProvider).WithTools(ChildTool[struct{}]("leaf", "leaf child", leaf)))
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	topText := "top-says"
 	orchProvider := &recordingProvider{turns: []Message{
 		withUsage(asstTool("M1", "mid", "{}"), &Usage{InputTokens: 11, OutputTokens: 1}),
 		withUsage(asstText(topText), &Usage{InputTokens: 13, OutputTokens: 6}),
 	}}
-	orch := testAgent(orchProvider)
-	orch.RegisterTool(AsTool[struct{}](mid, "mid", "mid sub-agent"))
+	orch, err := runtime.Register("orch", "v1", testAgent(orchProvider).WithTools(ChildTool[struct{}]("mid", "mid child", mid)))
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	var acc StreamAccumulator
 	textByAgent := map[string]string{}
-	out, err := orch.RunStream(context.Background(), "go", func(ev StreamEvent) {
+	out, err := runtime.RunStream(context.Background(), orch, "go", func(ev StreamEvent) {
 		acc.Add(ev)
 		if ev.Kind == StreamText {
 			textByAgent[ev.Agent] += ev.Text

@@ -36,10 +36,10 @@ func TestPersistentRuntimeReopensTerminalRun(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := runtime.Register("agent", "v1", agent); err != nil {
+	if _, err := runtime.Register("agent", "v1", agent); err != nil {
 		t.Fatal(err)
 	}
-	result, err := runtime.Run(context.Background(), "agent", "v1", "work", core.SubmitOptions{Scope: "test", Key: "one"})
+	result, err := runtime.Run(context.Background(), core.DefinitionRef{ID: "agent", Revision: "v1"}, "work", core.WithIdempotencyKey("test", "one"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,10 +67,10 @@ func TestPersistentRuntimeReopensTerminalRun(t *testing.T) {
 	if len(snapshot.Result.Messages) != 2 || snapshot.Result.Messages[1].Text() != "persisted" {
 		t.Fatalf("reopened transcript = %#v", snapshot.Result.Messages)
 	}
-	if err := reopened.Register("agent", "v1", agent); err != nil {
+	if _, err := reopened.Register("agent", "v1", agent); err != nil {
 		t.Fatal(err)
 	}
-	retried, err := reopened.Submit(context.Background(), "agent", "v1", "work", core.SubmitOptions{Scope: "test", Key: "one"})
+	retried, err := reopened.Submit(context.Background(), core.DefinitionRef{ID: "agent", Revision: "v1"}, "work", core.WithIdempotencyKey("test", "one"))
 	if err != nil || retried.ID() != result.RunID {
 		t.Fatalf("reopened admission = %q, %v; want %q", retried.ID(), err, result.RunID)
 	}
@@ -113,10 +113,10 @@ func TestDurableApprovalReopensAndLostResponseIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := runtime.Register("writer", "v1", agent); err != nil {
+	if _, err := runtime.Register("writer", "v1", agent); err != nil {
 		t.Fatal(err)
 	}
-	handle, err := runtime.Submit(context.Background(), "writer", "v1", "write", core.SubmitOptions{})
+	handle, err := runtime.Submit(context.Background(), core.DefinitionRef{ID: "writer", Revision: "v1"}, "write")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -149,7 +149,7 @@ func TestDurableApprovalReopensAndLostResponseIsIdempotent(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer reopened.Close()
-	if err := reopened.Register("writer", "v1", agent); err != nil {
+	if _, err := reopened.Register("writer", "v1", agent); err != nil {
 		t.Fatal(err)
 	}
 	if err := reopened.Recover(context.Background()); err != nil {

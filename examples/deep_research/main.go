@@ -1,7 +1,10 @@
 // Command deep_research is a CLI deep-research agent built on the automata
 // framework. An orchestrator agent maintains a to-do list and delegates to a
-// researcher (live Tavily web search) and a writer (which saves the report),
-// all streamed live in a Bubble Tea terminal UI.
+// researcher (live Tavily web search) and a writer (which saves the report).
+// Each delegation is a durable child run; the whole tree streams live into a
+// Bubble Tea terminal UI. The runtime is ephemeral, so an interrupted
+// research run is not resumed; see examples/durable_host for a persistent
+// store and recovery.
 //
 // Required environment:
 //
@@ -22,6 +25,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/joho/godotenv"
@@ -80,22 +84,35 @@ func main() {
 	cfg.outPath = *out
 	cfg.topic = strings.TrimSpace(strings.Join(flag.Args(), " "))
 
-	ctx, cancel := context.WithCancel(context.Background())
+	// A whole research session is bounded; the TUI can also cancel it.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
+
+	runtime, err := core.NewEphemeralRuntime()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(1)
+	}
+	// Closing the runtime stops any child run still working when the TUI exits.
+	defer runtime.Close()
 
 	store := &todoStore{}
 	sub := make(chan tea.Msg, 256)
 	sink := func(msg tea.Msg) { sub <- msg }
 
-	// Build the orchestrator once the topic is known (the save filename derives
+	// Register the agents once the topic is known (the save filename derives
 	// from it), so it works for both the arg and interactive-prompt paths.
-	build := func(topic string) (*core.Agent, error) {
+	start := func(ctx context.Context, topic string, onEvent func(core.StreamEvent)) (core.RunResult, error) {
 		c := cfg
 		c.topic = topic
-		return buildOrchestrator(c, store, sink)
+		orchestrator, err := registerAgents(runtime, c, store, sink)
+		if err != nil {
+			return core.RunResult{}, err
+		}
+		return runtime.RunStream(ctx, orchestrator, topic, onEvent, core.WithDeadline(time.Now().Add(25*time.Minute)))
 	}
 
-	p := tea.NewProgram(newModel(cfg, sub, ctx, cancel, build), tea.WithAltScreen())
+	p := tea.NewProgram(newModel(cfg, sub, ctx, cancel, start), tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)

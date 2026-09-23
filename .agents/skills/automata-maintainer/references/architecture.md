@@ -8,17 +8,16 @@ authoritative, and this file must not grow into a stale duplicate of them.
 
 | Lifecycle | Entry points | Authoritative sources |
 | --- | --- | --- |
-| Process-local | `Agent.Run`, `RunStream`, `NewSession`/`ResumeSession`, `RunTyped`/`RunSessionTyped`, `RunBackground` | `core/loop.go`, `core/session.go`, `core/typed.go`, `README.md` |
-| Durable | `core.Runtime`: `NewRuntime`/`NewEphemeralRuntime`, `Register`, `Submit`, `Run`, `RunStream`, `Recover`, `Close`; `RunHandle`: `Await`, `Cancel`, `Snapshot`, `Observe`; `CommittedRunHook`s; `core.Store` and `extensions/sqlite`; recovery and tool-effect reconciliation | `docs/durable-runtime.md`, `core/runtime*.go`, `extensions/AGENTS.md`, `extensions/sqlite/README.md` |
-| Streaming (both lifecycles) | `RunStream`, `RunHandle.Observe`, `core.StreamAccumulator` | `docs/streaming.md`, `core/stream.go`, `core/accumulator.go` |
+| Runtime (the only lifecycle) | `core.Runtime`: `NewRuntime`/`NewEphemeralRuntime`, `Register` (returns `DefinitionRef`), `Submit`/`Run`/`RunStream` with `WithIdempotencyKey`/`WithDeadline`/`WithConversation`, `Recover`, `Prune`, `Conversation`, `Close`; `RunHandle`: `Await`, `Cancel`, `Snapshot`, `Observe`, `Events`/`WaitEvents`, `ResolveWait`, `Reconcile`, `AcknowledgeHooks`; `CommittedRunHook`s; `core.Store` and `extensions/sqlite` | `docs/durable-runtime.md`, `core/runtime*.go`, `core/example_test.go`, `extensions/AGENTS.md`, `extensions/sqlite/README.md` |
+| Definitions and typed helpers | `core.New`/`AgentConfig`, `Func`/`FuncResult`, `WithToolEffectPolicy`, `WithDurableWait`, `ChildTool`/`NewChildTool`, `OutputSchema`, `Decode` | `core/agent.go`, `core/tools.go`, `core/children.go`, `core/typed.go`, `README.md` |
+| Live streaming | `Runtime.RunStream`, `RunHandle.Observe`, child-event forwarding, `core.StreamAccumulator` | `core/stream.go`, `core/runtime.go` (`publish`), `core/accumulator.go`, `docs/durable-runtime.md#observation` |
 
 Facts to keep straight:
 
-- The process-local APIs are transitional: `README.md` states they are not
-  protected legacy surfaces and will be replaced or routed through `Runtime`.
-  Do not freeze them as stable contract, and do not attach durable guarantees
-  (persistence, recovery, store-backed transcripts) to them before those
-  equivalents land.
+- There is no process-local execution path. Tests run agents through an
+  ephemeral Runtime (`runAgent` in `core/testfixture_test.go`), and a tool
+  that runs another agent itself is an opaque host tool, outside the parent's
+  durable guarantees; composition is `ChildTool`.
 - `loopMachine` is the durable runtime's internal turn driver, not a second
   public lifecycle.
 - Runtime storage failure never falls back to memory; an unavailable or
@@ -38,9 +37,9 @@ Facts to keep straight:
 | Change | Inspect together |
 | --- | --- |
 | Message or block model | `core/blocks.go`, `core/types.go`, JSON round-trip tests, every provider adapter present under `extensions/` |
-| Process-local run lifecycle or errors | `core/loop.go`, `core/agent.go`, `core/session.go`, hooks, `README.md` process-local sections |
-| Tool execution | `core/tools.go`, `core/toolbatch.go`, approvals, policy, effect policy, rich results, nested agents |
-| Streaming | `core/stream.go`, `core/emitter.go`, accumulator, every affected provider stream implementation, `docs/streaming.md` |
+| Run loop or errors | `core/loop.go`, `core/loopmachine.go`, `core/runtime.go` (failure persistence and `snapshotError`), `README.md` |
+| Tool execution | `core/tools.go`, `core/runtime_tools.go`, waits, policy, effect policy, rich results, child tools |
+| Streaming | `core/stream.go`, `core/runtime.go` (`publish`, `attachAncestors`), accumulator, every affected provider stream implementation |
 | Typed output | `core/typed.go`, schema derivation/validation, provider capability mapping |
 | Provider options | `core/provider.go`, request builders of the affected adapters, docs/examples |
 | Durable runtime or storage | `core/runtime*.go`, `core/waits.go`, `docs/durable-runtime.md`, `extensions/sqlite`, `internal/durabletest` |
@@ -72,7 +71,7 @@ classify workspace and release membership; do not infer either from memory.
 
 ```sh
 go test ./<affected package>       # targeted behavior
-go test -race ./core               # sessions, streams, tool batches, accumulators, hooks
+go test -race ./core               # runtime, streams, tool batches, children, accumulators, hooks
 go test ./...                      # from each affected nested module directory
 GOWORK=off go test ./...           # published modules with dependencies or interfaces changed
 go build ./...                     # affected example modules, without credentials
@@ -86,8 +85,8 @@ go build ./...                     # affected example modules, without credentia
   compatibility with previously tagged published releases. Verifying that
   requires the module's require lines to point at real tags (e.g. after a
   release refresh), which is release work and stays out of ordinary changes.
-- Run race tests for changes to sessions, streams, tool batches, accumulators,
-  hooks, or other concurrent state.
+- Run race tests for changes to the runtime, streams, tool batches, children,
+  accumulators, hooks, or other concurrent state.
 - Live provider calls are opt-in integration checks; never require them for
   ordinary unit validation, and never claim provider behavior from unit tests
   alone.

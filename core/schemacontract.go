@@ -510,13 +510,6 @@ func jsonKindOf(val any) string {
 	}
 }
 
-// isIntegralNumber reports whether the JSON number literal denotes an integer
-// ("1.0" and "1e2" count; "1.5" does not).
-func isIntegralNumber(n json.Number) bool {
-	r, ok := schemaNumberRat(n)
-	return ok && r.IsInt()
-}
-
 // joinPath qualifies a violation path under its parent.
 func joinPath(prefix, name string) string {
 	if prefix == "" {

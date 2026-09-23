@@ -23,28 +23,19 @@ var (
 	ErrConversationBlocked = errors.New("conversation history cannot be continued")
 )
 
-// ConversationOptions admits a Runtime run as the next turn of a durable
-// conversation. Turns are serialized: a conversation has at most one active
-// run, and each submission names the committed head it continues, so competing
-// or stale admissions are rejected instead of merged.
-type ConversationOptions struct {
-	// Scope namespaces conversation IDs, for example by tenant. It may be
-	// empty.
-	Scope string
-	// ID identifies the conversation within Scope. An empty ID submits an
-	// ordinary run.
-	ID string
-	// ExpectedHead is the run ID of the committed turn this submission
-	// continues, or empty to start the conversation.
+// conversationOptions admits a run as the next turn of a durable
+// conversation (see [WithConversation]).
+type conversationOptions struct {
+	Scope        string
+	ID           string
 	ExpectedHead string
 }
 
 // ConversationSnapshot is the committed state of a durable conversation.
 type ConversationSnapshot struct {
-	Scope              string
-	ID                 string
-	DefinitionID       string
-	DefinitionRevision string
+	Conversation ConversationRef
+	// Definition is pinned by the first turn; every turn runs it.
+	Definition DefinitionRef
 	// Head is the run ID of the last turn that terminalized; empty until the
 	// first turn does.
 	Head string
@@ -68,7 +59,7 @@ type storedConversation struct {
 
 func conversationKey(scope, id string) string { return scope + "\x00" + id }
 
-func validateConversationOptions(options ConversationOptions) error {
+func validateConversationOptions(options conversationOptions) error {
 	if options.ID == "" && (options.Scope != "" || options.ExpectedHead != "") {
 		return errors.New("conversation id is required")
 	}
@@ -102,7 +93,7 @@ func getConversation(tx StoreTransaction, key string) (storedConversation, error
 // starts like any new run. The caller resolves an exact idempotent retry
 // first, so a head that moved after a lost acknowledgement never rejects the
 // original admission.
-func admitConversationTurnTx(tx StoreTransaction, options ConversationOptions, definitionID, revision, task, runID string) (head storedRuntimeRun, ok bool, err error) {
+func admitConversationTurnTx(tx StoreTransaction, options conversationOptions, definitionID, revision, task, runID string) (head storedRuntimeRun, ok bool, err error) {
 	key := conversationKey(options.Scope, options.ID)
 	conversation, err := getConversation(tx, key)
 	switch {
@@ -186,20 +177,22 @@ func releaseConversationTx(tx StoreTransaction, record storedRuntimeRun) error {
 	return putStoredJSON(tx, runtimeConversationsBucket, key, conversation)
 }
 
-// Conversation returns the committed state of a durable conversation.
-func (r *Runtime) Conversation(ctx context.Context, scope, id string) (ConversationSnapshot, error) {
+// Conversation returns the committed state of a durable conversation. After
+// a lost admission acknowledgement without an idempotency key, its
+// ActiveRunID or Head identifies the turn that was admitted.
+func (r *Runtime) Conversation(ctx context.Context, ref ConversationRef) (ConversationSnapshot, error) {
 	var conversation storedConversation
 	err := r.transaction(ctx, false, func(tx StoreTransaction) error {
 		var err error
-		conversation, err = getConversation(tx, conversationKey(scope, id))
+		conversation, err = getConversation(tx, conversationKey(ref.Scope, ref.ID))
 		return err
 	})
 	if err != nil {
 		return ConversationSnapshot{}, err
 	}
 	return ConversationSnapshot{
-		Scope: conversation.Scope, ID: conversation.ID,
-		DefinitionID: conversation.DefinitionID, DefinitionRevision: conversation.DefinitionRevision,
-		Head: conversation.Head, ActiveRunID: conversation.ActiveRunID, Turns: conversation.Turns,
+		Conversation: ConversationRef{Scope: conversation.Scope, ID: conversation.ID},
+		Definition:   DefinitionRef{ID: conversation.DefinitionID, Revision: conversation.DefinitionRevision},
+		Head:         conversation.Head, ActiveRunID: conversation.ActiveRunID, Turns: conversation.Turns,
 	}, nil
 }

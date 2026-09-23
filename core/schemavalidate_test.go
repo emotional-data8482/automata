@@ -1,7 +1,6 @@
 package core
 
 import (
-	"context"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -225,7 +224,7 @@ func TestValidateTypedPayloadPointerScalarNullability(t *testing.T) {
 	}
 }
 
-func TestRunTypedAcceptsPointerScalarNullPayload(t *testing.T) {
+func TestTypedAcceptsPointerScalarNullPayload(t *testing.T) {
 	type pointerPayload struct {
 		S *string  `json:"s"`
 		I *int     `json:"i"`
@@ -236,9 +235,9 @@ func TestRunTypedAcceptsPointerScalarNullPayload(t *testing.T) {
 	provider := &scriptedProvider{turns: []Message{
 		asstTool("s1", structuredOutputToolName, `{"s":null,"i":null,"b":null,"f":null,"a":null}`),
 	}}
-	got, result, err := RunTyped[pointerPayload](context.Background(), testAgent(provider), "go")
+	got, result, err := runTyped[pointerPayload](t, testAgent(provider), "go")
 	if err != nil {
-		t.Fatalf("RunTyped: %v (result %#v)", err, result)
+		t.Fatalf("typed run: %v (result %#v)", err, result)
 	}
 	if got.S != nil || got.I != nil || got.B != nil || got.F != nil || got.A != nil {
 		t.Fatalf("decoded pointers = %#v, want all nil", got)

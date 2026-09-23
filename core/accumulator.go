@@ -5,7 +5,7 @@ import "sync"
 // ToolCallView is the accumulator's record of one tool call: the call as the
 // model requested it, and — once the StreamToolResult arrives — its outcome.
 // Result is the text-only view fed back to the model (compatibility field);
-// ResultBlocks carries the rich result blocks behind it (see [ResultTool]) and
+// ResultBlocks carries the rich result blocks behind it (see [ToolResult]) and
 // is empty only if the consumer attached before any result event.
 type ToolCallView struct {
 	Call         ToolUseBlock
@@ -17,15 +17,15 @@ type ToolCallView struct {
 }
 
 // AgentView is a per-invocation snapshot of an in-progress (or finished)
-// streaming run: the text streamed so far, every tool call with its result, and
+// streamed run: the text streamed so far, every tool call with its result, and
 // the summed token usage attributed to that invocation.
 type AgentView struct {
-	// Agent is the StreamEvent.Agent tag: "" for the top-level agent, the
-	// sub-agent tool's name for events forwarded by [AsTool] / [AsToolFunc].
+	// Agent is the StreamEvent.Agent tag: "" for the observed run, the child
+	// tool's name for events forwarded from a child run (see [ChildTool]).
 	Agent string
-	// InvocationID is the StreamEvent.InvocationID tag: "" for the top-level
-	// agent, the starting tool-call ID for a sub-agent invocation. It separates
-	// two concurrent calls to the same sub-agent tool, which share an Agent.
+	// InvocationID is the StreamEvent.InvocationID tag: "" for the observed
+	// run, the tool-call ID that started a child run. It separates two
+	// concurrent calls to the same child tool, which share an Agent.
 	InvocationID string
 	Text         string // assembled streamed text
 	Thinking     string // assembled streamed thinking
@@ -63,14 +63,15 @@ func (st *agentState) view() AgentView {
 	}
 }
 
-// StreamAccumulator folds a [RunStream] event stream into structured per-agent
-// state, so consumers (a TUI, a web handler, a log writer) can render a
-// snapshot instead of hand-rolling delta bookkeeping. Feed every event to
-// [StreamAccumulator.Add] and read [StreamAccumulator.Views] /
-// [StreamAccumulator.Totals] whenever a render is due:
+// StreamAccumulator folds a live event stream ([Runtime.RunStream] or
+// [RunHandle.Observe]) into structured per-agent state, so consumers (a TUI, a
+// web handler, a log writer) can render a snapshot instead of hand-rolling
+// delta bookkeeping. Feed every event to [StreamAccumulator.Add] and read
+// [StreamAccumulator.Views] / [StreamAccumulator.Totals] whenever a render is
+// due:
 //
 //	var acc core.StreamAccumulator
-//	out, err := agent.RunStream(ctx, task, func(ev core.StreamEvent) {
+//	out, err := runtime.RunStream(ctx, lead, task, func(ev core.StreamEvent) {
 //	    acc.Add(ev)
 //	    render(acc.Views(), acc.Totals())
 //	})
@@ -128,7 +129,7 @@ func (a *StreamAccumulator) Add(ev StreamEvent) {
 
 // agent returns the state record for the (name, invocationID) lane, creating it
 // on first sight. The top-level agent (the zero key) is kept at the front of
-// the order; sub-agent invocations follow in first-seen order. Callers must
+// the order; child invocations follow in first-seen order. Callers must
 // hold a.mu.
 func (a *StreamAccumulator) agent(name, invocationID string) *agentState {
 	key := agentKey{agent: name, invocationID: invocationID}
@@ -149,8 +150,8 @@ func (a *StreamAccumulator) agent(name, invocationID string) *agentState {
 }
 
 // Views returns a snapshot of every lane seen so far: the top-level agent
-// first (if it has produced any events), then each sub-agent invocation in
-// first-seen order. Parallel calls to the same sub-agent tool appear as
+// first (if it has produced any events), then each child invocation in
+// first-seen order. Parallel calls to the same child tool appear as
 // separate views with the same Agent but distinct InvocationIDs. The returned
 // views are copies — later Add calls do not mutate them.
 func (a *StreamAccumulator) Views() []AgentView {
@@ -179,8 +180,8 @@ func (a *StreamAccumulator) View(agent, invocationID string) (AgentView, bool) {
 }
 
 // ViewsFor returns every invocation lane for a given agent tag, in first-seen
-// order. Use it when a sub-agent tool may be called more than once (e.g.
-// parallel sub-agents) and you want all lanes sharing that name. Pass "" for
+// order. Use it when a child tool may be called more than once (e.g.
+// parallel children) and you want all lanes sharing that name. Pass "" for
 // the top-level agent.
 func (a *StreamAccumulator) ViewsFor(agent string) []AgentView {
 	a.mu.Lock()

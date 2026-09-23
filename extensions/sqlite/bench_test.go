@@ -73,10 +73,10 @@ func BenchmarkSQLiteToolTurns(b *testing.B) {
 			start := time.Now()
 			for i := range b.N {
 				revision := fmt.Sprintf("v%d", i)
-				if err := runtime.Register("agent", revision, benchTurnsAgent(b, turns)); err != nil {
+				if _, err := runtime.Register("agent", revision, benchTurnsAgent(b, turns)); err != nil {
 					b.Fatal(err)
 				}
-				if _, err := runtime.Run(context.Background(), "agent", revision, "work", core.SubmitOptions{}); err != nil {
+				if _, err := runtime.Run(context.Background(), core.DefinitionRef{ID: "agent", Revision: revision}, "work"); err != nil {
 					b.Fatal(err)
 				}
 			}
@@ -92,11 +92,11 @@ func BenchmarkSQLiteRecover(b *testing.B) {
 	for _, backlog := range []int{0, 1000} {
 		b.Run(fmt.Sprintf("terminal=%d", backlog), func(b *testing.B) {
 			runtime := benchRuntime(b, core.RuntimeConfig{})
-			if err := runtime.Register("agent", "v1", benchTurnsAgent(b, 1)); err != nil {
+			if _, err := runtime.Register("agent", "v1", benchTurnsAgent(b, 1)); err != nil {
 				b.Fatal(err)
 			}
 			for range backlog {
-				if _, err := runtime.Run(context.Background(), "agent", "v1", "work", core.SubmitOptions{}); err != nil {
+				if _, err := runtime.Run(context.Background(), core.DefinitionRef{ID: "agent", Revision: "v1"}, "work"); err != nil {
 					b.Fatal(err)
 				}
 			}
@@ -115,10 +115,10 @@ func BenchmarkSQLiteRecover(b *testing.B) {
 func BenchmarkSQLiteReads(b *testing.B) {
 	quietBenchLogs(b)
 	runtime := benchRuntime(b, core.RuntimeConfig{})
-	if err := runtime.Register("agent", "v1", benchTurnsAgent(b, 64)); err != nil {
+	if _, err := runtime.Register("agent", "v1", benchTurnsAgent(b, 64)); err != nil {
 		b.Fatal(err)
 	}
-	result, err := runtime.Run(context.Background(), "agent", "v1", "work", core.SubmitOptions{})
+	result, err := runtime.Run(context.Background(), core.DefinitionRef{ID: "agent", Revision: "v1"}, "work")
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -143,11 +143,11 @@ func BenchmarkSQLiteReads(b *testing.B) {
 func BenchmarkSQLitePrune(b *testing.B) {
 	quietBenchLogs(b)
 	runtime := benchRuntime(b, core.RuntimeConfig{})
-	if err := runtime.Register("agent", "v1", benchTurnsAgent(b, 1)); err != nil {
+	if _, err := runtime.Register("agent", "v1", benchTurnsAgent(b, 1)); err != nil {
 		b.Fatal(err)
 	}
 	for range b.N {
-		if _, err := runtime.Run(context.Background(), "agent", "v1", "work", core.SubmitOptions{}); err != nil {
+		if _, err := runtime.Run(context.Background(), core.DefinitionRef{ID: "agent", Revision: "v1"}, "work"); err != nil {
 			b.Fatal(err)
 		}
 	}

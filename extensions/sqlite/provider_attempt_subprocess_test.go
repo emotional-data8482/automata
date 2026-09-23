@@ -69,13 +69,13 @@ func runProviderAttemptOwner() {
 	provider := &attemptProvider{inOwner: true, inFlight: make(chan struct{})}
 	agent, err := attemptAgent(provider)
 	if err == nil {
-		err = runtime.Register("agent", "v1", agent)
+		_, err = runtime.Register("agent", "v1", agent)
 	}
 	if err != nil {
 		fmt.Println("agent-error: " + err.Error())
 		os.Exit(3)
 	}
-	handle, err := runtime.Submit(ctx, "agent", "v1", "look it up", core.SubmitOptions{Scope: "subprocess", Key: "attempt"})
+	handle, err := runtime.Submit(ctx, core.DefinitionRef{ID: "agent", Revision: "v1"}, "look it up", core.WithIdempotencyKey("subprocess", "attempt"))
 	if err != nil {
 		fmt.Println("submit-error: " + err.Error())
 		os.Exit(3)
@@ -128,7 +128,7 @@ func TestInterruptedProviderAttemptIsNeverSilentlyRepeated(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := reopened.Register("agent", "v1", agent); err != nil {
+		if _, err := reopened.Register("agent", "v1", agent); err != nil {
 			t.Fatal(err)
 		}
 		if err := reopened.Recover(ctx); err != nil {

@@ -85,13 +85,13 @@ type childAdmissionReceipt struct {
 // cancellation and optional child-local durations are owned by later slices.
 // The child is created RuntimeReady but only the caller schedules it after the
 // transaction commits.
-func (r *Runtime) admitChildRun(tx StoreTransaction, parent storedRuntimeRun, invocation storedToolInvocation, policy DurableChildPolicy, task string) (childAdmissionReceipt, error) {
+func (r *Runtime) admitChildRun(tx StoreTransaction, parent storedRuntimeRun, invocation storedToolInvocation, child DefinitionRef, task string) (childAdmissionReceipt, error) {
 	receipt := childAdmissionReceipt{}
-	if strings.ContainsRune(policy.DefinitionID, '\x00') || strings.ContainsRune(policy.Revision, '\x00') {
-		return receipt, errors.New("durable child identities cannot contain NUL")
+	if strings.ContainsRune(child.ID, '\x00') || strings.ContainsRune(child.Revision, '\x00') {
+		return receipt, errors.New("child identities cannot contain NUL")
 	}
-	if policy.DefinitionID == "" || policy.Revision == "" {
-		return receipt, errors.New("durable child policy requires a definition id and revision")
+	if child.ID == "" || child.Revision == "" {
+		return receipt, errors.New("child tool requires a definition id and revision")
 	}
 	if invocation.OperationID == "" {
 		return receipt, errors.New("child admission requires an operation identity")
@@ -103,7 +103,7 @@ func (r *Runtime) admitChildRun(tx StoreTransaction, parent storedRuntimeRun, in
 	if task == "" {
 		return receipt, fmt.Errorf("child admission for operation %q requires a projected task", invocation.OperationID)
 	}
-	digest := childAdmissionDigest(childAdmissionPayload{DefinitionID: policy.DefinitionID, Revision: policy.Revision, Task: task})
+	digest := childAdmissionDigest(childAdmissionPayload{DefinitionID: child.ID, Revision: child.Revision, Task: task})
 
 	rawLink, err := tx.Get(runtimeChildLinksBucket, childLinkKey(parent.RunID, invocation.OperationID))
 	if err != nil && !errors.Is(err, ErrStoreKeyNotFound) {
@@ -120,7 +120,7 @@ func (r *Runtime) admitChildRun(tx StoreTransaction, parent storedRuntimeRun, in
 		return r.resolveExistingChildAdmission(tx, link, invocation)
 	}
 
-	binding, err := r.binding(policy.DefinitionID, policy.Revision)
+	binding, err := r.binding(child)
 	if err != nil {
 		// Fail closed: a child of an unregistered definition must not be
 		// admitted or implicitly re-registered against a different revision.
@@ -128,11 +128,11 @@ func (r *Runtime) admitChildRun(tx StoreTransaction, parent storedRuntimeRun, in
 	}
 	now := time.Now().UTC()
 	childRunID := newRuntimeID()
-	child := storedRuntimeRun{
+	record := storedRuntimeRun{
 		Version:            runtimeEncodingVersion,
 		RunID:              childRunID,
-		DefinitionID:       policy.DefinitionID,
-		DefinitionRevision: policy.Revision,
+		DefinitionID:       child.ID,
+		DefinitionRevision: child.Revision,
 		Task:               task,
 		Deadline:           parent.Deadline,
 		State:              RuntimeReady,
@@ -140,17 +140,19 @@ func (r *Runtime) admitChildRun(tx StoreTransaction, parent storedRuntimeRun, in
 		Result:             RunResult{RunID: childRunID},
 		ParentRunID:        parent.RunID,
 		ParentOperationID:  invocation.OperationID,
+		ParentTool:         invocation.Call.Name,
+		ParentCallID:       invocation.Call.ID,
 		// Pin the child definition's own subtree and PerTool caps on the child
 		// record at admission; the child charges its ancestors from their
 		// persisted records, not from any context.
 		ToolBudget: pinnedToolCaps(binding.agent.toolPolicy),
 	}
-	if err := putRuntimeRun(tx, child); err != nil {
+	if err := putRuntimeRun(tx, record); err != nil {
 		return receipt, err
 	}
 	link := storedChildLink{
 		Version: runtimeEncodingVersion, ParentRunID: parent.RunID, OperationID: invocation.OperationID,
-		ChildRunID: childRunID, DefinitionID: policy.DefinitionID, DefinitionRevision: policy.Revision,
+		ChildRunID: childRunID, DefinitionID: child.ID, DefinitionRevision: child.Revision,
 		TaskDigest: digest, CreatedAt: now,
 	}
 	if err := putStoredJSON(tx, runtimeChildLinksBucket, childLinkKey(parent.RunID, invocation.OperationID), link); err != nil {
@@ -161,7 +163,7 @@ func (r *Runtime) admitChildRun(tx StoreTransaction, parent storedRuntimeRun, in
 		Kind: WaitChild, State: WaitPending, OperationID: invocation.OperationID,
 		BatchID: invocation.BatchID, Ordinal: invocation.Ordinal, Tool: invocation.Call.Name,
 		Arguments:    append(json.RawMessage(nil), invocation.Call.Input...),
-		DefinitionID: policy.DefinitionID, DefinitionRevision: policy.Revision,
+		DefinitionID: child.ID, DefinitionRevision: child.Revision,
 		ChildRunID: childRunID, CreatedAt: now,
 	}
 	if err := putStoredWait(tx, wait); err != nil {
@@ -192,25 +194,6 @@ func (r *Runtime) resolveExistingChildAdmission(tx StoreTransaction, link stored
 	return childAdmissionReceipt{ChildRunID: link.ChildRunID, WaitID: wait.ID, Created: false}, nil
 }
 
-// durableChildDeclaration resolves the durable child declaration behind a
-// registered executor, unwrapping first-party wrappers. A nil result with a
-// nil error means the executor is an ordinary leaf tool. A detected transient
-// child adapter is an invariant violation (Register rejects them), not a
-// silently-executed child.
-func durableChildDeclaration(tool Tool) (*durableChildTool, error) {
-	inspection, err := inspectChildTool(tool)
-	if err != nil {
-		return nil, err
-	}
-	if inspection.transientAdapter {
-		return nil, fmt.Errorf("process-local child adapter %q cannot be dispatched inside a durable batch", tool.Definition().Name)
-	}
-	if inspection.hasChild {
-		return inspection.childTool, nil
-	}
-	return nil, nil
-}
-
 // scheduleChild starts an admitted child run if it is still admitted-but-
 // unstarted and its binding is registered. It is a scheduling hint: calling it
 // on a claimed, running, or terminal child is benign, and a missing binding
@@ -231,7 +214,7 @@ func (r *Runtime) scheduleChild(ctx context.Context, childRunID string) {
 	if record.State != RuntimeReady {
 		return
 	}
-	if _, err := r.binding(record.DefinitionID, record.DefinitionRevision); err != nil {
+	if _, err := r.binding(record.definition()); err != nil {
 		return
 	}
 	r.start(childRunID)
@@ -510,7 +493,7 @@ func markParentChildAttentionTx(tx StoreTransaction, parentRunID, childRunID, re
 		return nil
 	}
 	record.State = RuntimeNeedsAttention
-	record.AttentionKind = "child"
+	record.AttentionKind = AttentionChild
 	record.AttentionReason = fmt.Sprintf("durable child %s requires attention: %s", childRunID, reason)
 	record.Generation++
 	return putRuntimeRun(tx, record)
@@ -525,7 +508,7 @@ func refreshParentChildAttentionTx(tx StoreTransaction, parentRunID string) erro
 	if err != nil {
 		return err
 	}
-	if record.State != RuntimeNeedsAttention || record.AttentionKind != "child" {
+	if record.State != RuntimeNeedsAttention || record.AttentionKind != AttentionChild {
 		return nil
 	}
 	waits, err := loadRunWaits(tx, parentRunID)

@@ -1,8 +1,20 @@
 # Application Patterns
 
-## Typed Final Results
+The repository's `core/example_test.go` holds compiled, output-checked versions of these patterns, and `examples/durable_host` shows a multi-process host.
 
-Use typed final output whenever Go code consumes the answer.
+## Durable Service Integration
+
+A web or queue service normally:
+
+1. At startup: opens the SQLite store, builds immutable agents, registers every revision stored runs may pin, and calls `Recover`.
+2. Per request: `Submit` with `WithIdempotencyKey(tenant, externalID)` and a request-independent `WithDeadline`, stores the run ID next to its own record, and returns immediately or awaits with the request context (cancellation only detaches).
+3. Reports progress from `Snapshot` or from committed events read at a saved cursor.
+4. Exposes operator actions for waits (`ResolveWait`), uncertain effects (`Reconcile`), provider attention, hook attention (`AcknowledgeHooks`), and `Cancel`.
+5. Runs `Prune` on a schedule with explicit retention ages.
+
+One process owns one SQLite store (enforced by an OS lock); scale out with separately owned stores.
+
+## Typed Final Results
 
 ```go
 type Decision struct {
@@ -11,245 +23,134 @@ type Decision struct {
     Confidence float64  `json:"confidence" desc:"value from 0 to 1"`
 }
 
-decision, result, err := core.RunTyped[Decision](ctx, agent, task)
-```
-
-Automata injects a hidden `automata_structured_output` tool whose schema derives from the type. Payloads are validated against the schema before being returned; invalid output gets one bounded correction turn, prose answers with embedded JSON are parsed before paying for a forced turn, and the forced-tool run remains the final backstop. Regular agent tools remain available.
-
-For an ongoing conversation:
-
-```go
-session := agent.NewSession()
-first, _, err := core.RunSessionTyped[Decision](ctx, session, "Review proposal A")
-if err != nil {
-    return err
-}
-next, result, err := core.RunSessionTyped[Decision](ctx, session, "Now compare proposal B")
-if err != nil {
-    return err
-}
-use(first, next, result)
-```
-
-Post-run hooks fire for each underlying run, including both the initial prose run and forced fallback when fallback is needed.
-
-## Persistent Sessions
-
-`Agent.Run` is one-shot. A `Session` carries the full canonical transcript across calls and commits partial progress even when a run fails.
-
-```go
-session := agent.NewSession()
-
-checkpoint := core.WithPostRunHook(func(ctx context.Context, result core.RunResult, runErr error) error {
-    ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-    defer cancel()
-
-    data, err := json.Marshal(result.Messages)
-    if err != nil {
-        return err
-    }
-    return storeTranscript(ctx, data)
+agent, err := core.New(provider, core.AgentConfig{
+    StructuredOutput: &core.StructuredOutputConfig{
+        Schema:         core.OutputSchema[Decision](),
+        MaxCorrections: 1,
+        Native:         true, // provider-native schema enforcement when supported
+    },
 })
-
-first, err := session.Run(ctx, "Draft a plan", checkpoint)
-if err != nil {
-    return err
-}
-second, err := session.Run(ctx, "Revise it using the new constraint", checkpoint)
-if err != nil {
-    return err
-}
-use(first, second)
+// ...
+result, err := rt.Run(ctx, reviewerRef, task)
+decision, err := core.Decode[Decision](result)
 ```
 
-Restore:
+Invalid payloads are corrected inside the same run within `MaxCorrections` and `MaxTurns`; accepted tool effects are never repeated to fix formatting. Without native support the model answers through a hidden `automata_structured_output` tool, or with JSON in prose, which is extracted and validated. Extended thinking is disabled only on a forced final structured-output turn.
+
+## Conversations
 
 ```go
-var transcript []core.Message
-if err := json.Unmarshal(data, &transcript); err != nil {
-    return err
-}
-session = agent.ResumeSession(transcript)
+thread := core.ConversationRef{Scope: tenantID, ID: conversationID}
+first, err := rt.Run(ctx, chatRef, "Draft a plan", core.WithConversation(thread, ""))
+next, err := rt.Run(ctx, chatRef, "Revise it", core.WithConversation(thread, first.RunID))
 ```
 
-Important semantics:
+Turns are serialized: one active turn per conversation (`ErrConversationBusy`), each naming the committed head it continues (`ErrConversationConflict` when stale). The first turn pins the definition revision. `rt.Conversation(ctx, thread)` returns the head, the active run, and the turn count, which also recovers a turn whose admission response was lost.
 
-- `Session.Run`, `RunStream`, and `RunSessionTyped` serialize against one another.
-- `Session.Messages()` returns a snapshot as of the last completed run.
-- A resumed non-empty transcript is used verbatim; the current agent system prompt is not added again.
-- Persistence is a completed-run checkpoint, not resumable execution inside a provider turn or tool call.
-- Protect external actions with application-level idempotency and record uncertain outcomes explicitly.
-
-## Streaming and UI/SSE State
-
-Use `RunStream` for live output:
+## Child Agents
 
 ```go
-var acc core.StreamAccumulator
-result, err := agent.RunStream(ctx, task, func(event core.StreamEvent) {
-    acc.Add(event)
-    notifyRenderer() // keep callback work small
-})
-
-if err != nil {
-    log.Printf("stream ended with partial result: %v", err)
-}
-renderFinal(result, acc.Views(), acc.Totals())
-```
-
-Event kinds:
-
-| Kind | Important fields |
-| --- | --- |
-| `core.StreamText` | `Text` delta |
-| `core.StreamThinking` | `Text` reasoning delta |
-| `core.StreamUsage` | per-turn `Usage` |
-| `core.StreamToolCall` | assembled `ToolCall` before execution |
-| `core.StreamToolResult` | `ToolCall`, `Result`, `ResultBlocks`, `IsError`, `Err` |
-
-Within one turn, text/thinking arrive first, then usage, all tool-call announcements in model order, then tool results in completion order. `Result` is the text compatibility view; rich tools also populate `ResultBlocks` with ordered `TextBlock`/`ImageBlock` content. Tool result handlers run concurrently, but callback delivery is serialized. The callback is on the critical path, so enqueue lightweight notifications rather than blocking on UI or network clients.
-
-`StreamAccumulator` groups by `(Agent, InvocationID)`:
-
-- `Agent == ""`, `InvocationID == ""`: top-level lane.
-- Sub-agent events use the sub-agent tool name and starting tool-call ID.
-- Repeated/concurrent calls to one sub-agent share `Agent` but have distinct `InvocationID` values.
-- `Views()` returns top-level first and sub-agent invocations in first-seen order.
-- `View(agent, invocationID)` selects one lane.
-- `ViewsFor(agent)` selects every invocation of one named agent.
-- `Totals()` includes all observed lanes and turns.
-
-The accumulator is concurrency-safe and its snapshots are copies. The top-level `RunResult.Usage` does not include nested sub-agent usage; use streamed tagged usage/accumulator totals for the full hierarchy.
-
-## Multi-Agent Orchestration
-
-Use sub-agents to isolate role, provider, tools, context, or permissions—not merely to split a prompt.
-
-```go
-type researchParams struct {
+type ResearchRequest struct {
     Topic     string   `json:"topic" desc:"bounded subtopic"`
     Questions []string `json:"questions,omitempty" desc:"specific questions"`
 }
 
-researcher := core.New(researchProvider).
-    WithSystemPrompt("Research only the assigned topic and return evidence with source URLs.").
-    WithMaxSteps(8)
-researcher.RegisterTool(searchTool)
+researcher, err := core.New(researchProvider, core.AgentConfig{
+    SystemPrompt: `Assignments arrive as JSON {"topic", "questions"}. Research only that and cite sources.`,
+    Tools:        []core.Tool{searchTool},
+    MaxTurns:     8,
+})
+researcherRef, err := rt.Register("researcher", "v1", researcher)
 
-orchestrator := core.New(orchestratorProvider).
-    WithSystemPrompt("Delegate focused research, reconcile evidence, and answer the user.").
-    WithMaxSteps(16)
-
-orchestrator.RegisterTool(core.AsToolFunc(
-    researcher,
-    "researcher",
-    "Delegate one focused research assignment and receive evidence-backed notes.",
-    func(p researchParams) string {
-        return fmt.Sprintf("Research: %s\nQuestions:\n- %s", p.Topic, strings.Join(p.Questions, "\n- "))
-    },
-))
+lead, err := core.New(leadProvider, core.AgentConfig{
+    Tools: []core.Tool{core.ChildTool[ResearchRequest]("researcher",
+        "Delegate one focused research assignment.", researcherRef)},
+    ToolPolicy: core.ToolPolicy{MaxCalls: 40}, // shared by the whole tree
+})
+leadRef, err := rt.Register("lead", "v1", lead)
 ```
 
-Generic type inference usually infers `researchParams` from the renderer. An explicit form is `core.AsToolFunc[researchParams](...)`.
+Each call is a durable child run linked to the parent's call; the parent's worker is released while children run, and completed children are never recreated after a restart. The parent receives the child's structured output (JSON) or final message. Children share the parent's caps, deadline, and cancellation and are never retried. A tool that runs another agent itself is an opaque host tool outside these guarantees; use `ChildTool`.
 
-Use `core.AsTool[P]` only when forwarding raw JSON as the sub-agent task is intentional. Each sub-agent invocation is a fresh independent run; it does not share a session with prior calls or the parent. Under `RunStream`, nested agents auto-stream into the parent.
-
-Good specialist design:
-
-- Give each role a narrow system prompt and least-privilege tool set.
-- Put shared facts in typed assignments/results, not a shared mutable transcript.
-- Use a single writer for a shared mutable resource; parallel readers are safer.
-- Keep deterministic verification outside the model and feed evidence back as data.
-- Budget nested runs explicitly; parent step/usage totals do not automatically impose a shared hierarchical budget.
-
-## Approval and Side Effects
-
-Use an approver to allow, deny, or rewrite a requested tool call before execution:
+## Streaming and UI/SSE State
 
 ```go
-agent.WithApprover(core.ApproverFunc(func(
-    ctx context.Context,
-    call core.ToolUseBlock,
-    messages []core.Message,
-) (core.Decision, error) {
-    if call.Name != "send_email" {
-        return core.Decision{Outcome: core.Allow}, nil
-    }
-
-    approvedArgs, ok := approvalStore.Lookup(call.ID, call.Input)
-    if !ok {
-        return core.Decision{Outcome: core.Deny, Reason: "operator approval required"}, nil
-    }
-    return core.Decision{Outcome: core.Modify, Args: approvedArgs}, nil
-}))
+var acc core.StreamAccumulator
+result, err := rt.RunStream(ctx, leadRef, task, func(event core.StreamEvent) {
+    acc.Add(event)
+    notifyRenderer() // keep callback work small
+})
+renderFinal(result, acc.Views(), acc.Totals())
 ```
 
-For consequential actions, approval should bind to effective arguments, authenticated actor, policy version, target resource, and expiration. A blocking in-memory approver is not durable suspension; if a process can restart or approval can take a long time, model that lifecycle in application storage.
+| Kind | Important fields |
+| --- | --- |
+| `core.StreamText` / `StreamThinking` | `Text` delta |
+| `core.StreamUsage` | per-turn `Usage` |
+| `core.StreamToolCall` | assembled `ToolCall` before execution |
+| `core.StreamToolResult` | `ToolCall`, `Result`, `ResultBlocks`, `IsError`, `Err` |
+
+Child-run events carry `Agent` (the child tool name) and `InvocationID` (the call that started the child); nested children keep the innermost tags. `StreamAccumulator.Views()` lists the observed run first, then child invocations in first-seen order. Live views are bounded and provisional: they drop events rather than slow the run. For reliable delivery (webhooks, queues, another process), read committed events:
+
+```go
+page, err := handle.WaitEvents(ctx, cursor, 256) // resume from a persisted cursor
+if errors.Is(err, core.ErrEventGap) { /* resynchronize from handle.Snapshot(ctx).EventSequence */ }
+```
+
+## Approvals and Questions
+
+```go
+refund := core.WithDurableWait(refundTool, core.DurableWaitPolicy{
+    Kind:          core.WaitApproval,
+    PolicyContext: "refunds-v2",
+    ExpiresAfter:  24 * time.Hour,
+    Prompt:        func(raw json.RawMessage) (string, error) { return describe(raw) },
+    Target:        func(raw json.RawMessage) (string, error) { return orderID(raw) },
+})
+// Host, possibly another process after a restart:
+snapshot, _ := handle.Snapshot(ctx)
+wait := snapshot.Waits[0]
+err = handle.ResolveWait(ctx, wait.ID, core.WaitResolution{
+    Decision: core.Allow, Actor: authenticatedUser, ActionDigest: wait.ActionDigest,
+})
+```
+
+The run holds no worker while waiting. `RuntimeConfig.Authorizer` checks current authority when the approval is accepted and again immediately before dispatch; the actor string is audit context, not a credential. Denials are returned to the model; a changed action needs a new approval. `core.WaitQuestion` waits take a JSON `Answer`, which becomes the tool result.
+
+## Side Effects and Reconciliation
+
+```go
+publish := core.WithToolEffectPolicy(core.FuncResult("publish", "Publish a report.",
+    func(ctx context.Context, in PublishInput) (core.ToolResult, error) {
+        op, _ := core.ToolOperationFromContext(ctx)
+        receipt, err := cms.Publish(ctx, in, op.IdempotencyKey)
+        if err != nil {
+            r := core.ErrorResult("publish failed: " + err.Error())
+            r.Effect = core.EffectReport{Status: core.EffectUnknown}
+            return r, nil
+        }
+        r := core.TextResult("published " + receipt)
+        r.Effect = core.EffectReport{Status: core.EffectApplied, Receipt: receipt}
+        return r, nil
+    }),
+    core.ToolEffectPolicy{Kind: core.ToolEffectMutating, Scope: "cms", SemanticKey: pathOf})
+```
+
+After a crash between dispatch and the committed outcome, the invocation is `ToolInvocationUncertain` and the run needs attention. Ask the destination by the operation's idempotency key, then `handle.Reconcile(ctx, operationID, core.EffectResolution{Result: ..., Effect: ...})`; the run continues without re-executing the tool.
 
 ## Context Management
 
-Add a compactor for long sessions or tool loops:
-
 ```go
 summarizer := claude.New(summaryModel, apiKey)
-agent.WithPreSendHook(core.Compactor(summarizer, core.CompactorConfig{
-    TriggerTokens: 100_000,
-    KeepRecent:    8,
-    MinRecompute:  8,
-}))
+agent, err := core.New(provider, core.AgentConfig{PreSendHooks: []core.PreSendHook{
+    core.Compactor(summarizer, core.CompactorConfig{TriggerTokens: 100_000, KeepRecent: 8, MinRecompute: 8}),
+}})
 ```
 
-Compaction:
-
-- Changes only the provider-facing view; canonical session history remains complete.
-- Keeps leading system messages and recent messages.
-- Avoids splitting a tool call from its result.
-- Memoizes summaries and recomputes after `MinRecompute` additional messages.
-- Uses approximate token estimation from recent usage or serialized character count.
-- Aborts the run if summarization fails.
-
-Use a cheap, fast provider for summaries when appropriate. Compaction is not a replacement for domain-specific retrieval, bounded tool output, or application artifact storage.
-
-## Service Integration
-
-A safe HTTP/service handler normally:
-
-1. Builds immutable agents during application startup.
-2. Creates a request context with deadline/cancellation.
-3. Loads or creates a session owned by an authenticated conversation ID.
-4. Serializes operations for that conversation in application storage as well as in process.
-5. Streams lightweight events into a bounded channel for SSE/WebSocket delivery.
-6. Persists the completed transcript and result using a post-run hook.
-7. Returns partial status and a stable operation ID on failure.
-
-Do not hold API keys or authorization objects in prompts/transcripts. Do not let a slow/disconnected stream consumer block the run indefinitely; use bounded buffering and a defined backpressure/drop/cancel policy in application code.
+Compaction changes only the provider-facing view, keeps system and recent messages, never splits a tool call from its result, and memoizes summaries. A summarization failure fails the turn.
 
 ## Testing Without Live Models
 
-Test deterministic tools directly:
+Implement a scripted `core.Provider` that returns `core.Response{Message: core.AssistantMessage(...), StopReason: core.StopToolUse or StopEndTurn}` and run agents through `core.NewEphemeralRuntime()`. Deterministic providers that decide from the request transcript (not a call counter) keep working across restarts in multi-process tests.
 
-```go
-func TestLookupToolRejectsMissingID(t *testing.T) {
-    tool := newLookupTool(fakeStore{})
-    _, err := tool.Execute(context.Background(), `{}`)
-    if err == nil {
-        t.Fatal("expected validation error")
-    }
-}
-```
-
-For agent-loop tests, implement a scripted `core.Provider` that records `core.Request` values and returns predetermined `core.Response` values. Construct assistant messages with `core.AssistantMessage`, `core.TextBlock`, and `core.ToolUseBlock`; attach a `core.Usage` to the message when testing accounting. Set `StopReason` explicitly to `core.StopToolUse` or `core.StopEndTurn`.
-
-Cover:
-
-- normal completion and typed decoding;
-- tool request → result → final turn;
-- concurrent tool calls and shared-state safety;
-- recoverable tool error and unknown tool;
-- context cancellation/deadline;
-- provider retry classification;
-- `ErrMaxStepsExceeded` with a populated transcript;
-- token-limit/incomplete `CompletionError` with partial output;
-- post-run checkpoint failure joined with run failure;
-- session JSON round-trip;
-- stream event order and nested lane attribution.
+Cover normal completion and typed decoding; tool request, result, and final turn; concurrent tool calls; recoverable tool errors and unknown tools; cancellation with `RunHandle.Cancel` and deadlines with `WithDeadline`; `ErrMaxTurnsExceeded` with a populated transcript; token-limit or incomplete `CompletionError` with partial output; approvals and denials; and, with a SQLite store in a temp dir, restart and reconciliation paths.

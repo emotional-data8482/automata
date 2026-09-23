@@ -7,47 +7,6 @@ import (
 	"math"
 )
 
-// Setting distinguishes inheritance (Set false) from replacement, including zero
-// and nil. A nil replacement clears a nullable setting.
-type Setting[T any] struct {
-	Set   bool
-	Value T
-}
-
-// CallOptionsPatch overrides resolved provider settings. Empty and nil stop
-// sequences both clear the list when Set is true. Zero MaxTokens selects the
-// provider default, zero ThinkingBudget disables thinking, and a non-nil zero
-// Temperature requests temperature zero.
-type CallOptionsPatch struct {
-	Temperature    Setting[*float64]
-	MaxTokens      Setting[int]
-	StopSequences  Setting[[]string]
-	ToolChoice     Setting[*ToolChoice]
-	ThinkingBudget Setting[int]
-	OutputSchema   Setting[json.RawMessage]
-}
-
-func (p CallOptionsPatch) apply(o CallOptions) CallOptions {
-	if p.Temperature.Set {
-		o.Temperature = p.Temperature.Value
-	}
-	if p.MaxTokens.Set {
-		o.MaxTokens = p.MaxTokens.Value
-	}
-	if p.StopSequences.Set {
-		o.StopSequences = p.StopSequences.Value
-	}
-	if p.ToolChoice.Set {
-		o.ToolChoice = p.ToolChoice.Value
-	}
-	if p.ThinkingBudget.Set {
-		o.ThinkingBudget = p.ThinkingBudget.Value
-	}
-	if p.OutputSchema.Set {
-		o.OutputSchema = p.OutputSchema.Value
-	}
-	return cloneCallOptions(o)
-}
 func cloneCallOptions(o CallOptions) CallOptions { return cloneRequest(Request{Options: o}).Options }
 func validateCallOptions(o CallOptions) error {
 	if o.MaxTokens < 0 || o.ThinkingBudget < 0 {
@@ -74,28 +33,6 @@ func validateCallOptions(o CallOptions) error {
 		}
 	}
 	return nil
-}
-
-// WithCallOptions captures an explicit patch for reuse across independent runs.
-func WithCallOptions(p CallOptionsPatch) RunOption {
-	o := p.apply(CallOptions{})
-	p.Temperature.Value = o.Temperature
-	p.StopSequences.Value = o.StopSequences
-	p.ToolChoice.Value = o.ToolChoice
-	p.OutputSchema.Value = o.OutputSchema
-	return func(c *runConfig) { c.options = p.apply(c.options) }
-}
-
-// WithMaxTurns replaces the total public-run turn allowance; n must be positive.
-func WithMaxTurns(n int) RunOption { return func(c *runConfig) { c.maxTurns = n } }
-
-// WithObserver appends an optional observer. Nil observers are ignored.
-func WithObserver(o RunObserver) RunOption {
-	return func(c *runConfig) {
-		if o != nil {
-			c.observers = append(c.observers, o)
-		}
-	}
 }
 
 type frozenTool struct{ registeredTool }

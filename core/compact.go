@@ -41,11 +41,11 @@ const defaultCompactPrompt = "You are a conversation summarizer for an AI agent.
 // generate the summary.
 //
 // The hook transforms only the view sent to the provider — it never mutates the
-// canonical transcript (per the [PreSendHook] contract), so [Session.Messages]
-// still returns the full history. It never cuts between an assistant tool call
+// canonical transcript (per the [PreSendHook] contract), so the committed
+// transcript keeps the full history. It never cuts between an assistant tool call
 // and its tool result. The summary is memoized (keyed by the content it
 // covers) and regenerated only every CompactorConfig.MinRecompute messages, so
-// a shared compactor is safe across concurrent sessions and does not pay a
+// a shared compactor is safe across concurrent runs and does not pay a
 // summarization call every turn.
 func Compactor(p Provider, cfg CompactorConfig) PreSendHook {
 	c := &compactor{p: p, cfg: cfg}

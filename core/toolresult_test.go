@@ -205,7 +205,7 @@ func TestLoopRichTextResult(t *testing.T) {
 			return TextResult("sunny in " + a.City), nil
 		}))
 
-	res, err := agent.Run(context.Background(), "go")
+	res, err := runAgent(t, agent, "go")
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -240,7 +240,7 @@ func TestLoopRichMixedResultPreservesBlockOrder(t *testing.T) {
 		), nil
 	}))
 
-	res, err := agent.Run(context.Background(), "go")
+	res, err := runAgent(t, agent, "go")
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -273,7 +273,7 @@ func TestLoopRichResultZeroValueNormalized(t *testing.T) {
 		return ToolResult{}, nil // handler returns the zero value
 	}))
 
-	res, err := agent.Run(context.Background(), "go")
+	res, err := runAgent(t, agent, "go")
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -297,7 +297,7 @@ func TestLoopRichResultRecoverableError(t *testing.T) {
 		return ErrorResult("exploded"), nil
 	}))
 
-	out, err := agent.Run(context.Background(), "go")
+	out, err := runAgent(t, agent, "go")
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -317,15 +317,28 @@ func TestLoopRichResultFatalCancellation(t *testing.T) {
 	provider := &capturingProvider{turns: []Message{
 		asstTool("r1", "hang", "{}"),
 	}}
+	started := make(chan struct{})
 	agent := testAgent(provider)
 	agent.RegisterTool(FuncResult("hang", "waits for cancellation", func(ctx context.Context, _ struct{}) (ToolResult, error) {
+		close(started)
 		<-ctx.Done()
 		return ToolResult{}, ctx.Err()
 	}))
 
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // cancel before the run so the tool observes it immediately
-	if _, err := agent.Run(ctx, "go"); !errors.Is(err, context.Canceled) {
+	runtime := newTestRuntime(t)
+	ref, err := runtime.Register("agent", "v1", agent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle, err := runtime.Submit(context.Background(), ref, "go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	if err := handle.Cancel(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := handle.Await(context.Background()); !errors.Is(err, context.Canceled) {
 		t.Fatalf("err = %v, want context.Canceled", err)
 	}
 }
@@ -342,7 +355,7 @@ func TestLoopStringToolTranscriptUnchanged(t *testing.T) {
 	}))
 
 	var events []StreamEvent
-	res, err := agent.RunStream(context.Background(), "go", func(ev StreamEvent) { events = append(events, ev) })
+	res, err := runAgentStream(t, agent, "go", func(ev StreamEvent) { events = append(events, ev) })
 	if err != nil {
 		t.Fatalf("RunStream: %v", err)
 	}
@@ -389,7 +402,7 @@ func TestLoopRichResultStreamEventsCarryBlocks(t *testing.T) {
 	}))
 
 	var resultEvents []StreamEvent
-	_, err := agent.RunStream(context.Background(), "go", func(ev StreamEvent) {
+	_, err := runAgentStream(t, agent, "go", func(ev StreamEvent) {
 		if ev.Kind == StreamToolResult {
 			resultEvents = append(resultEvents, ev)
 		}

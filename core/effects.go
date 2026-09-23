@@ -59,8 +59,7 @@ const (
 // SemanticKey is optional. For mutating tools, when Scope and SemanticKey are
 // both set, Runtime derives the key from the model-requested arguments, reserves
 // Scope+tool-name+key before dispatch, and rejects a second operation after an
-// applied or unresolved mutation. Approval-modified action binding is added by
-// the durable approval lifecycle. This is an
+// applied or unresolved mutation, in any run on the store. This is an
 // application-level semantic guard, not a substitute for destination-side
 // idempotency.
 type ToolEffectPolicy struct {

@@ -26,10 +26,10 @@ func TestRuntimeRecoveryPreservesEffectiveToolSelection(t *testing.T) {
 		request.Tools = nil
 		return request, nil
 	}}
-	if err := runtime.Register("agent", "v1", agent); err != nil {
+	if _, err := runtime.Register("agent", "v1", agent); err != nil {
 		t.Fatal(err)
 	}
-	result, err := runtime.Run(context.Background(), "agent", "v1", "work", SubmitOptions{})
+	result, err := runtime.Run(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "work")
 	if !errors.Is(err, ErrRunNeedsAttention) || executions.Load() != 0 {
 		t.Fatalf("initial run = %#v, %v; executions=%d", result, err, executions.Load())
 	}
@@ -40,7 +40,7 @@ func TestRuntimeRecoveryPreservesEffectiveToolSelection(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer reopened.Close()
-	if err := reopened.Register("agent", "v1", agent); err != nil {
+	if _, err := reopened.Register("agent", "v1", agent); err != nil {
 		t.Fatal(err)
 	}
 	if err := reopened.Recover(context.Background()); err != nil {
@@ -74,10 +74,10 @@ func TestRuntimeRecoveryNeverRepeatsUncertainCommittedHook(t *testing.T) {
 		t.Fatal(err)
 	}
 	agent := testAgent(&countingRuntimeProvider{})
-	if err := runtime.Register("agent", "v1", agent); err != nil {
+	if _, err := runtime.Register("agent", "v1", agent); err != nil {
 		t.Fatal(err)
 	}
-	result, err := runtime.Run(context.Background(), "agent", "v1", "work", SubmitOptions{})
+	result, err := runtime.Run(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "work")
 	if err == nil {
 		t.Fatal("expected hook-outcome persistence fault")
 	}
@@ -88,7 +88,7 @@ func TestRuntimeRecoveryNeverRepeatsUncertainCommittedHook(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer reopened.Close()
-	if err := reopened.Register("agent", "v1", agent); err != nil {
+	if _, err := reopened.Register("agent", "v1", agent); err != nil {
 		t.Fatal(err)
 	}
 	for range 3 {
@@ -117,10 +117,10 @@ func TestRuntimeCancelResolvesReservedMutationAsNotApplied(t *testing.T) {
 	agent.RegisterTool(effectTool("write", &executions, func(context.Context) (ToolResult, error) {
 		return ToolResult{Effect: EffectReport{Status: EffectApplied}}, nil
 	}, ToolEffectPolicy{Kind: ToolEffectMutating, Scope: "scope", SemanticKey: func(json.RawMessage) (string, error) { return "resource", nil }}))
-	if err := runtime.Register("agent", "v1", agent); err != nil {
+	if _, err := runtime.Register("agent", "v1", agent); err != nil {
 		t.Fatal(err)
 	}
-	first, err := runtime.Run(context.Background(), "agent", "v1", "work", SubmitOptions{})
+	first, err := runtime.Run(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "work")
 	if !errors.Is(err, ErrRunNeedsAttention) {
 		t.Fatalf("first run error = %v", err)
 	}
@@ -132,7 +132,7 @@ func TestRuntimeCancelResolvesReservedMutationAsNotApplied(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer reopened.Close()
-	if err := reopened.Register("agent", "v1", agent); err != nil {
+	if _, err := reopened.Register("agent", "v1", agent); err != nil {
 		t.Fatal(err)
 	}
 	handle := reopened.Handle(first.RunID)
@@ -147,7 +147,7 @@ func TestRuntimeCancelResolvesReservedMutationAsNotApplied(t *testing.T) {
 	if invocation.State != ToolInvocationCompleted || invocation.Effect.Status != EffectNotApplied {
 		t.Fatalf("cancelled reservation = %#v", invocation)
 	}
-	if _, err := reopened.Run(context.Background(), "agent", "v1", "work2", SubmitOptions{}); err != nil {
+	if _, err := reopened.Run(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "work2"); err != nil {
 		t.Fatal(err)
 	}
 	if executions.Load() != 1 {
@@ -162,10 +162,10 @@ func TestRuntimeToolDeadlineIdentitySurvivesInvocationStorage(t *testing.T) {
 		<-ctx.Done()
 		return ToolResult{}, ctx.Err()
 	}, ToolEffectPolicy{Kind: ToolEffectReadOnly}))
-	if err := runtime.Register("agent", "v1", agent); err != nil {
+	if _, err := runtime.Register("agent", "v1", agent); err != nil {
 		t.Fatal(err)
 	}
-	result, err := runtime.Run(context.Background(), "agent", "v1", "work", SubmitOptions{Deadline: time.Now().Add(20 * time.Millisecond)})
+	result, err := runtime.Run(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "work", WithDeadline(time.Now().Add(20*time.Millisecond)))
 	if !errors.Is(err, context.DeadlineExceeded) || result.Status != RunCancelled {
 		t.Fatalf("result=%#v err=%v", result, err)
 	}
@@ -207,10 +207,10 @@ func TestRuntimeLegacyAdapterKeepsAppliedEffectCompleted(t *testing.T) {
 		return ToolResult{Effect: EffectReport{Status: EffectApplied, Receipt: "receipt"}}, errors.New("post-write failure")
 	}, ToolEffectPolicy{Kind: ToolEffectMutating})
 	agent.RegisterTool(WithLegacyToolErrors(tool))
-	if err := runtime.Register("agent", "v1", agent); err != nil {
+	if _, err := runtime.Register("agent", "v1", agent); err != nil {
 		t.Fatal(err)
 	}
-	result, err := runtime.Run(context.Background(), "agent", "v1", "work", SubmitOptions{})
+	result, err := runtime.Run(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "work")
 	if err != nil || result.Output != "done" {
 		t.Fatalf("result=%#v err=%v", result, err)
 	}
@@ -230,15 +230,15 @@ func TestRuntimeFatalToolEmitsOneResultEvent(t *testing.T) {
 	agent.RegisterTool(FuncResult("fail", "fail", func(context.Context, struct{}) (ToolResult, error) {
 		return ToolResult{}, errors.New("fail")
 	}))
-	if err := runtime.Register("agent", "v1", agent); err != nil {
+	if _, err := runtime.Register("agent", "v1", agent); err != nil {
 		t.Fatal(err)
 	}
 	var events []StreamEvent
-	_, err := runtime.RunStream(context.Background(), "agent", "v1", "work", func(event StreamEvent) {
+	_, err := runtime.RunStream(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "work", func(event StreamEvent) {
 		if event.Kind == StreamToolResult {
 			events = append(events, event)
 		}
-	}, SubmitOptions{})
+	})
 	if err == nil || len(events) != 1 || events[0].ToolCall.ID != "fail" || events[0].Err == nil || !events[0].IsError {
 		t.Fatalf("events=%#v err=%v", events, err)
 	}
@@ -254,15 +254,15 @@ func TestRuntimeSemanticGuardRejectionEmitsResult(t *testing.T) {
 	agent.RegisterTool(effectTool("write", &executions, func(context.Context) (ToolResult, error) {
 		return ToolResult{Blocks: Blocks{TextBlock{Text: "wrote"}}, Effect: EffectReport{Status: EffectApplied}}, nil
 	}, ToolEffectPolicy{Kind: ToolEffectMutating, Scope: "scope", SemanticKey: func(json.RawMessage) (string, error) { return "same", nil }}))
-	if err := runtime.Register("agent", "v1", agent); err != nil {
+	if _, err := runtime.Register("agent", "v1", agent); err != nil {
 		t.Fatal(err)
 	}
 	resultIDs := make(map[string]int)
-	result, err := runtime.RunStream(context.Background(), "agent", "v1", "work", func(event StreamEvent) {
+	result, err := runtime.RunStream(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "work", func(event StreamEvent) {
 		if event.Kind == StreamToolResult {
 			resultIDs[event.ToolCall.ID]++
 		}
-	}, SubmitOptions{})
+	})
 	if err != nil || result.Output != "done" || executions.Load() != 1 || resultIDs["first"] != 1 || resultIDs["duplicate"] != 1 {
 		t.Fatalf("result=%#v IDs=%v executions=%d err=%v", result, resultIDs, executions.Load(), err)
 	}
@@ -282,15 +282,15 @@ func TestRuntimeFatalBatchEmitsQueuedCancellationResult(t *testing.T) {
 		queuedExecutions.Add(1)
 		return TextResult("unexpected"), nil
 	}))
-	if err := runtime.Register("agent", "v1", agent); err != nil {
+	if _, err := runtime.Register("agent", "v1", agent); err != nil {
 		t.Fatal(err)
 	}
 	var resultIDs []string
-	_, err := runtime.RunStream(context.Background(), "agent", "v1", "work", func(event StreamEvent) {
+	_, err := runtime.RunStream(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "work", func(event StreamEvent) {
 		if event.Kind == StreamToolResult {
 			resultIDs = append(resultIDs, event.ToolCall.ID)
 		}
-	}, SubmitOptions{})
+	})
 	if err == nil || queuedExecutions.Load() != 0 || len(resultIDs) != 2 || resultIDs[0] != "fatal" || resultIDs[1] != "queued" {
 		t.Fatalf("result IDs=%v queued executions=%d err=%v", resultIDs, queuedExecutions.Load(), err)
 	}
@@ -312,10 +312,10 @@ func TestRuntimeRecoveryDeliversHookNeverStarted(t *testing.T) {
 		t.Fatal(err)
 	}
 	agent := testAgent(&countingRuntimeProvider{})
-	if err := runtime.Register("agent", "v1", agent); err != nil {
+	if _, err := runtime.Register("agent", "v1", agent); err != nil {
 		t.Fatal(err)
 	}
-	result, err := runtime.Run(context.Background(), "agent", "v1", "work", SubmitOptions{})
+	result, err := runtime.Run(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "work")
 	if err == nil || deliveries.Load() != 0 {
 		t.Fatalf("marker fault = %v, deliveries %d", err, deliveries.Load())
 	}
@@ -326,7 +326,7 @@ func TestRuntimeRecoveryDeliversHookNeverStarted(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer reopened.Close()
-	if err := reopened.Register("agent", "v1", agent); err != nil {
+	if _, err := reopened.Register("agent", "v1", agent); err != nil {
 		t.Fatal(err)
 	}
 	for range 2 {

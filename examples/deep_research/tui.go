@@ -17,8 +17,8 @@ import (
 
 // --- bridge messages handled by the TUI -----------------------------------
 
-// uiEvent wraps a stream event from the orchestrator run. Sub-agent events
-// arrive with ev.Agent set (the sub-agent tool's name) via core.AsTool.
+// uiEvent wraps a stream event from the orchestrator run. Child-run events
+// arrive with ev.Agent set to the child tool's name.
 type uiEvent struct{ ev core.StreamEvent }
 
 // doneMsg is pushed when the orchestrator run returns.
@@ -82,7 +82,7 @@ type model struct {
 	sub    chan tea.Msg
 	ctx    context.Context
 	cancel context.CancelFunc
-	build  func(topic string) (*core.Agent, error)
+	run    func(ctx context.Context, topic string, onEvent func(core.StreamEvent)) (core.RunResult, error)
 
 	input    textinput.Model
 	spinner  spinner.Model
@@ -105,7 +105,7 @@ type model struct {
 	height  int
 }
 
-func newModel(cfg appConfig, sub chan tea.Msg, ctx context.Context, cancel context.CancelFunc, build func(string) (*core.Agent, error)) model {
+func newModel(cfg appConfig, sub chan tea.Msg, ctx context.Context, cancel context.CancelFunc, run func(context.Context, string, func(core.StreamEvent)) (core.RunResult, error)) model {
 	ti := textinput.New()
 	ti.Placeholder = "e.g. the impact of GLP-1 drugs on US healthcare costs"
 	ti.Focus()
@@ -127,7 +127,7 @@ func newModel(cfg appConfig, sub chan tea.Msg, ctx context.Context, cancel conte
 		sub:      sub,
 		ctx:      ctx,
 		cancel:   cancel,
-		build:    build,
+		run:      run,
 		input:    ti,
 		spinner:  sp,
 		viewport: viewport.New(80, 20),
@@ -144,17 +144,13 @@ func (m model) Init() tea.Cmd {
 	return tea.Batch(textinput.Blink, waitForMsg(m.sub))
 }
 
-// startRun builds the orchestrator for the topic and launches it in a
-// goroutine, forwarding every stream event onto the shared channel and a final
-// doneMsg when it returns.
+// startRun launches the orchestrator run for the topic in a goroutine,
+// forwarding every stream event onto the shared channel and a final doneMsg
+// when it returns.
 func (m model) startRun(topic string) tea.Cmd {
 	return func() tea.Msg {
-		orch, err := m.build(topic)
-		if err != nil {
-			return doneMsg{err: err}
-		}
 		go func() {
-			res, err := orch.RunStream(m.ctx, topic, func(ev core.StreamEvent) {
+			res, err := m.run(m.ctx, topic, func(ev core.StreamEvent) {
 				m.sub <- uiEvent{ev: ev}
 			})
 			m.sub <- doneMsg{output: res.Output, err: err}
@@ -251,7 +247,7 @@ func (m *model) resize() {
 }
 
 // renderLog renders the accumulator snapshot as one panel per agent (the
-// orchestrator first, sub-agents in first-seen order): the agent's streamed
+// orchestrator first, child runs in first-seen order): the agent's streamed
 // text, then each tool call with its result. The per-event bookkeeping the
 // TUI used to hand-roll lives in core.StreamAccumulator now.
 func (m model) renderLog() string {

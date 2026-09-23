@@ -45,10 +45,10 @@ func TestRuntimeTranscriptIntegrityFailuresAreReported(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = runtime.Close() })
-	if err := runtime.Register("agent", "v1", testAgent(&scriptedProvider{turns: []Message{asstText("the answer")}})); err != nil {
+	if _, err := runtime.Register("agent", "v1", testAgent(&scriptedProvider{turns: []Message{asstText("the answer")}})); err != nil {
 		t.Fatal(err)
 	}
-	result, err := runtime.Run(context.Background(), "agent", "v1", "question", SubmitOptions{})
+	result, err := runtime.Run(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "question")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,7 +91,7 @@ func TestRuntimeRecoveryReportsUnavailablePayloadAndContinues(t *testing.T) {
 	t.Cleanup(func() { _ = runtime.Close() })
 	agent := testAgent(&repeatingChildProvider{})
 	agent.RegisterTool(Func("extra", "ordinary work", func(context.Context, struct{}) (string, error) { return "ok", nil }))
-	if err := runtime.Register("agent", "v1", agent); err != nil {
+	if _, err := runtime.Register("agent", "v1", agent); err != nil {
 		t.Fatal(err)
 	}
 	if err := runtime.Recover(context.Background()); err != nil {
@@ -119,10 +119,10 @@ func TestRuntimeOversizedProviderTurnNeedsAttentionWithoutTruncation(t *testing.
 	}
 	t.Cleanup(func() { _ = runtime.Close() })
 	provider := &repeatingTextProvider{text: strings.Repeat("x", 10_000)}
-	if err := runtime.Register("agent", "v1", testAgent(provider)); err != nil {
+	if _, err := runtime.Register("agent", "v1", testAgent(provider)); err != nil {
 		t.Fatal(err)
 	}
-	result, err := runtime.Run(context.Background(), "agent", "v1", "write a lot", SubmitOptions{})
+	result, err := runtime.Run(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "write a lot")
 	if !errors.Is(err, ErrRunNeedsAttention) || !strings.Contains(err.Error(), ErrPayloadTooLarge.Error()) {
 		t.Fatalf("oversized turn = %v, want payload attention", err)
 	}
@@ -178,10 +178,10 @@ func TestRuntimeOversizedToolResultAwaitsReconciliation(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = runtime.Close() })
-	if err := runtime.Register("agent", "v1", agent); err != nil {
+	if _, err := runtime.Register("agent", "v1", agent); err != nil {
 		t.Fatal(err)
 	}
-	result, err := runtime.Run(context.Background(), "agent", "v1", "go", SubmitOptions{})
+	result, err := runtime.Run(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "go")
 	if !errors.Is(err, ErrRunNeedsAttention) || !strings.Contains(err.Error(), ErrPayloadTooLarge.Error()) {
 		t.Fatalf("oversized tool result = %v, want payload attention", err)
 	}

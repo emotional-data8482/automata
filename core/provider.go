@@ -17,9 +17,8 @@ type Request struct {
 }
 
 // CallOptions are the per-call knobs applied to a provider invocation. The zero
-// value means "provider defaults for everything". Agent-level defaults (see
-// [Agent.WithDefaultCallOptions]) are merged with per-run overrides (see
-// [WithCallOptions]) before each run.
+// value means "provider defaults for everything". A definition sets them with
+// [AgentConfig].CallOptions.
 type CallOptions struct {
 	// Temperature, when non-nil, sets the sampling temperature.
 	Temperature *float64
@@ -34,34 +33,9 @@ type CallOptions struct {
 	ThinkingBudget int
 	// OutputSchema, when non-nil, asks providers with native structured-output
 	// support to enforce this JSON schema on the response (see
-	// [StructuredOutputProvider] and [WithNativeStructuredOutput]). Providers
+	// [StructuredOutputProvider] and [StructuredOutputConfig].Native). Providers
 	// without support ignore it, like any other option they cannot honor.
 	OutputSchema json.RawMessage
-}
-
-// merge returns a copy of o with any field set on override taking precedence.
-// A nil pointer, zero int, or nil slice on override leaves o's value in place.
-func (o CallOptions) merge(override CallOptions) CallOptions {
-	out := o
-	if override.Temperature != nil {
-		out.Temperature = override.Temperature
-	}
-	if override.MaxTokens != 0 {
-		out.MaxTokens = override.MaxTokens
-	}
-	if override.StopSequences != nil {
-		out.StopSequences = override.StopSequences
-	}
-	if override.ToolChoice != nil {
-		out.ToolChoice = override.ToolChoice
-	}
-	if override.ThinkingBudget != 0 {
-		out.ThinkingBudget = override.ThinkingBudget
-	}
-	if override.OutputSchema != nil {
-		out.OutputSchema = override.OutputSchema
-	}
-	return out
 }
 
 // ToolChoiceMode selects how the model may use tools on a turn.
@@ -117,11 +91,11 @@ type StreamProvider interface {
 }
 
 // StructuredOutputProvider is an optional interface a Provider implements to
-// advertise native, schema-enforced structured output. When a typed run opts
-// in with [WithNativeStructuredOutput] and the run's provider implements this
-// interface and reports support, [RunTyped]/[RunSessionTyped] send the schema
-// derived from T via [CallOptions.OutputSchema] instead of injecting the
-// hidden structured-output tool, and the provider's response text is parsed
+// advertise native, schema-enforced structured output. When a definition's
+// [StructuredOutputConfig] sets Native and its provider implements this
+// interface and reports support, runs send the declared schema via
+// [CallOptions.OutputSchema] instead of injecting the hidden
+// structured-output tool, and the provider's response text is parsed
 // and validated like any other structured payload. Supported native invalid
 // payloads correct within the run's structured-output budget. Providers only
 // implementing [Provider], or reporting no support, use the hidden-tool path.

@@ -1,257 +1,120 @@
-# Automata v0.4.0 Core API
+# Automata Core API
 
-## Agent Construction
-
-```go
-agent := core.New(provider).
-    WithSystemPrompt(systemPrompt).
-    WithMaxSteps(10).
-    WithDefaultCallOptions(core.CallOptions{MaxTokens: 4096}).
-    WithLogger(logger).
-    WithTracer(tracer).
-    WithApprover(approver).
-    WithRetry(retryCfg).
-    WithPreSendHook(hook)
-
-agent.RegisterTool(tool)         // add, or replace a same-named tool
-agent.WithTools(toolA, toolB)    // replace the complete tool set
-```
-
-`core.New` defaults to:
-
-- `core.DefaultMaxSteps` (10)
-- `slog.Default()`
-- `tracing.Noop`
-- `core.AllowAll`
-- `retry.DefaultConfig()` for provider invocations
-
-Configure the agent completely before running it. `Run` and `RunStream` are safe to call concurrently after configuration because each creates its own loop. Builder methods and tool registration mutate the agent and must not race with runs.
-
-## Execution APIs
+## Definitions
 
 ```go
-result, err := agent.Run(ctx, task, runOptions...)
-result, err := agent.RunStream(ctx, task, onEvent, runOptions...)
-ch := agent.RunBackground(ctx, task, runOptions...)
+agent, err := core.New(provider, core.AgentConfig{
+    SystemPrompt: systemPrompt,
+    Tools:        []core.Tool{toolA, toolB},
+    MaxTurns:     10,                                   // zero selects core.DefaultMaxTurns
+    CallOptions:  core.CallOptions{MaxTokens: 4096},    // sent on every provider turn
+    ToolPolicy:   core.ToolPolicy{MaxCalls: 50, MaxParallel: 4},
+    Retry:        &retryCfg,                            // provider retries within one turn
+    Logger:       logger,                               // nil selects slog.Default
+    Tracer:       tracer,                               // nil selects tracing.Noop
+    PreSendHooks: []core.PreSendHook{compactor},
+    StructuredOutput: &core.StructuredOutputConfig{Schema: core.OutputSchema[Answer](), MaxCorrections: 1},
+})
 ```
 
-A background channel receives one `core.BackgroundResult` and then closes.
+`New` validates and freezes the configuration: later changes to the config value, tools, or schemas do not affect the agent. Tool names must be unique; `automata_structured_output` is reserved.
 
-`core.RunResult` contains:
+## Runtime
+
+```go
+store, err := sqlite.Open(ctx, "automata.db")         // or core.NewMemoryStore()
+rt, err := core.NewRuntime(ctx, core.RuntimeConfig{
+    Store:      store,
+    Authorizer: authorizer,                             // required for approval waits
+    Hooks:      []core.CommittedRunHook{auditHook},     // after the result commits
+    ProviderRecovery: core.ProviderRecoveryPolicy{MaxFreshAttempts: 0},
+})
+defer rt.Close()
+
+ref, err := rt.Register("support", "2026-09-23", agent) // returns core.DefinitionRef
+err = rt.Recover(ctx)                                   // after registering every stored revision
+
+result, err := rt.Run(ctx, ref, task, opts...)
+result, err := rt.RunStream(ctx, ref, task, onEvent, opts...)
+handle, err := rt.Submit(ctx, ref, task, opts...)
+handle := rt.Handle(runID)
+snapshot, err := rt.Conversation(ctx, core.ConversationRef{Scope: tenant, ID: thread})
+report, err := rt.Prune(ctx, core.RetentionPolicy{Events: 24 * time.Hour, History: 30 * 24 * time.Hour, Runs: 90 * 24 * time.Hour})
+```
+
+`core.NewEphemeralRuntime()` is `NewRuntime` on a fresh memory store. Storage failure never falls back to memory.
+
+Submit options: `core.WithIdempotencyKey(scope, key)`, `core.WithDeadline(t)`, `core.WithConversation(ref, expectedHead)`. An exact retry of a keyed submission (same task, definition, deadline, conversation) returns the original run; a changed one returns `core.ErrAdmissionConflict`.
+
+`RunHandle`: `ID`, `Await`, `Snapshot`, `Observe` (live view), `Events` / `WaitEvents` (committed cursor pages), `Cancel`, `ResolveWait`, `Reconcile`, `AcknowledgeHooks`. Canceling the context of any call only stops that call; `Cancel` and the deadline are the only logical cancellations.
+
+## RunResult
 
 | Field | Meaning |
 | --- | --- |
-| `Output` | Final assistant text, or partial final text for some completion failures |
-| `FinalMessage` | Last assistant message with all blocks |
-| `Messages` | Complete transcript produced so far |
-| `Usage` | Provider usage summed across this run's turns; excludes sub-agent usage |
-| `Steps` | Provider turns taken |
-| `StopReason` | Provider-neutral terminal reason |
-| `RawStopReason` | Verbatim provider terminal reason |
+| `RunID`, `Status` | Stable identity; `completed`, `failed`, `cancelled`, `limit_reached` |
+| `Output`, `FinalMessage` | Final assistant text and message (blocks included) |
+| `Messages` | Complete committed transcript (a conversation's full history) |
+| `Usage` | This run's provider usage; child runs are in `RunSnapshot.Accounting.Tree` |
+| `Turns`, `ProviderAttempts` | Provider turns (including corrections) and calls (including retries) |
+| `StopReason`, `RawStopReason`, `ProviderStopReason` | Why the run ended; the provider's verbatim and neutral last reasons |
+| `StructuredOutput` | The validated payload when the definition declares structured output |
+| `Diagnostics` | Rejected provider content and tool execution errors |
 
 Never discard `result` because `err` is non-nil.
 
-## Per-Call Options
+## RunSnapshot
 
-```go
-temperature := 0.2
-agent.WithDefaultCallOptions(core.CallOptions{
-    Temperature:   &temperature,
-    MaxTokens:     4096,
-    StopSequences: []string{"<END>"},
-    ThinkingBudget: 8_000,
-})
-
-result, err := agent.Run(ctx, task, core.WithCallOptions(core.CallOptions{
-    MaxTokens: 2_000, // merged over agent defaults
-    ToolChoice: &core.ToolChoice{
-        Mode: core.ToolChoiceTool,
-        Name: "lookup_record",
-    },
-}))
-```
-
-Tool-choice modes are `ToolChoiceAuto`, `ToolChoiceNone`, `ToolChoiceAny`, and `ToolChoiceTool`. Providers silently ignore options they cannot honor. A zero field in a per-run override preserves the agent default; for temperature, use a pointer so zero is expressible.
+`State` (`ready`, `running`, `waiting`, `cancel_requested`, `finalizing`, `needs_attention`, `terminal`), `Definition`, `Parent`, `Conversation`, `Result`, `Failure` (`Message`, `Kind`, `StopReason`, `Violations`), `Attention` (`Kind`: `execution`, `provider`, `hooks`, `child`; `Reason`; `BlockingRunID`), `Accounting` (`UnknownAttempts`, `FreshAttempts`, `Tree`), `Hooks`, `ToolBatches` (per-invocation state, effect, `ChildRunID`), `Waits`, `EventSequence`, `HistoryPruned`.
 
 ## Messages and Blocks
 
-A `core.Message` has `Role`, `Blocks`, and optional `Usage`. Blocks are the source of truth; there is no separate tool-call field.
+A `core.Message` has `Role`, `Blocks`, and optional `Usage`. Block types: `TextBlock`, `ThinkingBlock` (with signature), `ToolUseBlock` (raw JSON input), `ToolResultBlock` (nested blocks and `IsError`), `ImageBlock` (inline bytes or URL), and `RawBlock` (provider-native escape hatch). Helpers: `UserMessage`, `SystemMessage`, `AssistantMessage`, `ToolResultMessage`, `ToolResultBlockMessage`, and `Message.Text` / `Thinking` / `ToolUses`. `[]core.Message` round-trips through JSON.
 
-Concrete block types:
-
-- `core.TextBlock`
-- `core.ThinkingBlock` (including provider signature)
-- `core.ToolUseBlock` (raw JSON input)
-- `core.ToolResultBlock` (nested blocks and `IsError`)
-- `core.ImageBlock` (inline bytes or URL)
-- `core.RawBlock` (provider-specific escape hatch)
-
-Helpers:
-
-```go
-user := core.UserMessage("hello")
-system := core.SystemMessage("be concise")
-assistant := core.AssistantMessage(core.TextBlock{Text: "hello"})
-toolResult := core.ToolResultMessage(callID, "done", false)
-richToolResult := core.ToolResultBlockMessage(callID, core.Blocks{
-    core.TextBlock{Text: "screenshot:"},
-    core.ImageBlock{MediaType: "image/png", Data: pngBytes},
-}, false)
-
-text := message.Text()
-thinking := message.Thinking()
-calls := message.ToolUses()
-```
-
-`[]core.Message` can be marshaled to JSON. Typed blocks retain their type discriminants, thinking signatures, tool error flags, images, and raw provider blocks.
-
-## Typed Tool Schemas
-
-```go
-type address struct {
-    City    string `json:"city" desc:"city name"`
-    Country string `json:"country,omitempty" desc:"optional ISO country code"`
-}
-
-type searchArgs struct {
-    Query     string            `json:"query" desc:"search terms"`
-    Addresses []address         `json:"addresses,omitempty" desc:"optional geographic filters"`
-    Labels    map[string]string `json:"labels,omitempty" desc:"metadata filters"`
-}
-
-tool := core.Func("search", "Search records.",
-    func(ctx context.Context, args searchArgs) (string, error) {
-        return search(ctx, args)
-    })
-```
-
-Schema derivation supports primitives, pointers, nested structs, slices/arrays, string-keyed maps, `time.Time`, `[]byte`, interfaces, and `json.RawMessage`. Exported fields without `omitempty` are required. Use a struct (or `struct{}`) as the parameter type.
-
-A custom text tool implements:
+## Tools
 
 ```go
 type Tool interface {
-    Name() string
-    Schema() json.RawMessage
-    Execute(ctx context.Context, args string) (string, error)
+    Definition() core.ToolDefinition                  // Name, Description, InputSchema
+    Execute(ctx context.Context, args json.RawMessage) (core.ToolResult, error)
 }
 ```
 
-Prefer `core.Func` unless hand-authored schema or custom decoding is necessary.
+Prefer `core.Func` (text) or `core.FuncResult` (rich blocks). Schema derivation supports primitives, pointers, nested structs, slices, string-keyed maps, `time.Time`, `[]byte`, interfaces, and `json.RawMessage`; exported fields without `omitempty` are required.
 
-For block-based rich outputs, use `core.FuncResult` or implement `core.ResultTool`:
+Wrappers: `core.WithToolRetry(tool, cfg)`, `core.WithToolEffectPolicy(tool, policy)`, `core.WithDurableWait(tool, policy)`, `core.WithLegacyToolErrors(tool)` (turns a custom tool's Go errors into model-visible error results). Child tools: `core.ChildTool[P](name, description, ref)` or `core.NewChildTool(definition, ref)`; they cannot be retried, wrapped in a wait, or given an effect policy.
 
-```go
-tool := core.FuncResult("screenshot", "Capture a screenshot.",
-    func(ctx context.Context, args shotArgs) (core.ToolResult, error) {
-        png, err := capture(ctx, args.Target)
-        if err != nil {
-            return core.ToolResult{}, err
-        }
-        return core.BlockResult(
-            core.TextBlock{Text: "captured " + args.Target},
-            core.ImageBlock{MediaType: "image/png", Data: png},
-        ), nil
-    })
-```
+Results: `TextResult`, `BlockResult`, `ErrorResult`, `ImageResult`, `URLImageResult`; set `ToolResult.Effect` (`EffectApplied` with a `Receipt`, `EffectNotApplied`, `EffectUnknown`, `EffectNone`) for mutating tools.
 
-`core.ToolResult` constructors are `TextResult`, `BlockResult`, `ErrorResult`, `ImageResult`, and `URLImageResult`. `ToolResult.Text()` concatenates text blocks as the compatibility view for string-only consumers and providers. A zero `ToolResult` normalizes to one empty text block before recording.
+## Errors
 
-## Tool Execution Semantics
+Run errors (rebuilt from the persisted failure after `Await`, identically before and after a restart):
 
-- The model may request several calls in one turn; Automata announces them in model order and executes them concurrently.
-- Transcript tool-result messages stay in model call order even if execution finishes in another order.
-- Unknown tools, denials, and ordinary execution errors become recoverable error results for the model.
-- String tools become single-text-block tool results. Rich-result tools preserve block order in `ToolResultBlock.Content`.
-- Context cancellation/deadline from a tool aborts the batch and run. Sibling calls are canceled cooperatively and still receive transcript results.
-- An external side effect can complete while cancellation races its return. A canceled transcript result is not proof of rollback.
-- Provider retries use `Agent.WithRetry`; normal tool execution does not. Use `core.WithToolRetry` only for idempotent tools with retry-classifiable failures. It preserves `ResultTool.ExecuteResult` for rich tools.
+- `core.ErrMaxTurnsExceeded`, `core.ErrInvalidMaxTurns`, `core.ErrEmptyResponse`
+- `core.ErrInvalidStructuredOutput` / `*core.InvalidStructuredOutputError` (with `Violations`)
+- `*core.CompletionError` with `core.ErrTokenLimit`, `ErrContentFiltered`, `ErrIncompleteResponse`, `ErrUnknownStopReason`
+- `context.Canceled` (logical cancellation), `context.DeadlineExceeded` (run deadline)
+- `core.ErrRunNeedsAttention` from `Await` when the host must act
 
-## Error Classification
+A tool's or provider's own error types keep only their message after persistence.
 
-Common run errors:
-
-- `core.ErrInvalidMaxSteps`
-- `core.ErrMaxStepsExceeded`
-- `core.ErrEmptyResponse`
-- `core.CompletionError`
-
-Completion sentinels:
-
-- `core.ErrTokenLimit`
-- `core.ErrContentFiltered`
-- `core.ErrIncompleteResponse`
-- `core.ErrUnknownStopReason`
-- `context.Canceled`
+Runtime command errors: `ErrDefinitionNotRegistered`, `ErrDefinitionConflict`, `ErrAdmissionConflict`, `ErrRunNotFound`, `ErrRuntimeClosed`, `ErrRunPruned`, `ErrEventGap`, `ErrConversationBusy`, `ErrConversationConflict`, `ErrConversationBlocked`, `ErrWaitConflict`, `ErrWaitExpired`, `ErrWaitStale`, `ErrApprovalUnauthorized`, `ErrApprovalActionMismatch`, `ErrReconciliationConflict`, `ErrPayloadTooLarge`, `ErrPayloadUnavailable`.
 
 ```go
-result, err := agent.Run(ctx, task)
-if err != nil {
-    var completion *core.CompletionError
-    switch {
-    case errors.As(err, &completion):
-        log.Printf("partial completion: reason=%s raw=%q", completion.Reason, completion.RawReason)
-    case errors.Is(err, core.ErrMaxStepsExceeded):
-        log.Printf("step budget exhausted after %d turns", result.Steps)
-    case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
-        log.Printf("run canceled")
-    default:
-        log.Printf("run failed: %v", err)
-    }
+result, err := rt.Run(ctx, ref, task)
+switch {
+case err == nil:
+case errors.Is(err, core.ErrRunNeedsAttention):
+    snapshot, _ := rt.Handle(result.RunID).Snapshot(ctx) // inspect Attention, ToolBatches, Waits
+case errors.Is(err, core.ErrMaxTurnsExceeded):
+    log.Printf("turn budget exhausted after %d turns", result.Turns)
+case errors.Is(err, core.ErrIncompleteResponse):
+    log.Printf("partial answer: %q", result.Output)
+default:
+    log.Printf("run failed: %v", err)
 }
-// result.Messages and result.Usage remain available.
 ```
-
-## Approval
-
-```go
-approver := core.ApproverFunc(func(
-    ctx context.Context,
-    call core.ToolUseBlock,
-    history []core.Message,
-) (core.Decision, error) {
-    switch call.Name {
-    case "delete_record":
-        return core.Decision{Outcome: core.Deny, Reason: "deletion requires operator approval"}, nil
-    default:
-        return core.Decision{Outcome: core.Allow}, nil
-    }
-})
-agent.WithApprover(approver)
-```
-
-Outcomes:
-
-- `core.Allow`: execute unchanged.
-- `core.Modify`: replace raw arguments with `Decision.Args` and execute.
-- `core.Deny`: return `denied: <reason>` to the model; run continues.
-
-An approver error aborts the run. Approval is a gate, not a replacement for tool-side authorization, validation, egress control, or idempotency.
 
 ## Hooks
 
-A pre-send hook transforms the provider-facing snapshot once per turn without changing canonical history:
-
-```go
-type PreSendHook func(
-    ctx context.Context,
-    messages []core.Message,
-    tools []core.Tool,
-) ([]core.Message, []core.Tool, error)
-```
-
-Hooks run in registration order. An error aborts the run.
-
-A post-run hook observes the fully populated result:
-
-```go
-checkpoint := core.WithPostRunHook(func(
-    ctx context.Context,
-    result core.RunResult,
-    runErr error,
-) error {
-    return persist(result.Messages)
-})
-```
-
-Post-run hooks run after a session commits its transcript, including on failed and canceled runs. Their context preserves values but has cancellation/deadline removed; impose a storage timeout inside the hook. All hooks run even if an earlier hook fails, and errors are joined with the original run error.
+`core.PreSendHook func(ctx, core.Request) (core.Request, error)` transforms the provider-facing request each turn without changing committed history (`core.Compactor` is one). `core.CommittedRunHook{Name, Timeout, Handle}` runs after a run's result commits; its outcome is recorded in `RunSnapshot.Hooks` and never changes the result. An interrupted delivery needs `AcknowledgeHooks`.

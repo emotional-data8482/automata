@@ -22,8 +22,11 @@ import (
 // integrity digests to payloads, transcript base references for conversation
 // turns, provider attempt records, the committed event log with its per-run
 // heads, the active-run index, and the retention indexes and tombstones.
-// Earlier pre-release stores are rejected without implicit rewrite.
-const runtimeEncodingVersion = 8
+// Version 9 renames the max-steps stop reason and failure kinds to max-turns,
+// persists approval decisions as strings, and records the tool name and call
+// ID that admitted a child run. Earlier pre-release stores are rejected
+// without implicit rewrite.
+const runtimeEncodingVersion = 9
 
 const (
 	runtimeMetaBucket         = "runtime_meta"
@@ -118,13 +121,61 @@ const (
 	transitionProviderAttemptRecovered = "provider_attempt_recovered"
 )
 
-type SubmitOptions struct {
-	Scope    string
-	Key      string
-	Deadline time.Time
-	// Conversation admits the run as the next serialized turn of a durable
-	// conversation (see [ConversationOptions]).
-	Conversation ConversationOptions
+// SubmitOption configures one admission. See [WithIdempotencyKey],
+// [WithDeadline], and [WithConversation].
+type SubmitOption func(*submitOptions)
+
+type submitOptions struct {
+	Scope        string
+	Key          string
+	Deadline     time.Time
+	Conversation conversationOptions
+	err          error
+}
+
+// WithIdempotencyKey names the admission with an external identity, for
+// example a tenant and the ID of the task or workflow node the run performs.
+// An exact retry returns the original run, even after a lost acknowledgement
+// or a restart; a retry that changes the definition, task, deadline, or
+// conversation returns [ErrAdmissionConflict]. Scope and key are both
+// required.
+func WithIdempotencyKey(scope, key string) SubmitOption {
+	return func(o *submitOptions) {
+		if scope == "" || key == "" {
+			o.err = errors.New("idempotency scope and key are both required")
+		}
+		o.Scope, o.Key = scope, key
+	}
+}
+
+// WithDeadline sets the run's logical deadline. It is persisted with the
+// run, survives restarts and suspension, and is inherited by child runs.
+func WithDeadline(deadline time.Time) SubmitOption {
+	return func(o *submitOptions) { o.Deadline = deadline }
+}
+
+// WithConversation admits the run as the next turn of a durable
+// conversation. expectedHead is the run ID of the committed turn this one
+// continues, or empty to start the conversation. Turns are serialized: a
+// competing turn returns [ErrConversationBusy], and a stale head or a
+// different definition returns [ErrConversationConflict].
+func WithConversation(conversation ConversationRef, expectedHead string) SubmitOption {
+	return func(o *submitOptions) {
+		o.Conversation = conversationOptions{Scope: conversation.Scope, ID: conversation.ID, ExpectedHead: expectedHead}
+		if conversation.ID == "" {
+			o.err = errors.New("conversation id is required")
+		}
+	}
+}
+
+func resolveSubmitOptions(opts []SubmitOption) (submitOptions, error) {
+	var options submitOptions
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&options)
+		}
+	}
+	return options, options.err
 }
 
 // RunSnapshot is the host-facing view of a durable run. Optional groups are
@@ -153,7 +204,8 @@ type RunSnapshot struct {
 	HistoryPruned bool
 }
 
-// DefinitionRef identifies the pinned definition of a run.
+// DefinitionRef identifies a registered definition revision. [Runtime.Register]
+// returns it; runs, child tools, and conversations pin it.
 type DefinitionRef struct {
 	ID       string
 	Revision string
@@ -177,9 +229,9 @@ type FailureKind string
 const (
 	FailureDeadline                        FailureKind = "deadline"
 	FailureCancelled                       FailureKind = "cancelled"
-	FailureMaxSteps                        FailureKind = "max_steps"
-	FailureMaxStepsInvalidStructuredOutput FailureKind = "max_steps_invalid_structured_output"
-	FailureInvalidMaxSteps                 FailureKind = "invalid_max_steps"
+	FailureMaxTurns                        FailureKind = "max_turns"
+	FailureMaxTurnsInvalidStructuredOutput FailureKind = "max_turns_invalid_structured_output"
+	FailureInvalidMaxTurns                 FailureKind = "invalid_max_turns"
 	FailureEmptyResponse                   FailureKind = "empty_response"
 	FailureInvalidStructuredOutput         FailureKind = "invalid_structured_output"
 	FailureCompletion                      FailureKind = "completion"
@@ -187,11 +239,18 @@ const (
 )
 
 // RunFailure preserves the error message and any provider completion details.
+// The error an awaited run returns is rebuilt from it: errors.Is matches the
+// sentinel for Kind, errors.As finds a [*CompletionError] for completion
+// failures and an [*InvalidStructuredOutputError] carrying Violations for
+// structured-output failures, and other errors keep their message only.
 type RunFailure struct {
 	Message    string
 	Kind       FailureKind
 	StopReason StopReason
 	RawReason  string
+	// Violations are the schema violations of the last rejected structured
+	// payload, for the invalid-structured-output kinds.
+	Violations []string
 }
 
 // AttentionKind identifies the reason a durable run cannot continue normally.
@@ -233,39 +292,49 @@ type RunAccounting struct {
 }
 
 type definitionBinding struct {
-	revision string
-	agent    *Agent
-	source   *Agent
+	agent  *Agent
+	source *Agent
 }
 
 type storedRuntimeRun struct {
-	Version            int              `json:"version"`
-	RunID              string           `json:"run_id"`
-	DefinitionID       string           `json:"definition_id"`
-	DefinitionRevision string           `json:"definition_revision"`
-	Task               string           `json:"task"`
-	Deadline           time.Time        `json:"deadline,omitempty"`
-	State              RuntimeState     `json:"state"`
+	Version            int          `json:"version"`
+	RunID              string       `json:"run_id"`
+	DefinitionID       string       `json:"definition_id"`
+	DefinitionRevision string       `json:"definition_revision"`
+	Task               string       `json:"task"`
+	Deadline           time.Time    `json:"deadline,omitempty"`
+	State              RuntimeState `json:"state"`
+	// Generation is the run's state version. Every state transition
+	// increments it, and generation-guarded writes (attention, stale-worker
+	// checks) compare it inside their transaction. It is not a write
+	// counter: budget charges and the attempt, hook-delivery, and payload
+	// markers leave it unchanged, so every writer re-reads the record inside
+	// its transaction rather than trusting a cached generation.
 	Generation         uint64           `json:"generation"`
 	Result             RunResult        `json:"result"`
 	TranscriptChunks   int              `json:"transcript_chunks"`
 	TranscriptMessages int              `json:"transcript_messages"`
 	Error              string           `json:"error,omitempty"`
-	ErrorKind          string           `json:"error_kind,omitempty"`
+	ErrorKind          FailureKind      `json:"error_kind,omitempty"`
 	ErrorStopReason    StopReason       `json:"error_stop_reason,omitempty"`
 	ErrorRawReason     string           `json:"error_raw_reason,omitempty"`
+	ErrorViolations    []string         `json:"error_violations,omitempty"`
 	LastTransition     string           `json:"last_transition,omitempty"`
 	EffectiveTools     []string         `json:"effective_tools,omitempty"`
 	AttentionReason    string           `json:"attention_reason,omitempty"`
-	AttentionKind      string           `json:"attention_kind,omitempty"`
+	AttentionKind      AttentionKind    `json:"attention_kind,omitempty"`
 	HookResults        []RunHookResult  `json:"hook_results,omitempty"`
 	PendingBatchID     string           `json:"pending_batch_id,omitempty"`
 	NextBatchOrdinal   int              `json:"next_batch_ordinal,omitempty"`
 	ToolBudget         storedToolBudget `json:"tool_budget"`
 	// ParentRunID and ParentOperationID identify the parent run and durable
 	// invocation that admitted this child. They are empty on ordinary runs.
+	// ParentTool and ParentCallID name the parent's tool call; they tag the
+	// child's provisional events in the parent's live views.
 	ParentRunID       string `json:"parent_run_id,omitempty"`
 	ParentOperationID string `json:"parent_operation_id,omitempty"`
+	ParentTool        string `json:"parent_tool,omitempty"`
+	ParentCallID      string `json:"parent_call_id,omitempty"`
 	// ConversationScope and ConversationID name the durable conversation this
 	// run is a turn of. Both are empty on ordinary runs.
 	ConversationScope string `json:"conversation_scope,omitempty"`
@@ -307,6 +376,10 @@ type storedRuntimeRun struct {
 	Waits                    []WaitSnapshot      `json:"-"`
 	Tree                     TreeAccounting      `json:"-"`
 	EventSequence            uint64              `json:"-"`
+}
+
+func (record storedRuntimeRun) definition() DefinitionRef {
+	return DefinitionRef{ID: record.DefinitionID, Revision: record.DefinitionRevision}
 }
 
 // admissionPayload is the canonical admission identity payload. Its JSON
@@ -356,6 +429,15 @@ type admissionRecord struct {
 type liveRuntimeRun struct {
 	cancel  context.CancelFunc
 	restart bool
+	// ancestors are the run's parent chain, nearest first, while its worker
+	// forwards provisional events to their live views.
+	ancestors []streamAncestor
+}
+
+// streamAncestor is one hop of a child run's parent chain: the ancestor run
+// and the tool call through which the chain descends from it.
+type streamAncestor struct {
+	runID, tool, callID string
 }
 
 type runtimeStreamItem struct {
@@ -363,9 +445,11 @@ type runtimeStreamItem struct {
 	terminal bool
 }
 
-// Runtime owns durable admission, transitions, and worker lifetime. Execution
-// currently uses loopMachine as its internal driver; that implementation is
-// replaceable and is not a separate public lifecycle.
+// Runtime runs registered [Agent] definitions. It admits each task durably
+// before any work, owns worker lifetimes independently of callers, persists
+// every transition, and recovers after restart. It is the only way to execute
+// an Agent. Construct it with [NewRuntime] and a [Store], or with
+// [NewEphemeralRuntime] when losing runs on process exit is intended.
 type Runtime struct {
 	store   Store
 	storeMu sync.RWMutex
@@ -392,6 +476,11 @@ type Runtime struct {
 	driver      *runtimeDriver
 }
 
+// NewRuntime opens a runtime on config.Store. Storage that cannot be opened
+// or holds an unsupported encoding fails construction; Runtime never falls
+// back to memory. The runtime owns the store and closes it in [Runtime.Close].
+// Call [Runtime.Recover] after registering definitions to resume work a
+// previous process left.
 func NewRuntime(ctx context.Context, config RuntimeConfig) (*Runtime, error) {
 	if config.Store == nil {
 		return nil, fmt.Errorf("runtime store is required")
@@ -474,8 +563,12 @@ func (r *Runtime) transaction(ctx context.Context, writable bool, fn func(StoreT
 	return err
 }
 
-func NewEphemeralRuntime(hooks ...CommittedRunHook) (*Runtime, error) {
-	return NewRuntime(context.Background(), RuntimeConfig{Store: newEphemeralStore(), Hooks: hooks})
+// NewEphemeralRuntime returns a runtime on a fresh in-memory store, for tests,
+// scripts, and runs whose loss on process exit is intended. It has the same
+// lifecycle as a persistent runtime; only its storage is volatile. Use
+// NewRuntime with [NewMemoryStore] to configure hooks or an authorizer.
+func NewEphemeralRuntime() (*Runtime, error) {
+	return NewRuntime(context.Background(), RuntimeConfig{Store: NewMemoryStore()})
 }
 
 func (r *Runtime) initialize(ctx context.Context) error {
@@ -499,100 +592,100 @@ func (r *Runtime) initialize(ctx context.Context) error {
 	})
 }
 
-// Register binds an immutable executable Agent to a persisted definition
-// identity and revision. Re-registering the exact same Agent is idempotent;
-// substituting another binding under the same identity is rejected.
-func (r *Runtime) Register(definitionID, revision string, agent *Agent) error {
+// Register binds an immutable Agent to a definition ID and revision and
+// returns the reference that runs, child tools, and conversations pin. The
+// revision is a host attestation: register a new revision whenever the
+// Agent's behavior changes. Re-registering the same Agent is idempotent;
+// another Agent under the same ID and revision returns
+// [ErrDefinitionConflict]. Register every definition a store's runs pin
+// before calling [Runtime.Recover].
+func (r *Runtime) Register(definitionID, revision string, agent *Agent) (DefinitionRef, error) {
+	ref := DefinitionRef{ID: definitionID, Revision: revision}
 	if definitionID == "" || revision == "" || agent == nil || strings.ContainsRune(definitionID, '\x00') || strings.ContainsRune(revision, '\x00') {
-		return fmt.Errorf("definition id, revision, and agent are required")
+		return DefinitionRef{}, fmt.Errorf("definition id, revision, and agent are required")
 	}
 	for _, tool := range agent.tools {
 		policy, configured, err := waitPolicyFor(tool)
 		if err != nil {
-			return err
+			return DefinitionRef{}, err
 		}
 		if configured && policy.Kind == WaitApproval && r.authorizer == nil {
-			return errors.New("durable approval requires a runtime authorizer")
+			return DefinitionRef{}, errors.New("durable approval requires a runtime authorizer")
 		}
 		name := ""
 		if tool != nil {
 			name = tool.Definition().Name
 		}
-		inspection, err := inspectChildTool(tool)
+		isChild, err := isChildTool(tool)
 		if err != nil {
-			return fmt.Errorf("tool %q: %w", name, err)
+			return DefinitionRef{}, fmt.Errorf("tool %q: %w", name, err)
 		}
-		// Durable child declarations are validated structurally here; the
-		// pinned child binding itself is checked fail-closed at admission.
-		if inspection.hasChild {
-			// Process-local authority cannot be persisted with the child
-			// admission, so a parent that intercepts calls with an Approver or
-			// gates them with a per-call timeout/rate limiter cannot honestly
-			// enforce those controls on durable child invocations. The child
-			// run instead inherits the parent deadline and enforces its own
-			// registered policy locally. Richer parent-side policy support is
-			// later scope, not silently skipped enforcement.
-			if agent.approver != nil && agent.approver != AllowAll {
-				return fmt.Errorf("tool %q: durable child tools do not support process-local approver interception; use Runtime approvals or a child definition without an Approver", name)
-			}
+		// Child declarations are validated structurally here; the pinned
+		// child binding itself is checked fail-closed at admission.
+		if isChild {
+			// A per-call timeout or rate limiter cannot honestly bound a
+			// durable child run that outlives the parent's worker. The child
+			// inherits the parent deadline and enforces its own policy.
 			limits := agent.toolPolicy.limitsFor(name)
 			if limits.Timeout > 0 || limits.RateLimiter != nil {
-				return fmt.Errorf("tool %q: durable child tools do not support per-call timeout or rate limiting; the child run inherits the parent deadline and enforces its own policy locally", name)
+				return DefinitionRef{}, fmt.Errorf("tool %q: child tools do not support per-call timeout or rate limiting; the child run inherits the parent deadline and enforces its own policy locally", name)
 			}
-		}
-		if inspection.transientAdapter {
-			return fmt.Errorf("tool %q: process-local child adapters (AsTool/AsToolFunc) cannot be registered on a durable runtime; declare the child with DurableChildTool and register its definition", name)
 		}
 	}
 	key := bindingKey(definitionID, revision)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.closing || r.closed {
-		return ErrRuntimeClosed
+		return DefinitionRef{}, ErrRuntimeClosed
 	}
 	if existing, ok := r.bindings[key]; ok {
 		if existing.source == agent {
-			return nil
+			return ref, nil
 		}
-		return ErrDefinitionConflict
+		return DefinitionRef{}, ErrDefinitionConflict
 	}
-	r.bindings[key] = definitionBinding{revision: revision, agent: cloneAgentDefinition(agent), source: agent}
-	return nil
+	r.bindings[key] = definitionBinding{agent: cloneAgentDefinition(agent), source: agent}
+	return ref, nil
 }
 
 func cloneAgentDefinition(agent *Agent) *Agent {
 	frozen := *agent
 	frozen.tools = append([]Tool(nil), agent.tools...)
-	frozen.defaultCallOptions = cloneCallOptions(agent.defaultCallOptions)
+	frozen.callOptions = cloneCallOptions(agent.callOptions)
 	frozen.toolPolicy = agent.toolPolicy.clone()
 	frozen.preSendHooks = append([]PreSendHook(nil), agent.preSendHooks...)
-	frozen.observers = append([]RunObserver(nil), agent.observers...)
 	return &frozen
 }
 
 func bindingKey(id, revision string) string { return id + "\x00" + revision }
 
-func (r *Runtime) Submit(ctx context.Context, definitionID, revision, task string, options SubmitOptions) (*RunHandle, error) {
-	return r.submit(ctx, definitionID, revision, task, options, true)
+// Submit durably admits task as a new run of the registered definition and
+// starts it. It returns once admission commits; ctx bounds only admission.
+// The run continues after the caller disconnects: use the returned handle to
+// await, observe, answer, cancel, or reconcile it.
+func (r *Runtime) Submit(ctx context.Context, definition DefinitionRef, task string, opts ...SubmitOption) (*RunHandle, error) {
+	return r.submit(ctx, definition, task, opts, true)
 }
 
-func (r *Runtime) submit(ctx context.Context, definitionID, revision, task string, options SubmitOptions, start bool) (*RunHandle, error) {
+func (r *Runtime) submit(ctx context.Context, definition DefinitionRef, task string, opts []SubmitOption, start bool) (*RunHandle, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	if task == "" {
 		return nil, fmt.Errorf("task is required")
 	}
-	if (options.Scope == "") != (options.Key == "") {
-		return nil, fmt.Errorf("submission scope and key must be supplied together")
+	options, err := resolveSubmitOptions(opts)
+	if err != nil {
+		return nil, err
 	}
+	definitionID, revision := definition.ID, definition.Revision
 	if strings.ContainsRune(options.Scope, '\x00') || strings.ContainsRune(options.Key, '\x00') {
 		return nil, fmt.Errorf("submission scope and key cannot contain NUL")
 	}
 	if err := validateConversationOptions(options.Conversation); err != nil {
 		return nil, err
 	}
-	binding, err := r.binding(definitionID, revision)
+	binding, err := r.binding(definition)
 	if err != nil {
 		return nil, err
 	}
@@ -685,19 +778,21 @@ func newRuntimeID() string {
 	return hex.EncodeToString(id[:])
 }
 
-func (r *Runtime) binding(id, revision string) (definitionBinding, error) {
+func (r *Runtime) binding(ref DefinitionRef) (definitionBinding, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.closing || r.closed {
 		return definitionBinding{}, ErrRuntimeClosed
 	}
-	binding, ok := r.bindings[bindingKey(id, revision)]
+	binding, ok := r.bindings[bindingKey(ref.ID, ref.Revision)]
 	if !ok {
 		return definitionBinding{}, ErrDefinitionNotRegistered
 	}
 	return binding, nil
 }
 
+// Handle returns a handle for a run admitted earlier, by this process or a
+// previous one. Operations on an unknown run return [ErrRunNotFound].
 func (r *Runtime) Handle(runID string) *RunHandle {
 	return &RunHandle{runtime: r, runID: runID}
 }
@@ -774,7 +869,7 @@ func (r *Runtime) recoverRecord(ctx context.Context, record storedRuntimeRun) er
 	case RuntimeReady:
 		// Without its binding, admitted work stays ready so registration
 		// followed by another recovery pass can make progress.
-		if _, err := r.binding(record.DefinitionID, record.DefinitionRevision); err == nil {
+		if _, err := r.binding(record.definition()); err == nil {
 			r.start(record.RunID)
 		}
 	case RuntimeWaiting:
@@ -811,11 +906,11 @@ func (r *Runtime) recoverRecord(ctx context.Context, record storedRuntimeRun) er
 			return err
 		}
 	case RuntimeNeedsAttention:
-		if record.AttentionKind == "provider" {
+		if record.AttentionKind == AttentionProvider {
 			// A raised ProviderRecovery bound applies on the next pass.
 			return r.recoverProviderAttempt(ctx, record)
 		}
-		if record.AttentionKind == "child" {
+		if record.AttentionKind == AttentionChild {
 			// A parent blocked on child attention is still suspended: its
 			// logical deadline applies as for a waiting run, and a later
 			// clean child completion can unblock ordinary continuation
@@ -825,7 +920,7 @@ func (r *Runtime) recoverRecord(ctx context.Context, record storedRuntimeRun) er
 			}
 			return r.armSuspended(ctx, record.RunID)
 		}
-		if record.AttentionKind != "execution" || !r.payloadFits(record) {
+		if record.AttentionKind != AttentionExecution || !r.payloadFits(record) {
 			return nil
 		}
 		// Execution attention resumes from its last committed transition
@@ -852,7 +947,7 @@ func (r *Runtime) recoverRecord(ctx context.Context, record storedRuntimeRun) er
 			// parent or advances a conversation as usual.
 			return r.completeRunHooks(record.RunID)
 		}
-		return r.markAttentionKind(ctx, record.RunID, record.Generation, "hooks", "previous owner stopped while delivering committed-run hooks; delivery outcome is unknown")
+		return r.markAttentionKind(ctx, record.RunID, record.Generation, AttentionHooks, "previous owner stopped while delivering committed-run hooks; delivery outcome is unknown")
 	}
 	return nil
 }
@@ -901,7 +996,7 @@ func (r *Runtime) markPayloadAttention(ctx context.Context, runID string, cause 
 			terminal = true
 		} else {
 			record.State = RuntimeNeedsAttention
-			record.AttentionKind = "execution"
+			record.AttentionKind = AttentionExecution
 			record.AttentionReason = cause.Error()
 		}
 		record.Generation++
@@ -980,7 +1075,7 @@ func (r *Runtime) recoverProviderAttempt(ctx context.Context, scanned storedRunt
 			ready = true
 		} else if record.State == RuntimeRunning {
 			record.State = RuntimeNeedsAttention
-			record.AttentionKind = "provider"
+			record.AttentionKind = AttentionProvider
 			record.AttentionReason = "previous owner stopped during execution: a provider attempt may have been sent and its outcome and usage are unknown"
 		} else {
 			return nil
@@ -1067,7 +1162,7 @@ func (r *Runtime) execute(workerCtx context.Context, runID string) {
 	r.mu.Lock()
 	delete(r.failures, runID)
 	r.mu.Unlock()
-	binding, err := r.binding(record.DefinitionID, record.DefinitionRevision)
+	binding, err := r.binding(record.definition())
 	if err != nil {
 		if markErr := r.markAttention(context.Background(), runID, record.Generation, err.Error()); markErr != nil {
 			r.setFailure(runID, errors.Join(err, markErr))
@@ -1095,15 +1190,12 @@ func (r *Runtime) execute(workerCtx context.Context, runID string) {
 		r.setFailure(runID, err)
 		return
 	}
-	cfg := binding.agent.newRunConfig(nil)
+	cfg := binding.agent.newRunConfig()
 	// Restore the persisted correction-turn count so a restarted correction
 	// continues the original budget rather than resetting it.
 	if cfg.structuredOutput != nil {
 		cfg.structuredOutput.correctionsUsed = record.Corrections
 	}
-	// Runtime observation is attached through RunHandle. Agent observers are
-	// synchronous direct-run instrumentation and do not participate here.
-	cfg.observers = nil
 	cfg.resume = record.TranscriptMessages > 0
 	cfg.resumeTools = append([]string(nil), record.EffectiveTools...)
 	var transitionErr error
@@ -1114,28 +1206,22 @@ func (r *Runtime) execute(workerCtx context.Context, runID string) {
 		}
 		return err
 	}
-	cfg.durableBatch = func(ctx context.Context, l *loop, calls []ToolUseBlock, messages []Message, policy *toolPolicyState) ([]Message, error) {
-		return r.executeDurableToolBatch(ctx, runID, l, calls, messages, policy)
+	cfg.durableBatch = func(ctx context.Context, l *loop, calls []ToolUseBlock) ([]Message, error) {
+		return r.executeDurableToolBatch(ctx, runID, l, calls, binding.agent.toolPolicy)
 	}
 	history := record.Result.Messages
-	scope, beginErr := binding.agent.beginRunWithID(execCtx, cfg, history, nil, "runtime", runID)
-	if beginErr != nil {
-		result, finishErr := scope.finalize(scope.result, beginErr)
+	scope := &runScope{id: runID, result: cloneRunResult(record.Result),
+		turns: record.Result.Turns, providerAttempts: record.Result.ProviderAttempts, usage: record.Result.Usage}
+	scope.result.Messages = cloneMessages(history)
+	if err := binding.agent.validateRun(cfg); err != nil {
+		result, finishErr := scope.finalize(scope.result, err)
 		if commitErr := r.completeExecution(runID, result, finishErr, workerCtx.Err()); commitErr != nil {
 			r.setFailure(runID, commitErr)
 		}
 		return
 	}
-	scope.result = cloneRunResult(record.Result)
-	scope.result.Messages = cloneMessages(history)
-	scope.turns = record.Result.Turns
-	scope.providerAttempts = record.Result.ProviderAttempts
-	scope.usage = record.Result.Usage
-	scope.checkpointMessages = cloneMessages(history)
-	scope.ctx = scope.policy.withDurableBudget(scope.ctx, func() (toolBudgetUsage, error) {
-		return r.reserveNestedCall(runID)
-	})
 	cfg.scope = scope
+	r.attachAncestors(workerCtx, record)
 	result := cloneRunResult(record.Result)
 	var runErr error
 	if record.LastTransition == "batch_committed" && record.Error != "" {
@@ -1143,7 +1229,7 @@ func (r *Runtime) execute(workerCtx context.Context, runID string) {
 		// stopped. Only finalization remains; do not ask the provider to continue.
 		runErr = snapshotError(snapshotFromRecord(record))
 	} else {
-		result, runErr = binding.agent.runStream(scope.ctx, newLoop(binding.agent, history), record.Task, func(event StreamEvent) {
+		result, runErr = binding.agent.runStream(execCtx, newLoop(binding.agent, history), record.Task, func(event StreamEvent) {
 			r.publish(runID, event)
 		}, cfg)
 	}
@@ -1311,13 +1397,13 @@ func (r *Runtime) finishExecution(runID string, result RunResult, runErr, worker
 		case workerErr != nil:
 			record.State = RuntimeNeedsAttention
 			record.AttentionReason = "worker stopped during execution"
-			record.AttentionKind = "execution"
+			record.AttentionKind = AttentionExecution
 			if record.LastTransition == transitionProviderAttemptStarted {
 				// The stopped attempt may have reached the provider: its outcome
 				// and usage are unknown, exactly as after a crash, and the same
 				// recovery policy decides whether a fresh attempt may follow.
 				record.AttentionReason = "worker stopped during execution: a provider attempt may have been sent and its outcome and usage are unknown"
-				record.AttentionKind = "provider"
+				record.AttentionKind = AttentionProvider
 				record.UnknownAttempts++
 			}
 			setRuntimeError(&record, runErr)
@@ -1413,7 +1499,7 @@ func (r *Runtime) markAttentionWithResult(ctx context.Context, runID string, res
 			if !strings.Contains(reason, err.Error()) {
 				reason += ": " + err.Error()
 			}
-			record.Result.Turns, record.Result.Steps = result.Turns, result.Steps
+			record.Result.Turns = result.Turns
 			record.Result.ProviderAttempts, record.Result.Usage = result.ProviderAttempts, result.Usage
 		} else if err != nil {
 			return err
@@ -1442,7 +1528,7 @@ func (r *Runtime) markAttentionWithResult(ctx context.Context, runID string, res
 		} else {
 			record.State = RuntimeNeedsAttention
 			record.AttentionReason = reason
-			record.AttentionKind = "execution"
+			record.AttentionKind = AttentionExecution
 		}
 		record.Generation++
 		committed = record
@@ -1468,9 +1554,11 @@ func errorString(err error) string {
 func setRuntimeError(record *storedRuntimeRun, err error) {
 	failure := failureFromError(err)
 	record.Error, record.ErrorKind, record.ErrorStopReason, record.ErrorRawReason = "", "", "", ""
+	record.ErrorViolations = nil
 	if failure != nil {
-		record.Error, record.ErrorKind = failure.Message, string(failure.Kind)
+		record.Error, record.ErrorKind = failure.Message, failure.Kind
 		record.ErrorStopReason, record.ErrorRawReason = failure.StopReason, failure.RawReason
+		record.ErrorViolations = failure.Violations
 	}
 }
 
@@ -1479,17 +1567,20 @@ func failureFromError(err error) *RunFailure {
 		return nil
 	}
 	failure := &RunFailure{Message: err.Error()}
+	if invalid, ok := errors.AsType[*InvalidStructuredOutputError](err); ok {
+		failure.Violations = append([]string(nil), invalid.Violations...)
+	}
 	switch {
 	case errors.Is(err, context.DeadlineExceeded):
 		failure.Kind = FailureDeadline
 	case errors.Is(err, context.Canceled):
 		failure.Kind = FailureCancelled
-	case errors.Is(err, ErrMaxStepsExceeded) && errors.Is(err, ErrInvalidStructuredOutput):
-		failure.Kind = FailureMaxStepsInvalidStructuredOutput
-	case errors.Is(err, ErrMaxStepsExceeded):
-		failure.Kind = FailureMaxSteps
-	case errors.Is(err, ErrInvalidMaxSteps):
-		failure.Kind = FailureInvalidMaxSteps
+	case errors.Is(err, ErrMaxTurnsExceeded) && errors.Is(err, ErrInvalidStructuredOutput):
+		failure.Kind = FailureMaxTurnsInvalidStructuredOutput
+	case errors.Is(err, ErrMaxTurnsExceeded):
+		failure.Kind = FailureMaxTurns
+	case errors.Is(err, ErrInvalidMaxTurns):
+		failure.Kind = FailureInvalidMaxTurns
 	case errors.Is(err, ErrEmptyResponse):
 		failure.Kind = FailureEmptyResponse
 	case errors.Is(err, ErrInvalidStructuredOutput):
@@ -1526,10 +1617,10 @@ func (r *Runtime) failure(runID string) error {
 }
 
 func (r *Runtime) markAttention(ctx context.Context, runID string, generation uint64, reason string) error {
-	return r.markAttentionKind(ctx, runID, generation, "execution", reason)
+	return r.markAttentionKind(ctx, runID, generation, AttentionExecution, reason)
 }
 
-func (r *Runtime) markAttentionKind(ctx context.Context, runID string, generation uint64, kind, reason string) error {
+func (r *Runtime) markAttentionKind(ctx context.Context, runID string, generation uint64, kind AttentionKind, reason string) error {
 	var childOf string
 	err := r.transaction(ctx, true, func(tx StoreTransaction) error {
 		record, err := getRuntimeRun(tx, runID)
@@ -1557,14 +1648,64 @@ func (r *Runtime) markAttentionKind(ctx context.Context, runID string, generatio
 	return err
 }
 
+// publish delivers a provisional event to the run's live views and, for a
+// child run, to its ancestors' views. At each hop an untagged event is
+// tagged with the tool name and call ID through which the chain descends, so
+// the innermost tag wins.
 func (r *Runtime) publish(runID string, event StreamEvent) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.deliver(runID, event)
+	for _, hop := range r.live[runID].ancestors {
+		if event.Agent == "" {
+			event.Agent = hop.tool
+		}
+		if event.InvocationID == "" {
+			event.InvocationID = hop.callID
+		}
+		r.deliver(hop.runID, event)
+	}
+}
+
+func (r *Runtime) deliver(runID string, event StreamEvent) {
 	for _, ch := range r.subscribers[runID] {
 		select {
 		case ch <- runtimeStreamItem{event: cloneStreamEvent(event)}:
 		default:
 		}
+	}
+}
+
+// maxStreamAncestors bounds the parent chain a child's worker forwards
+// provisional events through.
+const maxStreamAncestors = 64
+
+// attachAncestors records a child run's parent chain on its live worker so
+// publish can forward provisional events to ancestor views. The chain comes
+// from compact committed records, so it is rebuilt after a restart. A read
+// failure only disables forwarding: live views are provisional.
+func (r *Runtime) attachAncestors(ctx context.Context, record storedRuntimeRun) {
+	if record.ParentRunID == "" {
+		return
+	}
+	var ancestors []streamAncestor
+	_ = r.transaction(ctx, false, func(tx StoreTransaction) error {
+		current := record
+		for current.ParentRunID != "" && len(ancestors) < maxStreamAncestors {
+			ancestors = append(ancestors, streamAncestor{runID: current.ParentRunID, tool: current.ParentTool, callID: current.ParentCallID})
+			parent, err := getRuntimeRun(tx, current.ParentRunID)
+			if err != nil {
+				return err
+			}
+			current = parent
+		}
+		return nil
+	})
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if live, ok := r.live[record.RunID]; ok {
+		live.ancestors = ancestors
+		r.live[record.RunID] = live
 	}
 }
 
@@ -1610,16 +1751,26 @@ func (r *Runtime) subscribe(runID string) (<-chan runtimeStreamItem, func()) {
 	}
 }
 
-func (r *Runtime) Run(ctx context.Context, definitionID, revision, task string, options SubmitOptions) (RunResult, error) {
-	h, err := r.Submit(ctx, definitionID, revision, task, options)
+// Run is [Runtime.Submit] followed by [RunHandle.Await]. Canceling ctx stops
+// the wait, not the run: the returned result carries the run ID, so the
+// caller can reattach with [Runtime.Handle].
+func (r *Runtime) Run(ctx context.Context, definition DefinitionRef, task string, opts ...SubmitOption) (RunResult, error) {
+	h, err := r.Submit(ctx, definition, task, opts...)
 	if err != nil {
 		return RunResult{}, err
 	}
 	return h.Await(ctx)
 }
 
-func (r *Runtime) RunStream(ctx context.Context, definitionID, revision, task string, onEvent func(StreamEvent), options SubmitOptions) (RunResult, error) {
-	h, err := r.submit(ctx, definitionID, revision, task, options, false)
+// RunStream is [Runtime.Run] with a live view: onEvent receives the run's
+// provisional events (text and thinking deltas, tool calls and results,
+// usage), including those of its child runs tagged with [StreamEvent].Agent
+// and InvocationID. Calls to onEvent are serialized. The view is bounded and
+// drops events rather than slowing the run; committed facts stay replayable
+// through [RunHandle.Events]. Canceling ctx detaches the view without
+// canceling the run. A nil onEvent is a no-op.
+func (r *Runtime) RunStream(ctx context.Context, definition DefinitionRef, task string, onEvent func(StreamEvent), opts ...SubmitOption) (RunResult, error) {
+	h, err := r.submit(ctx, definition, task, opts, false)
 	if err != nil {
 		return RunResult{}, err
 	}
@@ -1651,6 +1802,10 @@ func (r *Runtime) RunStream(ctx context.Context, definitionID, revision, task st
 	return snapshot.Result, err
 }
 
+// Close stops the runtime: it cancels worker contexts, waits for workers to
+// yield at a safe boundary, stops the background driver, and closes the
+// store. A run interrupted mid-segment is recovered by the next process's
+// [Runtime.Recover]; closing never cancels a run logically.
 func (r *Runtime) Close() error {
 	r.mu.Lock()
 	if r.closed {
@@ -1684,11 +1839,15 @@ func (r *Runtime) Close() error {
 	return err
 }
 
+// RunHandle addresses one durable run. It holds no resources: handles are
+// cheap, and any number of them may address the same run, including from
+// [Runtime.Handle] after a restart.
 type RunHandle struct {
 	runtime *Runtime
 	runID   string
 }
 
+// ID returns the run's stable identity.
 func (h *RunHandle) ID() string { return h.runID }
 
 // Snapshot returns the authoritative committed view of the run, including
@@ -1882,6 +2041,10 @@ func resultWithRunID(result RunResult, runID string) RunResult {
 	return result
 }
 
+// Cancel durably cancels the run and every non-terminal descendant in one
+// commit. A suspended run becomes terminal at once; a running one stops
+// dispatching and finishes as canceled. An exact retry returns the original
+// outcome, even after a lost acknowledgement or later transitions.
 func (h *RunHandle) Cancel(ctx context.Context) error {
 	var cancels []context.CancelFunc
 	var canceledChild string
@@ -1995,7 +2158,7 @@ func (h *RunHandle) AcknowledgeHooks(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		if record.State != RuntimeNeedsAttention || record.AttentionKind != "hooks" {
+		if record.State != RuntimeNeedsAttention || record.AttentionKind != AttentionHooks {
 			return fmt.Errorf("run %s is not awaiting hook acknowledgement (state %s)", h.runID, record.State)
 		}
 		record.HookResults = record.HookResults[:0]
@@ -2237,7 +2400,7 @@ func snapshotFromRecord(record storedRuntimeRun) RunSnapshot {
 	}
 	snapshot.Failure = failureFromRecord(record)
 	if record.State == RuntimeNeedsAttention {
-		snapshot.Attention = &RunAttention{Kind: AttentionKind(record.AttentionKind), Reason: record.AttentionReason}
+		snapshot.Attention = &RunAttention{Kind: record.AttentionKind, Reason: record.AttentionReason}
 		if snapshot.Attention.Kind == AttentionChild {
 			// The persisted reason names the blocking child. Match it against a
 			// pending child wait, rather than trusting an arbitrary string as an ID.
@@ -2257,7 +2420,8 @@ func failureFromRecord(record storedRuntimeRun) *RunFailure {
 	if record.Error == "" && record.ErrorKind == "" {
 		return nil
 	}
-	return &RunFailure{Message: record.Error, Kind: FailureKind(record.ErrorKind), StopReason: record.ErrorStopReason, RawReason: record.ErrorRawReason}
+	return &RunFailure{Message: record.Error, Kind: record.ErrorKind, StopReason: record.ErrorStopReason,
+		RawReason: record.ErrorRawReason, Violations: append([]string(nil), record.ErrorViolations...)}
 }
 
 func snapshotError(snapshot RunSnapshot) error {
@@ -2270,18 +2434,26 @@ func snapshotError(snapshot RunSnapshot) error {
 		return context.DeadlineExceeded
 	case FailureCancelled:
 		return context.Canceled
-	case FailureMaxSteps:
-		return fmt.Errorf("%s: %w", failure.Message, ErrMaxStepsExceeded)
-	case FailureMaxStepsInvalidStructuredOutput:
-		return fmt.Errorf("%s: %w", failure.Message, errors.Join(ErrMaxStepsExceeded, ErrInvalidStructuredOutput))
-	case FailureInvalidMaxSteps:
-		return fmt.Errorf("%s: %w", failure.Message, ErrInvalidMaxSteps)
+	case FailureMaxTurns:
+		return fmt.Errorf("%s: %w", failure.Message, ErrMaxTurnsExceeded)
+	case FailureMaxTurnsInvalidStructuredOutput:
+		invalid := &InvalidStructuredOutputError{Violations: append([]string(nil), failure.Violations...)}
+		return fmt.Errorf("%s: %w", failure.Message, errors.Join(ErrMaxTurnsExceeded, invalid))
+	case FailureInvalidMaxTurns:
+		return fmt.Errorf("%s: %w", failure.Message, ErrInvalidMaxTurns)
 	case FailureEmptyResponse:
 		return fmt.Errorf("%s: %w", failure.Message, ErrEmptyResponse)
 	case FailureInvalidStructuredOutput:
-		return fmt.Errorf("%s: %w", failure.Message, ErrInvalidStructuredOutput)
+		invalid := &InvalidStructuredOutputError{Violations: append([]string(nil), failure.Violations...)}
+		return fmt.Errorf("%s: %w", failure.Message, invalid)
 	case FailureCompletion:
-		return &CompletionError{Reason: failure.StopReason, RawReason: failure.RawReason}
+		completion := &CompletionError{Reason: failure.StopReason, RawReason: failure.RawReason}
+		// Restore the cause's text so the error reads as it did when the run
+		// failed; only its message survives persistence.
+		if cause, ok := strings.CutPrefix(failure.Message, completion.Error()+": "); ok {
+			completion.Cause = errors.New(cause)
+		}
+		return completion
 	}
 	if snapshot.Result.Status == RunCancelled {
 		return context.Canceled

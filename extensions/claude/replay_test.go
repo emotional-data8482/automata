@@ -25,7 +25,7 @@ func TestConvertReconciledFailureHistory(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			result, err := agent.Run(context.Background(), "go")
+			result, err := runTask(t, agent, "go", false)
 			if err == nil {
 				t.Fatal("incomplete response succeeded")
 			}
@@ -35,9 +35,6 @@ func TestConvertReconciledFailureHistory(t *testing.T) {
 			}
 			var restored []core.Message
 			if err := json.Unmarshal(data, &restored); err != nil {
-				t.Fatal(err)
-			}
-			if _, err := agent.ResumeSession(restored); err != nil {
 				t.Fatal(err)
 			}
 			restored = append(restored, core.UserMessage("continue"))
@@ -75,14 +72,11 @@ func TestMissingResponseArgumentsAreNotRepaired(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	result, err := agent.Run(context.Background(), "go")
+	result, err := runTask(t, agent, "go", false)
 	if err == nil || len(result.Diagnostics) == 0 {
 		t.Fatalf("accepted malformed response: %+v, %v", result, err)
 	}
 	if _, err := json.Marshal(result); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := agent.ResumeSession(result.Messages); err != nil {
 		t.Fatal(err)
 	}
 }

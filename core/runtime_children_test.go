@@ -14,7 +14,7 @@ import (
 )
 
 // childTestDefinition is a minimal valid input schema for a declared child
-// tool; DurableChildTool rejects unsupported or non-object schemas eagerly.
+// tool; NewChildTool rejects unsupported or non-object schemas at registration.
 func childTestDefinition(name string) ToolDefinition {
 	return ToolDefinition{
 		Name:        name,
@@ -46,7 +46,7 @@ func itoa(i int) string {
 
 // admitInTx runs admitChildRun inside its own writable transaction so tests
 // exercise the same atomic boundary the batch integration will share.
-func admitInTx(t *testing.T, runtime *Runtime, parent storedRuntimeRun, invocation storedToolInvocation, policy DurableChildPolicy, task string) (childAdmissionReceipt, error) {
+func admitInTx(t *testing.T, runtime *Runtime, parent storedRuntimeRun, invocation storedToolInvocation, policy DefinitionRef, task string) (childAdmissionReceipt, error) {
 	t.Helper()
 	var receipt childAdmissionReceipt
 	err := runtime.transaction(context.Background(), true, func(tx StoreTransaction) error {
@@ -106,15 +106,15 @@ func countLinks(t *testing.T, runtime *Runtime) int {
 
 func TestChildAdmissionIsIdempotentByParentOperation(t *testing.T) {
 	runtime := newTestRuntime(t)
-	if err := runtime.Register("agent", "v1", testAgent(&scriptedProvider{turns: []Message{asstText("parent")}})); err != nil {
+	if _, err := runtime.Register("agent", "v1", testAgent(&scriptedProvider{turns: []Message{asstText("parent")}})); err != nil {
 		t.Fatal(err)
 	}
-	if err := runtime.Register("child-def", "v1", testAgent(&scriptedProvider{turns: []Message{asstText("child")}})); err != nil {
+	if _, err := runtime.Register("child-def", "v1", testAgent(&scriptedProvider{turns: []Message{asstText("child")}})); err != nil {
 		t.Fatal(err)
 	}
 	parent := childTestParent()
 	invocation := childTestInvocation(parent.RunID, "0000000000000000", 0)
-	policy := DurableChildPolicy{DefinitionID: "child-def", Revision: "v1"}
+	policy := DefinitionRef{ID: "child-def", Revision: "v1"}
 
 	first, err := admitInTx(t, runtime, parent, invocation, policy, "research tea")
 	if err != nil {
@@ -171,14 +171,14 @@ func TestChildAdmissionIsIdempotentByParentOperation(t *testing.T) {
 
 func TestChildAdmissionDistinctOperationsCreateDistinctChildren(t *testing.T) {
 	runtime := newTestRuntime(t)
-	if err := runtime.Register("agent", "v1", testAgent(&scriptedProvider{})); err != nil {
+	if _, err := runtime.Register("agent", "v1", testAgent(&scriptedProvider{})); err != nil {
 		t.Fatal(err)
 	}
-	if err := runtime.Register("child-def", "v1", testAgent(&scriptedProvider{})); err != nil {
+	if _, err := runtime.Register("child-def", "v1", testAgent(&scriptedProvider{})); err != nil {
 		t.Fatal(err)
 	}
 	parent := childTestParent()
-	policy := DurableChildPolicy{DefinitionID: "child-def", Revision: "v1"}
+	policy := DefinitionRef{ID: "child-def", Revision: "v1"}
 
 	// Two operations that carry the same model call ID are distinct durable
 	// invocations: identity is the parent operation, not the call ID.
@@ -207,19 +207,19 @@ func TestChildAdmissionDistinctOperationsCreateDistinctChildren(t *testing.T) {
 
 func TestChildAdmissionConflictOnChangedPayload(t *testing.T) {
 	runtime := newTestRuntime(t)
-	if err := runtime.Register("agent", "v1", testAgent(&scriptedProvider{})); err != nil {
+	if _, err := runtime.Register("agent", "v1", testAgent(&scriptedProvider{})); err != nil {
 		t.Fatal(err)
 	}
-	if err := runtime.Register("child-def", "v1", testAgent(&scriptedProvider{})); err != nil {
+	if _, err := runtime.Register("child-def", "v1", testAgent(&scriptedProvider{})); err != nil {
 		t.Fatal(err)
 	}
 	parent := childTestParent()
 	invocation := childTestInvocation(parent.RunID, "0000000000000000", 0)
-	policy := DurableChildPolicy{DefinitionID: "child-def", Revision: "v1"}
+	policy := DefinitionRef{ID: "child-def", Revision: "v1"}
 	if _, err := admitInTx(t, runtime, parent, invocation, policy, "research tea"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := admitInTx(t, runtime, parent, invocation, DurableChildPolicy{DefinitionID: "other-def", Revision: "v1"}, "research tea"); !errors.Is(err, errChildAdmissionConflict) {
+	if _, err := admitInTx(t, runtime, parent, invocation, DefinitionRef{ID: "other-def", Revision: "v1"}, "research tea"); !errors.Is(err, errChildAdmissionConflict) {
 		t.Fatalf("changed definition = %v", err)
 	}
 	if _, err := admitInTx(t, runtime, parent, invocation, policy, "research coffee"); !errors.Is(err, errChildAdmissionConflict) {
@@ -237,15 +237,15 @@ func TestChildAdmissionConflictOnChangedPayload(t *testing.T) {
 
 func TestChildAdmissionRequiresRegisteredBinding(t *testing.T) {
 	runtime := newTestRuntime(t)
-	if err := runtime.Register("agent", "v1", testAgent(&scriptedProvider{})); err != nil {
+	if _, err := runtime.Register("agent", "v1", testAgent(&scriptedProvider{})); err != nil {
 		t.Fatal(err)
 	}
 	parent := childTestParent()
 	invocation := childTestInvocation(parent.RunID, "0000000000000000", 0)
-	if _, err := admitInTx(t, runtime, parent, invocation, DurableChildPolicy{DefinitionID: "missing", Revision: "v1"}, "task"); !errors.Is(err, ErrDefinitionNotRegistered) {
+	if _, err := admitInTx(t, runtime, parent, invocation, DefinitionRef{ID: "missing", Revision: "v1"}, "task"); !errors.Is(err, ErrDefinitionNotRegistered) {
 		t.Fatalf("missing binding = %v", err)
 	}
-	if _, err := admitInTx(t, runtime, parent, invocation, DurableChildPolicy{DefinitionID: "agent", Revision: "unregistered"}, "task"); !errors.Is(err, ErrDefinitionNotRegistered) {
+	if _, err := admitInTx(t, runtime, parent, invocation, DefinitionRef{ID: "agent", Revision: "unregistered"}, "task"); !errors.Is(err, ErrDefinitionNotRegistered) {
 		t.Fatalf("unregistered revision = %v", err)
 	}
 	if got := countChildRuns(t, runtime); got != 0 {
@@ -258,14 +258,14 @@ func TestChildAdmissionRequiresRegisteredBinding(t *testing.T) {
 
 func TestChildAdmissionRequiresCompleteIdentityAndTask(t *testing.T) {
 	runtime := newTestRuntime(t)
-	if err := runtime.Register("agent", "v1", testAgent(&scriptedProvider{})); err != nil {
+	if _, err := runtime.Register("agent", "v1", testAgent(&scriptedProvider{})); err != nil {
 		t.Fatal(err)
 	}
-	if err := runtime.Register("child-def", "v1", testAgent(&scriptedProvider{})); err != nil {
+	if _, err := runtime.Register("child-def", "v1", testAgent(&scriptedProvider{})); err != nil {
 		t.Fatal(err)
 	}
 	parent := childTestParent()
-	policy := DurableChildPolicy{DefinitionID: "child-def", Revision: "v1"}
+	policy := DefinitionRef{ID: "child-def", Revision: "v1"}
 
 	noBatch := childTestInvocation(parent.RunID, "", 0)
 	if _, err := admitInTx(t, runtime, parent, noBatch, policy, "task"); err == nil {
@@ -291,15 +291,15 @@ func TestChildAdmissionRequiresCompleteIdentityAndTask(t *testing.T) {
 
 func TestChildAdmissionRollbackPersistsNothing(t *testing.T) {
 	runtime := newTestRuntime(t)
-	if err := runtime.Register("agent", "v1", testAgent(&scriptedProvider{})); err != nil {
+	if _, err := runtime.Register("agent", "v1", testAgent(&scriptedProvider{})); err != nil {
 		t.Fatal(err)
 	}
-	if err := runtime.Register("child-def", "v1", testAgent(&scriptedProvider{})); err != nil {
+	if _, err := runtime.Register("child-def", "v1", testAgent(&scriptedProvider{})); err != nil {
 		t.Fatal(err)
 	}
 	parent := childTestParent()
 	invocation := childTestInvocation(parent.RunID, "0000000000000000", 0)
-	policy := DurableChildPolicy{DefinitionID: "child-def", Revision: "v1"}
+	policy := DefinitionRef{ID: "child-def", Revision: "v1"}
 
 	err := runtime.transaction(context.Background(), true, func(tx StoreTransaction) error {
 		if _, err := runtime.admitChildRun(tx, parent, invocation, policy, "research tea"); err != nil {
@@ -340,15 +340,15 @@ func TestChildAdmissionRollbackPersistsNothing(t *testing.T) {
 
 func TestChildWaitCannotBeResolvedByHost(t *testing.T) {
 	runtime := newTestRuntime(t)
-	if err := runtime.Register("agent", "v1", testAgent(&scriptedProvider{})); err != nil {
+	if _, err := runtime.Register("agent", "v1", testAgent(&scriptedProvider{})); err != nil {
 		t.Fatal(err)
 	}
-	if err := runtime.Register("child-def", "v1", testAgent(&scriptedProvider{})); err != nil {
+	if _, err := runtime.Register("child-def", "v1", testAgent(&scriptedProvider{})); err != nil {
 		t.Fatal(err)
 	}
 	parent := childTestParent()
 	invocation := childTestInvocation(parent.RunID, "0000000000000000", 0)
-	receipt, err := admitInTx(t, runtime, parent, invocation, DurableChildPolicy{DefinitionID: "child-def", Revision: "v1"}, "research tea")
+	receipt, err := admitInTx(t, runtime, parent, invocation, DefinitionRef{ID: "child-def", Revision: "v1"}, "research tea")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -388,38 +388,38 @@ func TestRuntimeRejectsVersion6Store(t *testing.T) {
 
 // --- registration boundary ---------------------------------------------------
 
-func TestRegisterValidatesDurableChildTool(t *testing.T) {
+func TestRegisterValidatesNewChildTool(t *testing.T) {
 	runtime := newTestRuntime(t)
-	if err := runtime.Register("agent", "v1", testAgent(&scriptedProvider{})); err != nil {
+	if _, err := runtime.Register("agent", "v1", testAgent(&scriptedProvider{})); err != nil {
 		t.Fatal(err)
 	}
 
 	agent := testAgent(&scriptedProvider{}).WithToolPolicy(ToolPolicy{MaxCalls: 2})
-	agent.RegisterTool(DurableChildTool(childTestDefinition("delegate"), DurableChildPolicy{DefinitionID: "agent", Revision: "v1"}))
-	if err := runtime.Register("parent", "v1", agent); err != nil {
+	agent.RegisterTool(NewChildTool(childTestDefinition("delegate"), DefinitionRef{ID: "agent", Revision: "v1"}))
+	if _, err := runtime.Register("parent", "v1", agent); err != nil {
 		t.Fatalf("valid durable child rejected: %v", err)
 	}
 
 	// legacyError adaptation preserves child metadata by delegation.
 	legacy := testAgent(&scriptedProvider{})
-	legacy.RegisterTool(WithLegacyToolErrors(DurableChildTool(childTestDefinition("delegate"), DurableChildPolicy{DefinitionID: "agent", Revision: "v1"})))
-	if err := runtime.Register("legacy-parent", "v1", legacy); err != nil {
+	legacy.RegisterTool(WithLegacyToolErrors(NewChildTool(childTestDefinition("delegate"), DefinitionRef{ID: "agent", Revision: "v1"})))
+	if _, err := runtime.Register("legacy-parent", "v1", legacy); err != nil {
 		t.Fatalf("legacyError-wrapped durable child rejected: %v", err)
 	}
 
 	invalidSchema := testAgent(&scriptedProvider{})
-	invalidSchema.RegisterTool(DurableChildTool(ToolDefinition{Name: "bad", InputSchema: json.RawMessage(`{"type":"array"}`)}, DurableChildPolicy{DefinitionID: "agent", Revision: "v1"}))
-	if err := runtime.Register("bad-schema", "v1", invalidSchema); err == nil || !strings.Contains(err.Error(), "input schema must be an object schema") {
+	invalidSchema.RegisterTool(NewChildTool(ToolDefinition{Name: "bad", InputSchema: json.RawMessage(`{"type":"array"}`)}, DefinitionRef{ID: "agent", Revision: "v1"}))
+	if _, err := runtime.Register("bad-schema", "v1", invalidSchema); err == nil || !strings.Contains(err.Error(), "input schema must be an object schema") {
 		t.Fatalf("invalid schema = %v", err)
 	}
 	unparsableSchema := testAgent(&scriptedProvider{})
-	unparsableSchema.RegisterTool(DurableChildTool(ToolDefinition{Name: "bad", InputSchema: json.RawMessage(`{`)}, DurableChildPolicy{DefinitionID: "agent", Revision: "v1"}))
-	if err := runtime.Register("bad-json", "v1", unparsableSchema); err == nil {
+	unparsableSchema.RegisterTool(NewChildTool(ToolDefinition{Name: "bad", InputSchema: json.RawMessage(`{`)}, DefinitionRef{ID: "agent", Revision: "v1"}))
+	if _, err := runtime.Register("bad-json", "v1", unparsableSchema); err == nil {
 		t.Fatal("unparsable schema was accepted")
 	}
 	missingPolicy := testAgent(&scriptedProvider{})
-	missingPolicy.RegisterTool(DurableChildTool(childTestDefinition("bad"), DurableChildPolicy{}))
-	if err := runtime.Register("bad-policy", "v1", missingPolicy); err == nil || !strings.Contains(err.Error(), "definition id and revision") {
+	missingPolicy.RegisterTool(NewChildTool(childTestDefinition("bad"), DefinitionRef{}))
+	if _, err := runtime.Register("bad-policy", "v1", missingPolicy); err == nil || !strings.Contains(err.Error(), "definition id and revision") {
 		t.Fatalf("missing policy identity = %v", err)
 	}
 }
@@ -428,7 +428,7 @@ func TestRegisterRejectsUnsafeDurableChildWrappers(t *testing.T) {
 	runtime := newTestRuntime(t)
 	build := func(wrap func(Tool) Tool) *Agent {
 		agent := testAgent(&scriptedProvider{})
-		agent.RegisterTool(wrap(DurableChildTool(childTestDefinition("delegate"), DurableChildPolicy{DefinitionID: "agent", Revision: "v1"})))
+		agent.RegisterTool(wrap(NewChildTool(childTestDefinition("delegate"), DefinitionRef{ID: "agent", Revision: "v1"})))
 		return agent
 	}
 	cases := []struct {
@@ -442,47 +442,16 @@ func TestRegisterRejectsUnsafeDurableChildWrappers(t *testing.T) {
 		{"wrapper order cannot hide the child", build(func(t Tool) Tool { return WithLegacyToolErrors(WithToolRetry(t, retry.Config{MaxAttempts: 2})) }), "cannot be retried"},
 	}
 	for _, tc := range cases {
-		if err := runtime.Register(tc.name, "v1", tc.agent); err == nil || !strings.Contains(err.Error(), tc.want) {
+		if _, err := runtime.Register(tc.name, "v1", tc.agent); err == nil || !strings.Contains(err.Error(), tc.want) {
 			t.Fatalf("%s: %v", tc.name, err)
 		}
 	}
 }
 
-func TestInspectChildToolDetectsTransientAdaptersThroughWrappers(t *testing.T) {
-	sub := testAgent(&scriptedProvider{})
-	direct := AsTool[struct{}](sub, "sub", "delegate")
-	rendered := AsToolFunc[struct{}](sub, "sub", "delegate", func(struct{}) string { return "task" })
-	wrapped := WithLegacyToolErrors(AsTool[struct{}](sub, "sub", "delegate"))
-	retryWrapped := WithToolRetry(WithLegacyToolErrors(direct), retry.Config{MaxAttempts: 2})
-	plain := Func("echo", "echo", func(context.Context, struct{}) (string, error) { return "ok", nil })
-	child := DurableChildTool(childTestDefinition("delegate"), DurableChildPolicy{DefinitionID: "child-def", Revision: "v1"})
-
-	for _, tool := range []Tool{direct, rendered, wrapped, retryWrapped} {
-		inspection, err := inspectChildTool(tool)
-		if err != nil {
-			t.Fatalf("%T: %v", tool, err)
-		}
-		if !inspection.transientAdapter || inspection.hasChild {
-			t.Fatalf("%T inspection = %#v", tool, inspection)
-		}
-	}
-	inspection, err := inspectChildTool(plain)
-	if err != nil || inspection.transientAdapter || inspection.hasChild {
-		t.Fatalf("plain tool inspection = %#v, %v", inspection, err)
-	}
-	inspection, err = inspectChildTool(child)
-	if err != nil || inspection.transientAdapter || !inspection.hasChild ||
-		inspection.child.DefinitionID != "child-def" || inspection.child.Revision != "v1" {
-		t.Fatalf("durable child inspection = %#v, %v", inspection, err)
-	}
-}
-
-// --- process-local boundary --------------------------------------------------
-
-func TestDurableChildToolExecuteFailsOutsideRuntime(t *testing.T) {
-	child := DurableChildTool(childTestDefinition("delegate"), DurableChildPolicy{DefinitionID: "child-def", Revision: "v1"})
+func TestChildToolIsNeverExecutedDirectly(t *testing.T) {
+	child := NewChildTool(childTestDefinition("delegate"), DefinitionRef{ID: "child-def", Revision: "v1"})
 	if _, err := child.Execute(context.Background(), json.RawMessage(`{}`)); err == nil ||
-		!strings.Contains(err.Error(), "only through Runtime admission") {
+		!strings.Contains(err.Error(), "never executed directly") {
 		t.Fatalf("execute outside runtime = %v", err)
 	}
 }
@@ -576,7 +545,7 @@ func stageWaitingParentWithTerminalChild(t *testing.T, runtime *Runtime, parentI
 	return childID
 }
 func newSharedChildDefinition(parent *Agent) {
-	parent.RegisterTool(DurableChildTool(childTestDefinition("delegate"), DurableChildPolicy{DefinitionID: "child", Revision: "v1"}))
+	parent.RegisterTool(NewChildTool(childTestDefinition("delegate"), DefinitionRef{ID: "child", Revision: "v1"}))
 }
 
 // A mixed batch suspends entirely on the child wait; after the child settles
@@ -596,13 +565,13 @@ func TestRuntimeDurableChildMixedBatchKeepsSiblingOrder(t *testing.T) {
 	parent.RegisterTool(extra)
 
 	runtime := newTestRuntime(t)
-	if err := runtime.Register("child", "v1", testAgent(&repeatingChildProvider{})); err != nil {
+	if _, err := runtime.Register("child", "v1", testAgent(&repeatingChildProvider{})); err != nil {
 		t.Fatal(err)
 	}
-	if err := runtime.Register("parent", "v1", parent); err != nil {
+	if _, err := runtime.Register("parent", "v1", parent); err != nil {
 		t.Fatal(err)
 	}
-	result, err := runtime.Run(context.Background(), "parent", "v1", "go", SubmitOptions{})
+	result, err := runtime.Run(context.Background(), DefinitionRef{ID: "parent", Revision: "v1"}, "go")
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -647,13 +616,13 @@ func TestRuntimeDurableChildSiblingsNotRerunAfterRestart(t *testing.T) {
 	parent.RegisterTool(denied)
 
 	runtime := newTestRuntime(t)
-	if err := runtime.Register("child", "v1", testAgent(childProvider)); err != nil {
+	if _, err := runtime.Register("child", "v1", testAgent(childProvider)); err != nil {
 		t.Fatal(err)
 	}
-	if err := runtime.Register("parent", "v1", parent); err != nil {
+	if _, err := runtime.Register("parent", "v1", parent); err != nil {
 		t.Fatal(err)
 	}
-	first, err := runtime.Run(context.Background(), "parent", "v1", "go", SubmitOptions{})
+	first, err := runtime.Run(context.Background(), DefinitionRef{ID: "parent", Revision: "v1"}, "go")
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -717,13 +686,13 @@ func TestRuntimeDurableChildLostWakeRecovered(t *testing.T) {
 	newSharedChildDefinition(parent)
 
 	runtime := newTestRuntime(t)
-	if err := runtime.Register("child", "v1", testAgent(childProvider)); err != nil {
+	if _, err := runtime.Register("child", "v1", testAgent(childProvider)); err != nil {
 		t.Fatal(err)
 	}
-	if err := runtime.Register("parent", "v1", parent); err != nil {
+	if _, err := runtime.Register("parent", "v1", parent); err != nil {
 		t.Fatal(err)
 	}
-	childResult, err := runtime.Run(context.Background(), "child", "v1", "seed", SubmitOptions{})
+	childResult, err := runtime.Run(context.Background(), DefinitionRef{ID: "child", Revision: "v1"}, "seed")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -779,13 +748,13 @@ func TestRuntimeDurableChildAttentionBlocksParentAndLaterUnblocks(t *testing.T) 
 	newSharedChildDefinition(parent)
 	childProvider := &repeatingChildProvider{}
 	runtime := newTestRuntime(t)
-	if err := runtime.Register("child", "v1", testAgent(childProvider)); err != nil {
+	if _, err := runtime.Register("child", "v1", testAgent(childProvider)); err != nil {
 		t.Fatal(err)
 	}
-	if err := runtime.Register("parent", "v1", parent); err != nil {
+	if _, err := runtime.Register("parent", "v1", parent); err != nil {
 		t.Fatal(err)
 	}
-	childResult, err := runtime.Run(context.Background(), "child", "v1", "seed", SubmitOptions{})
+	childResult, err := runtime.Run(context.Background(), DefinitionRef{ID: "child", Revision: "v1"}, "seed")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -876,13 +845,13 @@ func TestRuntimeDurableChildCancellationPropagatesToRunningChild(t *testing.T) {
 	}})
 	newSharedChildDefinition(parent)
 	runtime := newTestRuntime(t)
-	if err := runtime.Register("child", "v1", testAgent(barrier)); err != nil {
+	if _, err := runtime.Register("child", "v1", testAgent(barrier)); err != nil {
 		t.Fatal(err)
 	}
-	if err := runtime.Register("parent", "v1", parent); err != nil {
+	if _, err := runtime.Register("parent", "v1", parent); err != nil {
 		t.Fatal(err)
 	}
-	handle, err := runtime.Submit(context.Background(), "parent", "v1", "go", SubmitOptions{})
+	handle, err := runtime.Submit(context.Background(), DefinitionRef{ID: "parent", Revision: "v1"}, "go")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -962,13 +931,13 @@ func TestRuntimeDurableCanceledParentBlocksNoncooperativeChildDispatch(t *testin
 	newSharedChildDefinition(parent)
 	runtime := newTestRuntime(t)
 	t.Cleanup(childProvider.unblock)
-	if err := runtime.Register("child", "v1", child); err != nil {
+	if _, err := runtime.Register("child", "v1", child); err != nil {
 		t.Fatal(err)
 	}
-	if err := runtime.Register("parent", "v1", parent); err != nil {
+	if _, err := runtime.Register("parent", "v1", parent); err != nil {
 		t.Fatal(err)
 	}
-	handle, err := runtime.Submit(context.Background(), "parent", "v1", "go", SubmitOptions{})
+	handle, err := runtime.Submit(context.Background(), DefinitionRef{ID: "parent", Revision: "v1"}, "go")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1027,7 +996,7 @@ func TestRuntimeDurableCancellationPersistsForSuspendedAndStoppedDescendants(t *
 		asstTool("g1", "delegate2", `{"topic":"tea"}`),
 		asstText("child done"),
 	}})
-	child.RegisterTool(DurableChildTool(childTestDefinition("delegate2"), DurableChildPolicy{DefinitionID: "grandchild", Revision: "v1"}))
+	child.RegisterTool(NewChildTool(childTestDefinition("delegate2"), DefinitionRef{ID: "grandchild", Revision: "v1"}))
 	parent := testAgent(&scriptedProvider{turns: []Message{
 		asstTool("c1", "delegate", `{"topic":"tea"}`),
 		asstText("parent done"),
@@ -1035,11 +1004,11 @@ func TestRuntimeDurableCancellationPersistsForSuspendedAndStoppedDescendants(t *
 	newSharedChildDefinition(parent)
 	runtime := newTestRuntime(t)
 	for id, agent := range map[string]*Agent{"grandchild": questionChild(), "child": child, "parent": parent} {
-		if err := runtime.Register(id, "v1", agent); err != nil {
+		if _, err := runtime.Register(id, "v1", agent); err != nil {
 			t.Fatal(err)
 		}
 	}
-	handle, err := runtime.Submit(context.Background(), "parent", "v1", "go", SubmitOptions{})
+	handle, err := runtime.Submit(context.Background(), DefinitionRef{ID: "parent", Revision: "v1"}, "go")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1094,7 +1063,7 @@ func TestRuntimeDurableCancellationPersistsForSuspendedAndStoppedDescendants(t *
 	if !errors.Is(err, context.Canceled) || childResult.Status != RunCancelled {
 		t.Fatalf("child = %s, %v; want canceled", childResult.Status, err)
 	}
-	if err := runtime.Handle(grandchildID).ResolveWait(context.Background(), grandchild.Waits[0].ID, WaitResolution{Answer: json.RawMessage(`"late"`), Decision: Allow}); err == nil {
+	if err := runtime.Handle(grandchildID).ResolveWait(context.Background(), grandchild.Waits[0].ID, WaitResolution{Answer: json.RawMessage(`"late"`)}); err == nil {
 		t.Fatal("a late answer resumed a descendant of a canceled run")
 	}
 	final, err := handle.Snapshot(context.Background())
@@ -1118,7 +1087,7 @@ func TestRuntimeDurableCanceledChildWakesParentAfterDescendantSettles(t *testing
 		asstTool("g1", "delegate2", `{"topic":"tea"}`),
 		asstText("child done"),
 	}})
-	child.RegisterTool(DurableChildTool(childTestDefinition("delegate2"), DurableChildPolicy{DefinitionID: "grandchild", Revision: "v1"}))
+	child.RegisterTool(NewChildTool(childTestDefinition("delegate2"), DefinitionRef{ID: "grandchild", Revision: "v1"}))
 	parent := testAgent(&scriptedProvider{turns: []Message{
 		asstTool("c1", "delegate", `{"topic":"tea"}`),
 		asstText("parent done"),
@@ -1127,11 +1096,11 @@ func TestRuntimeDurableCanceledChildWakesParentAfterDescendantSettles(t *testing
 	runtime := newTestRuntime(t)
 	t.Cleanup(grandchildProvider.unblock)
 	for id, agent := range map[string]*Agent{"grandchild": grandchild, "child": child, "parent": parent} {
-		if err := runtime.Register(id, "v1", agent); err != nil {
+		if _, err := runtime.Register(id, "v1", agent); err != nil {
 			t.Fatal(err)
 		}
 	}
-	handle, err := runtime.Submit(context.Background(), "parent", "v1", "go", SubmitOptions{})
+	handle, err := runtime.Submit(context.Background(), DefinitionRef{ID: "parent", Revision: "v1"}, "go")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1192,13 +1161,13 @@ func TestRuntimeDurableReconcilingTerminalChildWakesParent(t *testing.T) {
 	}})
 	newSharedChildDefinition(parent)
 	runtime := newTestRuntime(t)
-	if err := runtime.Register("child", "v1", testAgent(childProvider)); err != nil {
+	if _, err := runtime.Register("child", "v1", testAgent(childProvider)); err != nil {
 		t.Fatal(err)
 	}
-	if err := runtime.Register("parent", "v1", parent); err != nil {
+	if _, err := runtime.Register("parent", "v1", parent); err != nil {
 		t.Fatal(err)
 	}
-	childResult, err := runtime.Run(context.Background(), "child", "v1", "seed", SubmitOptions{})
+	childResult, err := runtime.Run(context.Background(), DefinitionRef{ID: "child", Revision: "v1"}, "seed")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1256,14 +1225,14 @@ func TestRuntimeDurableWaitingDeadlinePropagatesToSuspendedDescendants(t *testin
 	}})
 	newSharedChildDefinition(parent)
 	runtime := newTestRuntime(t)
-	if err := runtime.Register("child", "v1", questionChild()); err != nil {
+	if _, err := runtime.Register("child", "v1", questionChild()); err != nil {
 		t.Fatal(err)
 	}
-	if err := runtime.Register("parent", "v1", parent); err != nil {
+	if _, err := runtime.Register("parent", "v1", parent); err != nil {
 		t.Fatal(err)
 	}
 	deadline := time.Now().Add(300 * time.Millisecond).UTC()
-	handle, err := runtime.Submit(context.Background(), "parent", "v1", "go", SubmitOptions{Deadline: deadline})
+	handle, err := runtime.Submit(context.Background(), DefinitionRef{ID: "parent", Revision: "v1"}, "go", WithDeadline(deadline))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1316,13 +1285,13 @@ func TestRuntimeDurableChildStructuredOutputProjection(t *testing.T) {
 	newSharedChildDefinition(parent)
 
 	runtime := newTestRuntime(t)
-	if err := runtime.Register("child", "v1", childAgent); err != nil {
+	if _, err := runtime.Register("child", "v1", childAgent); err != nil {
 		t.Fatal(err)
 	}
-	if err := runtime.Register("parent", "v1", parent); err != nil {
+	if _, err := runtime.Register("parent", "v1", parent); err != nil {
 		t.Fatal(err)
 	}
-	result, err := runtime.Run(context.Background(), "parent", "v1", "go", SubmitOptions{})
+	result, err := runtime.Run(context.Background(), DefinitionRef{ID: "parent", Revision: "v1"}, "go")
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -1360,15 +1329,15 @@ func TestRuntimeDurableChildRichBlocksRetained(t *testing.T) {
 	}})
 	newSharedChildDefinition(parent)
 	runtime := newTestRuntime(t)
-	if err := runtime.Register("child", "v1", testAgent(&scriptedProvider{turns: []Message{
+	if _, err := runtime.Register("child", "v1", testAgent(&scriptedProvider{turns: []Message{
 		AssistantMessage(TextBlock{Text: "see attached"}, RawBlock{Type: "custom_widget", Data: json.RawMessage(`{"n":1}`)}),
 	}})); err != nil {
 		t.Fatal(err)
 	}
-	if err := runtime.Register("parent", "v1", parent); err != nil {
+	if _, err := runtime.Register("parent", "v1", parent); err != nil {
 		t.Fatal(err)
 	}
-	result, err := runtime.Run(context.Background(), "parent", "v1", "go", SubmitOptions{})
+	result, err := runtime.Run(context.Background(), DefinitionRef{ID: "parent", Revision: "v1"}, "go")
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -1413,13 +1382,13 @@ func TestRuntimeDurableChildFailureModelVisible(t *testing.T) {
 	newSharedChildDefinition(parent)
 	childProvider := &failingChildProvider{}
 	runtime := newTestRuntime(t)
-	if err := runtime.Register("child", "v1", testAgent(childProvider)); err != nil {
+	if _, err := runtime.Register("child", "v1", testAgent(childProvider)); err != nil {
 		t.Fatal(err)
 	}
-	if err := runtime.Register("parent", "v1", parent); err != nil {
+	if _, err := runtime.Register("parent", "v1", parent); err != nil {
 		t.Fatal(err)
 	}
-	result, err := runtime.Run(context.Background(), "parent", "v1", "go", SubmitOptions{})
+	result, err := runtime.Run(context.Background(), DefinitionRef{ID: "parent", Revision: "v1"}, "go")
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -1443,46 +1412,12 @@ func TestRuntimeDurableChildFailureModelVisible(t *testing.T) {
 	}
 }
 
-func TestRegisterRejectsTransientChildAdapters(t *testing.T) {
-	child := testAgent(&scriptedProvider{turns: []Message{asstText("x")}})
-	cases := []struct {
-		name string
-		tool Tool
-	}{
-		{"asTool", AsTool[struct{}](child, "delegate", "process-local child")},
-		{"asToolFunc", AsToolFunc(child, "delegate", "process-local child", func(struct{}) string { return "task" })},
-		{"legacyWrapped", WithLegacyToolErrors(AsTool[struct{}](child, "delegate", "child"))},
-		{"retryWrapped", WithToolRetry(AsTool[struct{}](child, "delegate", "child"), retry.Config{MaxAttempts: 2})},
-	}
-	for _, tc := range cases {
-		runtime := newTestRuntime(t)
-		parent := testAgent(nil)
-		parent.RegisterTool(tc.tool)
-		err := runtime.Register("parent", "v1", parent)
-		if err == nil || !strings.Contains(err.Error(), "process-local child adapters") {
-			t.Fatalf("%s: registered transient adapter = %v", tc.name, err)
-		}
-	}
-}
-
-func TestRegisterRejectsDurableChildWithProcessLocalAuthority(t *testing.T) {
-	tool := DurableChildTool(childTestDefinition("delegate"), DurableChildPolicy{DefinitionID: "child-def", Revision: "v1"})
+func TestRegisterRejectsChildToolWithPerCallLimits(t *testing.T) {
+	tool := NewChildTool(childTestDefinition("delegate"), DefinitionRef{ID: "child-def", Revision: "v1"})
 	cases := []struct {
 		name  string
 		agent *Agent
 	}{
-		{"approver", func() *Agent {
-			agent, err := New(&scriptedProvider{}, AgentConfig{
-				Tools: []Tool{tool},
-				Approver: ApproverFunc(func(context.Context, ToolUseBlock, []Message) (Decision, error) {
-					return Decision{Outcome: Allow}, nil
-				}),
-			})
-			if err != nil {
-				panic(err)
-			}
-			return agent
-		}()},
 		{"policyTimeout", func() *Agent {
 			agent, err := New(&scriptedProvider{}, AgentConfig{Tools: []Tool{tool}, ToolPolicy: ToolPolicy{Timeout: time.Second}})
 			if err != nil {
@@ -1500,8 +1435,8 @@ func TestRegisterRejectsDurableChildWithProcessLocalAuthority(t *testing.T) {
 	}
 	for _, tc := range cases {
 		runtime := newTestRuntime(t)
-		err := runtime.Register("parent", "v1", tc.agent)
-		if err == nil || !strings.Contains(err.Error(), "durable child tools do not support") {
+		_, err := runtime.Register("parent", "v1", tc.agent)
+		if err == nil || !strings.Contains(err.Error(), "child tools do not support") {
 			t.Fatalf("%s: = %v", tc.name, err)
 		}
 	}
@@ -1513,7 +1448,7 @@ func TestRegisterRejectsDurableChildWithProcessLocalAuthority(t *testing.T) {
 		t.Fatal(err)
 	}
 	runtime := newTestRuntime(t)
-	if err := runtime.Register("leafy", "v1", plain); err != nil {
+	if _, err := runtime.Register("leafy", "v1", plain); err != nil {
 		t.Fatalf("plain leaf with timeout = %v", err)
 	}
 }
@@ -1539,7 +1474,7 @@ func TestRuntimeDurableSubtreeCapDescendantsReserveAncestorTotals(t *testing.T) 
 		asstTool("g1", "delegate2", `{"topic":"tea"}`),
 		asstText("child done"),
 	}})
-	child.RegisterTool(DurableChildTool(childTestDefinition("delegate2"), DurableChildPolicy{DefinitionID: "grandchild", Revision: "v1"}))
+	child.RegisterTool(NewChildTool(childTestDefinition("delegate2"), DefinitionRef{ID: "grandchild", Revision: "v1"}))
 	parent := testAgent(&scriptedProvider{turns: []Message{
 		asstTool("c1", "delegate", `{"topic":"tea"}`),
 		asstText("parent done"),
@@ -1547,16 +1482,16 @@ func TestRuntimeDurableSubtreeCapDescendantsReserveAncestorTotals(t *testing.T) 
 	newSharedChildDefinition(parent)
 
 	runtime := newTestRuntime(t)
-	if err := runtime.Register("grandchild", "v1", grandchild); err != nil {
+	if _, err := runtime.Register("grandchild", "v1", grandchild); err != nil {
 		t.Fatal(err)
 	}
-	if err := runtime.Register("child", "v1", child); err != nil {
+	if _, err := runtime.Register("child", "v1", child); err != nil {
 		t.Fatal(err)
 	}
-	if err := runtime.Register("parent", "v1", parent); err != nil {
+	if _, err := runtime.Register("parent", "v1", parent); err != nil {
 		t.Fatal(err)
 	}
-	result, err := runtime.Run(context.Background(), "parent", "v1", "go", SubmitOptions{})
+	result, err := runtime.Run(context.Background(), DefinitionRef{ID: "parent", Revision: "v1"}, "go")
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -1633,13 +1568,13 @@ func TestRuntimeDurableChildLocalCapStricterThanAncestor(t *testing.T) {
 	newSharedChildDefinition(parent)
 
 	runtime := newTestRuntime(t)
-	if err := runtime.Register("child", "v1", child); err != nil {
+	if _, err := runtime.Register("child", "v1", child); err != nil {
 		t.Fatal(err)
 	}
-	if err := runtime.Register("parent", "v1", parent); err != nil {
+	if _, err := runtime.Register("parent", "v1", parent); err != nil {
 		t.Fatal(err)
 	}
-	result, err := runtime.Run(context.Background(), "parent", "v1", "go", SubmitOptions{})
+	result, err := runtime.Run(context.Background(), DefinitionRef{ID: "parent", Revision: "v1"}, "go")
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -1735,13 +1670,13 @@ func TestRuntimeDurableConcurrentSiblingRunsReserveAncestorAtomically(t *testing
 	newSharedChildDefinition(parent)
 
 	runtime := newTestRuntime(t)
-	if err := runtime.Register("child", "v1", child); err != nil {
+	if _, err := runtime.Register("child", "v1", child); err != nil {
 		t.Fatal(err)
 	}
-	if err := runtime.Register("parent", "v1", parent); err != nil {
+	if _, err := runtime.Register("parent", "v1", parent); err != nil {
 		t.Fatal(err)
 	}
-	handle, err := runtime.Submit(context.Background(), "parent", "v1", "go", SubmitOptions{})
+	handle, err := runtime.Submit(context.Background(), DefinitionRef{ID: "parent", Revision: "v1"}, "go")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1823,13 +1758,13 @@ func TestRuntimeDurableSubtreeCapCounterSurvivesRestart(t *testing.T) {
 	parent.RegisterTool(extra)
 
 	runtime := newTestRuntime(t)
-	if err := runtime.Register("child", "v1", testAgent(childProvider)); err != nil {
+	if _, err := runtime.Register("child", "v1", testAgent(childProvider)); err != nil {
 		t.Fatal(err)
 	}
-	if err := runtime.Register("parent", "v1", parent); err != nil {
+	if _, err := runtime.Register("parent", "v1", parent); err != nil {
 		t.Fatal(err)
 	}
-	childResult, err := runtime.Run(context.Background(), "child", "v1", "seed", SubmitOptions{})
+	childResult, err := runtime.Run(context.Background(), DefinitionRef{ID: "child", Revision: "v1"}, "seed")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1911,12 +1846,12 @@ func TestRuntimeDurableChildAdmissionRollbackDoesNotCharge(t *testing.T) {
 	newSharedChildDefinition(parent)
 
 	runtime := newTestRuntime(t)
-	if err := runtime.Register("parent", "v1", parent); err != nil {
+	if _, err := runtime.Register("parent", "v1", parent); err != nil {
 		t.Fatal(err)
 	}
 	// The pinned child definition is never registered, so the admission fails
 	// closed inside the batch-creation transaction.
-	_, err := runtime.Run(context.Background(), "parent", "v1", "go", SubmitOptions{})
+	_, err := runtime.Run(context.Background(), DefinitionRef{ID: "parent", Revision: "v1"}, "go")
 	if err == nil {
 		t.Fatal("failed child admission was invisible")
 	}
@@ -2028,19 +1963,19 @@ func TestRuntimeDurableReservationStoreErrorIsNotBudgetDenial(t *testing.T) {
 	}}).WithToolPolicy(ToolPolicy{MaxCalls: 5})
 	newSharedChildDefinition(parent)
 
-	store := &failRunGetStore{Store: newEphemeralStore()}
+	store := &failRunGetStore{Store: NewMemoryStore()}
 	runtime, err := NewRuntime(context.Background(), RuntimeConfig{Store: store})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = runtime.Close() })
-	if err := runtime.Register("child", "v1", child); err != nil {
+	if _, err := runtime.Register("child", "v1", child); err != nil {
 		t.Fatal(err)
 	}
-	if err := runtime.Register("parent", "v1", parent); err != nil {
+	if _, err := runtime.Register("parent", "v1", parent); err != nil {
 		t.Fatal(err)
 	}
-	handle, err := runtime.Submit(context.Background(), "parent", "v1", "go", SubmitOptions{})
+	handle, err := runtime.Submit(context.Background(), DefinitionRef{ID: "parent", Revision: "v1"}, "go")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2106,7 +2041,7 @@ func TestRuntimeDurableTreeAccountingCountsEachRunOnce(t *testing.T) {
 		withUsage(asstTool("g1", "delegate2", `{"topic":"tea"}`), &Usage{InputTokens: 20, OutputTokens: 2}),
 		withUsage(asstText("child done"), &Usage{InputTokens: 20, OutputTokens: 2}),
 	}})
-	child.RegisterTool(DurableChildTool(childTestDefinition("delegate2"), DurableChildPolicy{DefinitionID: "grandchild", Revision: "v1"}))
+	child.RegisterTool(NewChildTool(childTestDefinition("delegate2"), DefinitionRef{ID: "grandchild", Revision: "v1"}))
 	parent := testAgent(&scriptedProvider{turns: []Message{
 		withUsage(asstTool("c1", "delegate", `{"topic":"tea"}`), &Usage{InputTokens: 3, OutputTokens: 3}),
 		withUsage(asstText("parent done"), &Usage{InputTokens: 3, OutputTokens: 3}),
@@ -2115,11 +2050,11 @@ func TestRuntimeDurableTreeAccountingCountsEachRunOnce(t *testing.T) {
 
 	runtime := newTestRuntime(t)
 	for id, agent := range map[string]*Agent{"grandchild": grandchild, "child": child, "parent": parent} {
-		if err := runtime.Register(id, "v1", agent); err != nil {
+		if _, err := runtime.Register(id, "v1", agent); err != nil {
 			t.Fatal(err)
 		}
 	}
-	result, err := runtime.Run(context.Background(), "parent", "v1", "go", SubmitOptions{})
+	result, err := runtime.Run(context.Background(), DefinitionRef{ID: "parent", Revision: "v1"}, "go")
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -2225,7 +2160,7 @@ func TestRuntimeRecoveryRecordsUnknownProviderAttemptOnce(t *testing.T) {
 	provider := &repeatingChildProvider{}
 	agent := testAgent(provider)
 	agent.RegisterTool(Func("extra", "ordinary work", func(context.Context, struct{}) (string, error) { return "ok", nil }))
-	if err := runtime.Register("agent", "v1", agent); err != nil {
+	if _, err := runtime.Register("agent", "v1", agent); err != nil {
 		t.Fatal(err)
 	}
 	// A repeated pass over the same interrupted generation counts it once.
@@ -2317,7 +2252,7 @@ func TestRuntimeProviderRecoveryPolicyAuthorizesBoundedFreshAttempts(t *testing.
 		provider := &repeatingChildProvider{}
 		agent := testAgent(provider)
 		agent.RegisterTool(Func("extra", "ordinary work", func(context.Context, struct{}) (string, error) { return "ok", nil }))
-		if err := runtime.Register("agent", "v1", agent); err != nil {
+		if _, err := runtime.Register("agent", "v1", agent); err != nil {
 			t.Fatal(err)
 		}
 		if err := runtime.Recover(context.Background()); err != nil {
@@ -2371,10 +2306,10 @@ func TestRuntimeWorkerStopDuringProviderAttemptNeedsProviderAttention(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := runtime.Register("agent", "v1", testAgent(provider)); err != nil {
+	if _, err := runtime.Register("agent", "v1", testAgent(provider)); err != nil {
 		t.Fatal(err)
 	}
-	handle, err := runtime.Submit(context.Background(), "agent", "v1", "work", SubmitOptions{})
+	handle, err := runtime.Submit(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "work")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2396,7 +2331,7 @@ func TestRuntimeWorkerStopDuringProviderAttemptNeedsProviderAttention(t *testing
 		t.Fatal(err)
 	}
 	defer reopened.Close()
-	if err := reopened.Register("agent", "v1", testAgent(fresh)); err != nil {
+	if _, err := reopened.Register("agent", "v1", testAgent(fresh)); err != nil {
 		t.Fatal(err)
 	}
 	if err := reopened.Recover(context.Background()); err != nil {
@@ -2419,46 +2354,6 @@ func awaitRun(t *testing.T, runtime *Runtime, runID string) (RunResult, error) {
 
 // --- review regressions -------------------------------------------------------
 
-// A process-local agent nested inside a Runtime run's tool charges the run's
-// persisted subtree cap, exactly as direct nested runs share the total budget.
-func TestRuntimeNestedProcessLocalAgentChargesPersistedCap(t *testing.T) {
-	var leafCalls atomic.Int32
-	inner := testAgent(&scriptedProvider{turns: []Message{
-		AssistantMessage(toolUse("l1", "leaf", `{}`), toolUse("l2", "leaf", `{}`)),
-		asstText("inner done"),
-	}})
-	inner.RegisterTool(Func("leaf", "leaf work", func(context.Context, struct{}) (string, error) {
-		leafCalls.Add(1)
-		return "leaf ok", nil
-	}))
-	parent := testAgent(&scriptedProvider{turns: []Message{
-		asstTool("o1", "outer", `{}`),
-		asstText("parent done"),
-	}}).WithToolPolicy(ToolPolicy{MaxCalls: 2})
-	parent.RegisterTool(Func("outer", "run a nested agent", func(ctx context.Context, _ struct{}) (string, error) {
-		result, err := inner.Run(ctx, "go")
-		return result.Output, err
-	}))
-	runtime := newTestRuntime(t)
-	if err := runtime.Register("parent", "v1", parent); err != nil {
-		t.Fatal(err)
-	}
-	result, err := runtime.Run(context.Background(), "parent", "v1", "go", SubmitOptions{})
-	if err != nil || result.Output != "parent done" {
-		t.Fatalf("parent = %q, %v", result.Output, err)
-	}
-	if got := leafCalls.Load(); got != 1 {
-		t.Fatalf("nested leaf calls = %d, want 1 under the shared cap of 2", got)
-	}
-	record, err := runtimeRecord(runtime, result.RunID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if record.ToolBudget.TotalCap != 2 || record.ToolBudget.Total != 2 {
-		t.Fatalf("parent tool budget = %#v, want the nested charge persisted", record.ToolBudget)
-	}
-}
-
 // deadlineChildProvider blocks until its context ends, so a child sharing
 // the parent's deadline fails exactly at that deadline.
 type deadlineChildProvider struct{}
@@ -2477,13 +2372,13 @@ func TestRuntimeDurableSharedDeadlineFinalizesWokenParent(t *testing.T) {
 	}})
 	newSharedChildDefinition(parent)
 	runtime := newTestRuntime(t)
-	if err := runtime.Register("child", "v1", testAgent(deadlineChildProvider{})); err != nil {
+	if _, err := runtime.Register("child", "v1", testAgent(deadlineChildProvider{})); err != nil {
 		t.Fatal(err)
 	}
-	if err := runtime.Register("parent", "v1", parent); err != nil {
+	if _, err := runtime.Register("parent", "v1", parent); err != nil {
 		t.Fatal(err)
 	}
-	handle, err := runtime.Submit(context.Background(), "parent", "v1", "go", SubmitOptions{Deadline: time.Now().Add(150 * time.Millisecond)})
+	handle, err := runtime.Submit(context.Background(), DefinitionRef{ID: "parent", Revision: "v1"}, "go", WithDeadline(time.Now().Add(150*time.Millisecond)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2504,10 +2399,10 @@ func TestRuntimeDurableSharedDeadlineFinalizesWokenParent(t *testing.T) {
 // its logical deadline and finalizes the blocking descendant with it.
 func TestRuntimeDurableChildAttentionParentHonorsDeadline(t *testing.T) {
 	runtime := newTestRuntime(t)
-	if err := runtime.Register("child", "v1", testAgent(&repeatingChildProvider{})); err != nil {
+	if _, err := runtime.Register("child", "v1", testAgent(&repeatingChildProvider{})); err != nil {
 		t.Fatal(err)
 	}
-	childResult, err := runtime.Run(context.Background(), "child", "v1", "seed", SubmitOptions{})
+	childResult, err := runtime.Run(context.Background(), DefinitionRef{ID: "child", Revision: "v1"}, "seed")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2555,13 +2450,13 @@ func TestRuntimeDurableFinalizingChildWithoutHookDeliveryCompletesParent(t *test
 	}})
 	newSharedChildDefinition(parent)
 	runtime := newTestRuntime(t)
-	if err := runtime.Register("child", "v1", testAgent(childProvider)); err != nil {
+	if _, err := runtime.Register("child", "v1", testAgent(childProvider)); err != nil {
 		t.Fatal(err)
 	}
-	if err := runtime.Register("parent", "v1", parent); err != nil {
+	if _, err := runtime.Register("parent", "v1", parent); err != nil {
 		t.Fatal(err)
 	}
-	childResult, err := runtime.Run(context.Background(), "child", "v1", "seed", SubmitOptions{})
+	childResult, err := runtime.Run(context.Background(), DefinitionRef{ID: "child", Revision: "v1"}, "seed")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2607,13 +2502,13 @@ func TestRuntimeDurableChildAttentionClearsWhenSiblingsRemainPending(t *testing.
 		return "unused", nil
 	}), DurableWaitPolicy{Kind: WaitQuestion}))
 	runtime := newTestRuntime(t)
-	if err := runtime.Register("child", "v1", child); err != nil {
+	if _, err := runtime.Register("child", "v1", child); err != nil {
 		t.Fatal(err)
 	}
-	if err := runtime.Register("parent", "v1", parent); err != nil {
+	if _, err := runtime.Register("parent", "v1", parent); err != nil {
 		t.Fatal(err)
 	}
-	handle, err := runtime.Submit(context.Background(), "parent", "v1", "go", SubmitOptions{})
+	handle, err := runtime.Submit(context.Background(), DefinitionRef{ID: "parent", Revision: "v1"}, "go")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2659,7 +2554,7 @@ func TestRuntimeDurableChildAttentionClearsWhenSiblingsRemainPending(t *testing.
 	if waiting.Attention != nil {
 		t.Fatalf("parent waiting on third child retains attention %#v", waiting.Attention)
 	}
-	if err := runtime.Handle(third).ResolveWait(context.Background(), thirdSnapshot.Waits[0].ID, WaitResolution{Answer: json.RawMessage(`"yes"`), Decision: Allow}); err != nil {
+	if err := runtime.Handle(third).ResolveWait(context.Background(), thirdSnapshot.Waits[0].ID, WaitResolution{Answer: json.RawMessage(`"yes"`)}); err != nil {
 		t.Fatal(err)
 	}
 	result, err := awaitRun(t, runtime, handle.ID())
@@ -2689,10 +2584,10 @@ func (repeatingQuestionProvider) Invoke(_ context.Context, request Request) (Res
 // instead of being left running without a worker.
 func TestRuntimeReplayedBatchWithPendingWaitSuspends(t *testing.T) {
 	runtime := newTestRuntime(t)
-	if err := runtime.Register("asker", "v1", questionChild()); err != nil {
+	if _, err := runtime.Register("asker", "v1", questionChild()); err != nil {
 		t.Fatal(err)
 	}
-	handle, err := runtime.Submit(context.Background(), "asker", "v1", "go", SubmitOptions{})
+	handle, err := runtime.Submit(context.Background(), DefinitionRef{ID: "asker", Revision: "v1"}, "go")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2710,80 +2605,12 @@ func TestRuntimeReplayedBatchWithPendingWaitSuspends(t *testing.T) {
 	}
 	runtime.start(handle.ID())
 	waitForRunState(t, runtime, handle.ID(), RuntimeWaiting)
-	if err := handle.ResolveWait(context.Background(), waiting.Waits[0].ID, WaitResolution{Answer: json.RawMessage(`"yes"`), Decision: Allow}); err != nil {
+	if err := handle.ResolveWait(context.Background(), waiting.Waits[0].ID, WaitResolution{Answer: json.RawMessage(`"yes"`)}); err != nil {
 		t.Fatal(err)
 	}
 	result, err := awaitRun(t, runtime, handle.ID())
 	if err != nil || result.Output != "child done" {
 		t.Fatalf("resumed run = %q, %v", result.Output, err)
-	}
-}
-
-// A nested charge that cannot be recorded fails the nested run instead of
-// showing its model a budget denial; nothing runs. A run that is no longer
-// running admits no nested charge at all.
-func TestRuntimeNestedReservationFailureIsNotBudgetDenial(t *testing.T) {
-	var leafCalls atomic.Int32
-	inner := testAgent(&scriptedProvider{turns: []Message{asstTool("l1", "leaf", `{}`), asstText("inner done")}})
-	inner.RegisterTool(Func("leaf", "leaf work", func(context.Context, struct{}) (string, error) {
-		leafCalls.Add(1)
-		return "leaf ok", nil
-	}))
-	store := &failRunGetStore{Store: newEphemeralStore()}
-	var innerErr error
-	parent := testAgent(&scriptedProvider{turns: []Message{asstTool("o1", "outer", `{}`), asstText("parent done")}})
-	parent.RegisterTool(Func("outer", "run a nested agent", func(ctx context.Context, _ struct{}) (string, error) {
-		store.armed.Store(true)
-		result, err := inner.Run(ctx, "go")
-		innerErr = err
-		return result.Output, err
-	}))
-	runtime, err := NewRuntime(context.Background(), RuntimeConfig{Store: store})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = runtime.Close() })
-	if err := runtime.Register("parent", "v1", parent); err != nil {
-		t.Fatal(err)
-	}
-	handle, err := runtime.submit(context.Background(), "parent", "v1", "go", SubmitOptions{}, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	store.target.Store(handle.ID())
-	runtime.start(handle.ID())
-	// The outer tool returns the nested failure as a Go error, which aborts
-	// the parent as any tool execution error does.
-	if _, err := awaitRun(t, runtime, handle.ID()); err == nil || errors.Is(err, ErrToolBudgetExhausted) {
-		t.Fatalf("parent = %v, want the propagated storage failure", err)
-	}
-	if innerErr == nil || errors.Is(innerErr, ErrToolBudgetExhausted) || !strings.Contains(innerErr.Error(), "injected ancestor read failure") {
-		t.Fatalf("nested run error = %v, want the storage failure", innerErr)
-	}
-	if got := leafCalls.Load(); got != 0 {
-		t.Fatalf("leaf calls = %d, want 0", got)
-	}
-
-	if err := runtime.transaction(context.Background(), true, func(tx StoreTransaction) error {
-		record, err := getRuntimeRun(tx, handle.ID())
-		if err != nil {
-			return err
-		}
-		record.State = RuntimeCancelRequested
-		record.ToolBudget = storedToolBudget{TotalCap: 5}
-		return putRuntimeRun(tx, record)
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := runtime.reserveNestedCall(handle.ID()); !errors.Is(err, context.Canceled) {
-		t.Fatalf("nested charge on a cancel-requested run = %v", err)
-	}
-	record, err := runtimeRecord(runtime, handle.ID())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if record.ToolBudget.Total != 0 {
-		t.Fatalf("refused nested charge persisted: %#v", record.ToolBudget)
 	}
 }
 
@@ -2837,16 +2664,16 @@ func TestRuntimeSuspendedBatchDoesNotDispatchAfterRacingResolution(t *testing.T)
 		extraCalls.Add(1)
 		return "extra ok", nil
 	}))
-	store := &afterWaitingStore{Store: newEphemeralStore()}
+	store := &afterWaitingStore{Store: NewMemoryStore()}
 	runtime, err := NewRuntime(context.Background(), RuntimeConfig{Store: store})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = runtime.Close() })
-	if err := runtime.Register("agent", "v1", agent); err != nil {
+	if _, err := runtime.Register("agent", "v1", agent); err != nil {
 		t.Fatal(err)
 	}
-	handle, err := runtime.submit(context.Background(), "agent", "v1", "go", SubmitOptions{}, false)
+	handle, err := runtime.submit(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "go", nil, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2857,7 +2684,7 @@ func TestRuntimeSuspendedBatchDoesNotDispatchAfterRacingResolution(t *testing.T)
 			resolveErr = err
 			return
 		}
-		resolveErr = handle.ResolveWait(context.Background(), snapshot.Waits[0].ID, WaitResolution{Answer: json.RawMessage(`"yes"`), Decision: Allow})
+		resolveErr = handle.ResolveWait(context.Background(), snapshot.Waits[0].ID, WaitResolution{Answer: json.RawMessage(`"yes"`)})
 	}
 	runtime.start(handle.ID())
 	result, err := awaitRun(t, runtime, handle.ID())
@@ -2883,13 +2710,13 @@ func TestRuntimeAcknowledgeHooksCompletesChildAndWakesParent(t *testing.T) {
 	}})
 	newSharedChildDefinition(parent)
 	runtime := newTestRuntime(t)
-	if err := runtime.Register("child", "v1", testAgent(childProvider)); err != nil {
+	if _, err := runtime.Register("child", "v1", testAgent(childProvider)); err != nil {
 		t.Fatal(err)
 	}
-	if err := runtime.Register("parent", "v1", parent); err != nil {
+	if _, err := runtime.Register("parent", "v1", parent); err != nil {
 		t.Fatal(err)
 	}
-	childResult, err := runtime.Run(context.Background(), "child", "v1", "seed", SubmitOptions{})
+	childResult, err := runtime.Run(context.Background(), DefinitionRef{ID: "child", Revision: "v1"}, "seed")
 	if err != nil {
 		t.Fatal(err)
 	}

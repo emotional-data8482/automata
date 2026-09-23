@@ -1,5 +1,6 @@
 // Command claude-example runs a minimal tool-using agent against the
-// Anthropic API.
+// Anthropic API, streaming its answer. The run is ephemeral: it executes
+// through a core.Runtime on an in-memory store, which is lost on exit.
 //
 // Set ANTHROPIC_API_KEY in the environment before running. The model defaults
 // to claude-sonnet-4-6 and can be overridden with ANTHROPIC_MODEL.
@@ -49,11 +50,22 @@ func main() {
 		})}})
 
 	if err != nil {
-		panic(err)
+		log.Fatalf("configure agent: %v", err)
 	}
 
-	_, err = agent.RunStream(
-		context.Background(),
+	runtime, err := core.NewEphemeralRuntime()
+	if err != nil {
+		log.Fatalf("open runtime: %v", err)
+	}
+	defer runtime.Close()
+	assistant, err := runtime.Register("assistant", "v1", agent)
+	if err != nil {
+		log.Fatalf("register agent: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	res, err := runtime.RunStream(ctx, assistant,
 		"What time is it right now in Tokyo, and how many hours ahead of UTC is that?",
 		func(ev core.StreamEvent) {
 			switch ev.Kind {
@@ -72,6 +84,7 @@ func main() {
 	)
 	fmt.Println()
 	if err != nil {
-		log.Fatalf("run failed: %v", err)
+		log.Fatalf("run failed after %d turns (partial output %q): %v", res.Turns, res.Output, err)
 	}
+	fmt.Printf("\n[%d turns, %d output tokens]\n", res.Turns, res.Usage.OutputTokens)
 }

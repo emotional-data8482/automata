@@ -49,7 +49,7 @@ func TestDurableWaitEncodingIsStable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const want = `{"version":8,"run_id":"run-1","id":"wait-1","kind":"approval","state":"pending","operation_id":"op-1","batch_id":"batch-1","ordinal":2,"tool":"write","arguments":{"path":"a"},"target":"a","action_digest":"digest","definition_id":"agent","definition_revision":"v1","policy_context":"policy-v2","created_at":"2026-01-02T03:04:05Z"}`
+	const want = `{"version":9,"run_id":"run-1","id":"wait-1","kind":"approval","state":"pending","operation_id":"op-1","batch_id":"batch-1","ordinal":2,"tool":"write","arguments":{"path":"a"},"target":"a","action_digest":"digest","definition_id":"agent","definition_revision":"v1","policy_context":"policy-v2","created_at":"2026-01-02T03:04:05Z"}`
 	if string(data) != want {
 		t.Fatalf("wait encoding drifted:\n got %s\nwant %s", data, want)
 	}
@@ -112,10 +112,10 @@ func TestRuntimeQuestionWaitSurvivesRestartAndResolutionRetry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := runtime.Register("assistant", "v1", agent); err != nil {
+	if _, err := runtime.Register("assistant", "v1", agent); err != nil {
 		t.Fatal(err)
 	}
-	handle, err := runtime.Submit(context.Background(), "assistant", "v1", "help", SubmitOptions{})
+	handle, err := runtime.Submit(context.Background(), DefinitionRef{ID: "assistant", Revision: "v1"}, "help")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -145,7 +145,7 @@ func TestRuntimeQuestionWaitSurvivesRestartAndResolutionRetry(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer reopened.Close()
-	if err := reopened.Register("assistant", "v1", agent); err != nil {
+	if _, err := reopened.Register("assistant", "v1", agent); err != nil {
 		t.Fatal(err)
 	}
 	if err := reopened.Recover(context.Background()); err != nil {
@@ -219,10 +219,10 @@ func TestRuntimeApprovalBindsActionAndRevalidatesAuthority(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer runtime.Close()
-	if err := runtime.Register("writer", "v3", agent); err != nil {
+	if _, err := runtime.Register("writer", "v3", agent); err != nil {
 		t.Fatal(err)
 	}
-	handle, err := runtime.Submit(context.Background(), "writer", "v3", "write", SubmitOptions{})
+	handle, err := runtime.Submit(context.Background(), DefinitionRef{ID: "writer", Revision: "v3"}, "write")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -247,57 +247,6 @@ func TestRuntimeApprovalBindsActionAndRevalidatesAuthority(t *testing.T) {
 	}
 	if err := handle.ResolveWait(context.Background(), wait.ID, resolution); err != nil {
 		t.Fatalf("lost-response retry: %v", err)
-	}
-}
-
-func TestDurableApprovalDoesNotAuthorizeNestedToolCalls(t *testing.T) {
-	childProvider := &scriptedProvider{turns: []Message{asstTool("leaf-1", "leaf", `{}`), asstText("child adapted")}}
-	var leafCalls atomic.Int64
-	var childApprovals atomic.Int64
-	leaf := Func("leaf", "leaf", func(context.Context, struct{}) (string, error) {
-		leafCalls.Add(1)
-		return "leaf", nil
-	})
-	child, err := New(childProvider, AgentConfig{
-		Tools: []Tool{leaf},
-		Approver: ApproverFunc(func(context.Context, ToolUseBlock, []Message) (Decision, error) {
-			childApprovals.Add(1)
-			return Decision{Outcome: Deny, Reason: "child denied"}, nil
-		}),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	delegate := Func("delegate", "delegate", func(ctx context.Context, _ struct{}) (string, error) {
-		result, err := child.Run(ctx, "child")
-		return result.Output, err
-	})
-	delegate = WithDurableWait(delegate, DurableWaitPolicy{Kind: WaitApproval, Target: func(json.RawMessage) (string, error) { return "child-run", nil }})
-	parent, err := New(&scriptedProvider{turns: []Message{asstTool("delegate-1", "delegate", `{}`), asstText("parent done")}}, AgentConfig{Tools: []Tool{delegate}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	runtime, err := NewRuntime(context.Background(), RuntimeConfig{Store: NewMemoryStore(), Authorizer: ApprovalAuthorizerFunc(func(context.Context, ApprovalAuthorization) error { return nil })})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer runtime.Close()
-	if err := runtime.Register("parent", "v1", parent); err != nil {
-		t.Fatal(err)
-	}
-	handle, err := runtime.Submit(context.Background(), "parent", "v1", "go", SubmitOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	wait := waitForRuntimeWait(t, handle)
-	if err := handle.ResolveWait(context.Background(), wait.ID, WaitResolution{Decision: Allow, ActionDigest: wait.ActionDigest}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := handle.Await(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if childApprovals.Load() != 1 || leafCalls.Load() != 0 {
-		t.Fatalf("child approvals = %d, leaf calls = %d", childApprovals.Load(), leafCalls.Load())
 	}
 }
 
@@ -326,10 +275,10 @@ func TestRuntimeApprovalIsRevalidatedImmediatelyBeforeDispatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer runtime.Close()
-	if err := runtime.Register("writer", "v1", agent); err != nil {
+	if _, err := runtime.Register("writer", "v1", agent); err != nil {
 		t.Fatal(err)
 	}
-	handle, err := runtime.Submit(context.Background(), "writer", "v1", "go", SubmitOptions{})
+	handle, err := runtime.Submit(context.Background(), DefinitionRef{ID: "writer", Revision: "v1"}, "go")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -364,10 +313,10 @@ func TestRuntimeExpiredApprovalCannotDispatchAndRetryIsStable(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer runtime.Close()
-	if err := runtime.Register("writer", "v1", agent); err != nil {
+	if _, err := runtime.Register("writer", "v1", agent); err != nil {
 		t.Fatal(err)
 	}
-	handle, err := runtime.Submit(context.Background(), "writer", "v1", "go", SubmitOptions{})
+	handle, err := runtime.Submit(context.Background(), DefinitionRef{ID: "writer", Revision: "v1"}, "go")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -424,10 +373,10 @@ func TestRuntimeCancellationAfterAcceptedApprovalPreservesReceipt(t *testing.T) 
 			close(release)
 		}
 	}()
-	if err := runtime.Register("writer", "v1", agent); err != nil {
+	if _, err := runtime.Register("writer", "v1", agent); err != nil {
 		t.Fatal(err)
 	}
-	handle, err := runtime.Submit(context.Background(), "writer", "v1", "go", SubmitOptions{})
+	handle, err := runtime.Submit(context.Background(), DefinitionRef{ID: "writer", Revision: "v1"}, "go")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -574,10 +523,10 @@ func TestRuntimeCancellationCannotBeReversedByWaitCreation(t *testing.T) {
 	defer runtime.Close()
 	var release sync.Once
 	defer release.Do(func() { close(store.release) })
-	if err := runtime.Register("agent", "v1", agent); err != nil {
+	if _, err := runtime.Register("agent", "v1", agent); err != nil {
 		t.Fatal(err)
 	}
-	handle, err := runtime.Submit(context.Background(), "agent", "v1", "go", SubmitOptions{})
+	handle, err := runtime.Submit(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "go")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -643,10 +592,10 @@ func TestRuntimeApprovalRevalidatesAfterRateLimitWait(t *testing.T) {
 			close(release)
 		}
 	}()
-	if err := runtime.Register("agent", "v1", agent); err != nil {
+	if _, err := runtime.Register("agent", "v1", agent); err != nil {
 		t.Fatal(err)
 	}
-	handle, err := runtime.Submit(context.Background(), "agent", "v1", "go", SubmitOptions{})
+	handle, err := runtime.Submit(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "go")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -695,10 +644,10 @@ func TestRuntimeWaitResolutionHandoffAndLostAcknowledgement(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer runtime.Close()
-			if err := runtime.Register("agent", "v1", agent); err != nil {
+			if _, err := runtime.Register("agent", "v1", agent); err != nil {
 				t.Fatal(err)
 			}
-			handle, err := runtime.Submit(context.Background(), "agent", "v1", "go", SubmitOptions{})
+			handle, err := runtime.Submit(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "go")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -751,10 +700,10 @@ func TestRuntimeRecoverAppliesDeadlineToSuspendedWait(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer runtime.Close()
-	if err := runtime.Register("agent", "v1", agent); err != nil {
+	if _, err := runtime.Register("agent", "v1", agent); err != nil {
 		t.Fatal(err)
 	}
-	handle, err := runtime.Submit(context.Background(), "agent", "v1", "go", SubmitOptions{Deadline: time.Now().Add(20 * time.Millisecond)})
+	handle, err := runtime.Submit(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "go", WithDeadline(time.Now().Add(20*time.Millisecond)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -791,10 +740,10 @@ func TestRuntimeObserverRemainsAttachedAcrossWait(t *testing.T) {
 	defer runtime.Close()
 	var releaseTracer sync.Once
 	defer releaseTracer.Do(func() { close(tracer.release) })
-	if err := runtime.Register("agent", "v1", agent); err != nil {
+	if _, err := runtime.Register("agent", "v1", agent); err != nil {
 		t.Fatal(err)
 	}
-	handle, err := runtime.Submit(context.Background(), "agent", "v1", "go", SubmitOptions{})
+	handle, err := runtime.Submit(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "go")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -858,7 +807,7 @@ func TestRuntimeRunStreamContinuesAcrossWait(t *testing.T) {
 	defer runtime.Close()
 	var releaseTracer sync.Once
 	defer releaseTracer.Do(func() { close(tracer.release) })
-	if err := runtime.Register("agent", "v1", agent); err != nil {
+	if _, err := runtime.Register("agent", "v1", agent); err != nil {
 		t.Fatal(err)
 	}
 	type streamOutcome struct {
@@ -868,7 +817,7 @@ func TestRuntimeRunStreamContinuesAcrossWait(t *testing.T) {
 	done := make(chan streamOutcome, 1)
 	var events atomic.Int64
 	go func() {
-		result, err := runtime.RunStream(context.Background(), "agent", "v1", "go", func(StreamEvent) { events.Add(1) }, SubmitOptions{})
+		result, err := runtime.RunStream(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "go", func(StreamEvent) { events.Add(1) })
 		done <- streamOutcome{result: result, err: err}
 	}()
 	select {
@@ -947,10 +896,10 @@ func TestRuntimeApprovalRevocationAndCancellationPreventDispatch(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer runtime.Close()
-			if err := runtime.Register("agent", "v1", agent); err != nil {
+			if _, err := runtime.Register("agent", "v1", agent); err != nil {
 				t.Fatal(err)
 			}
-			handle, err := runtime.Submit(context.Background(), "agent", "v1", "go", SubmitOptions{})
+			handle, err := runtime.Submit(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "go")
 			if err != nil {
 				t.Fatal(err)
 			}

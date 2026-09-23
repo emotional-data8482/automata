@@ -32,15 +32,12 @@ const (
 	// recognize. The raw value remains available for diagnostics.
 	StopUnknown StopReason = "unknown"
 
-	// StopMaxSteps means the agent step budget was exhausted with tools pending.
-	StopMaxSteps StopReason = "max_steps"
+	// StopMaxTurns means the run's turn budget was exhausted before a final
+	// answer.
+	StopMaxTurns StopReason = "max_turns"
 	// StopError means the run aborted on another provider, tool, or hook error.
 	StopError StopReason = "error"
 )
-
-// StopNormal is an alias for StopEndTurn, provided for callers that prefer the
-// provider-neutral "normal completion" terminology.
-const StopNormal = StopEndTurn
 
 var (
 	// ErrTokenLimit is matched by a CompletionError caused by StopTokenLimit.
@@ -57,7 +54,7 @@ var (
 )
 
 // CompletionError reports a provider turn that produced a partial or unusable
-// answer. Run and RunStream return it together with a populated RunResult, so
+// answer. A run returns it together with a populated RunResult, so
 // callers can retain Output, FinalMessage, Messages, and Usage while deciding
 // whether to continue, retry, or surface the partial answer.
 //
@@ -169,7 +166,7 @@ func (m Message) Text() string {
 }
 
 // ToolUses returns the [ToolUseBlock]s in the message, in block order. This is
-// how the run loop and an [Approver] read the tool calls a model requested.
+// how the run loop reads the tool calls a model requested.
 func (m Message) ToolUses() []ToolUseBlock {
 	var out []ToolUseBlock
 	for _, blk := range m.Blocks {
@@ -250,8 +247,8 @@ type Tool interface {
 	Execute(context.Context, json.RawMessage) (ToolResult, error)
 }
 
-// ToolResult is the execution-layer return value of a rich-result tool
-// (see [ResultTool]). It is not a transcript type: the run loop converts it
+// ToolResult is the execution-layer return value of a tool (see [FuncResult]
+// for a typed constructor). It is not a transcript type: the run loop converts it
 // into a [ToolResultBlock] inside a role:"tool" [Message]. Blocks order is
 // preserved in the transcript, and Text() stays the compatibility view that
 // streaming consumers and text-only providers see.
@@ -354,8 +351,8 @@ type BlockDelta struct {
 	Signature   string // thinking signature (arrives at block end on Anthropic)
 }
 
-// StreamEventKind discriminates the StreamEvent variants delivered to a
-// RunStream callback. Switch on it to decide which fields are populated.
+// StreamEventKind discriminates the StreamEvent variants delivered to a live
+// view. Switch on it to decide which fields are populated.
 type StreamEventKind int
 
 const (
@@ -377,29 +374,29 @@ const (
 	StreamUsage
 )
 
-// StreamEvent is a single item in the event stream delivered to the RunStream
-// callback. Unlike StreamChunk (the provider-facing wire fragment), a
-// StreamEvent is a fully assembled, run-level observation: a content or
-// thinking delta, a requested tool call, a tool result, or usage.
+// StreamEvent is a provisional, run-level observation delivered to a live
+// view ([Runtime.RunStream] or [RunHandle.Observe]): a content or thinking
+// delta, a requested tool call, a tool result, or usage. Unlike StreamChunk
+// (the provider-facing wire fragment) it is fully assembled. Views are
+// bounded and may drop events; committed facts are in [RunHandle.Events].
 type StreamEvent struct {
 	Kind StreamEventKind
-	// Agent names the sub-agent the event originated from, set to the sub-agent
-	// tool's name when an [AsTool] sub-agent streams into a parent run. It is
-	// empty for events from the top-level agent being streamed. Nested
-	// sub-agents keep the innermost tag (a wrapper only stamps when empty).
+	// Agent names the child run the event originated from: the name of the
+	// [ChildTool] whose call started it. It is empty for events of the
+	// observed run itself. Events of nested children keep the innermost tag.
 	Agent string
-	// InvocationID identifies the specific sub-agent invocation the event came
-	// from: the ID of the tool call that started it. Two parallel calls to the
-	// same sub-agent tool share an Agent name but have distinct InvocationIDs,
-	// so (Agent, InvocationID) is what keeps their event streams separable. It
-	// is empty for top-level events, and — like Agent — keeps the innermost
-	// value on nested sub-agents.
+	// InvocationID identifies the specific child run the event came from:
+	// the ID of the tool call that started it. Two parallel calls to the same
+	// child tool share an Agent name but have distinct InvocationIDs, so
+	// (Agent, InvocationID) keeps their event streams separable. It is empty
+	// for the observed run's own events and, like Agent, keeps the innermost
+	// value for nested children.
 	InvocationID string
 	Text         string       // StreamText / StreamThinking: the content delta
 	ToolCall     ToolUseBlock // StreamToolCall / StreamToolResult: the call
 	Result       string       // StreamToolResult: the string returned to the model
 	// ResultBlocks holds the rich result blocks behind Result for a
-	// StreamToolResult (see [ResultTool]). For string tools it is a single
+	// StreamToolResult. For string tools it is a single
 	// [TextBlock]; for image-only rich results Result is "" — consumers that
 	// need the content should read ResultBlocks. Shared with the transcript, so
 	// treat it as read-only.

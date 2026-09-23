@@ -32,10 +32,10 @@ func questionTestAgent(t testing.TB, provider Provider) *Agent {
 func submitWaitingQuestion(t *testing.T, runtime *Runtime, turns ...Message) (*RunHandle, WaitSnapshot) {
 	t.Helper()
 	provider := &scriptedProvider{turns: append([]Message{asstTool("q-1", "ask_user", `{"prompt":"region?"}`)}, turns...)}
-	if err := runtime.Register("asker", "v1", questionTestAgent(t, provider)); err != nil {
+	if _, err := runtime.Register("asker", "v1", questionTestAgent(t, provider)); err != nil {
 		t.Fatal(err)
 	}
-	handle, err := runtime.Submit(context.Background(), "asker", "v1", "help", SubmitOptions{})
+	handle, err := runtime.Submit(context.Background(), DefinitionRef{ID: "asker", Revision: "v1"}, "help")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,10 +89,10 @@ func TestRuntimeCommittedEventsReplayRunLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	runtime := newTestRuntime(t)
-	if err := runtime.Register("agent", "v1", agent); err != nil {
+	if _, err := runtime.Register("agent", "v1", agent); err != nil {
 		t.Fatal(err)
 	}
-	result, err := runtime.Run(context.Background(), "agent", "v1", "go", SubmitOptions{})
+	result, err := runtime.Run(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "go")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -156,10 +156,10 @@ func TestRuntimeCommittedEventsReplayRunLifecycle(t *testing.T) {
 // skip.
 func TestRuntimeEventPagesAreBoundedAndResumable(t *testing.T) {
 	runtime := newTestRuntime(t)
-	if err := runtime.Register("agent", "v1", testAgent(&scriptedProvider{turns: []Message{asstText("done")}})); err != nil {
+	if _, err := runtime.Register("agent", "v1", testAgent(&scriptedProvider{turns: []Message{asstText("done")}})); err != nil {
 		t.Fatal(err)
 	}
-	result, err := runtime.Run(context.Background(), "agent", "v1", "go", SubmitOptions{})
+	result, err := runtime.Run(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "go")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -382,10 +382,10 @@ func (p *streamingDeltasProvider) InvokeStream(ctx context.Context, _ Request) (
 // completes, and committed events still replay everything that committed.
 func TestRuntimeStalledObserverDoesNotBlockCommits(t *testing.T) {
 	runtime := newTestRuntime(t)
-	if err := runtime.Register("agent", "v1", testAgent(&streamingDeltasProvider{deltas: 2000})); err != nil {
+	if _, err := runtime.Register("agent", "v1", testAgent(&streamingDeltasProvider{deltas: 2000})); err != nil {
 		t.Fatal(err)
 	}
-	handle, err := runtime.submit(context.Background(), "agent", "v1", "go", SubmitOptions{}, false)
+	handle, err := runtime.submit(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "go", nil, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -429,19 +429,19 @@ func TestRuntimeStalledObserverDoesNotBlockCommits(t *testing.T) {
 func TestRuntimeRunStreamReturnsWhenSuspendedRunIsCanceled(t *testing.T) {
 	runtime := newTestRuntime(t)
 	provider := &scriptedProvider{turns: []Message{asstTool("q-1", "ask_user", `{"prompt":"region?"}`)}}
-	if err := runtime.Register("asker", "v1", questionTestAgent(t, provider)); err != nil {
+	if _, err := runtime.Register("asker", "v1", questionTestAgent(t, provider)); err != nil {
 		t.Fatal(err)
 	}
 	streamed := make(chan error, 1)
-	options := SubmitOptions{Scope: "tenant", Key: "stream-cancel"}
+	options := WithIdempotencyKey("tenant", "stream-cancel")
 	go func() {
-		_, err := runtime.RunStream(context.Background(), "asker", "v1", "help", nil, options)
+		_, err := runtime.RunStream(context.Background(), DefinitionRef{ID: "asker", Revision: "v1"}, "help", nil, options)
 		streamed <- err
 	}()
 	var handle *RunHandle
 	deadline := time.Now().Add(2 * time.Second)
 	for handle == nil && time.Now().Before(deadline) {
-		if h, err := runtime.Submit(context.Background(), "asker", "v1", "help", options); err == nil {
+		if h, err := runtime.Submit(context.Background(), DefinitionRef{ID: "asker", Revision: "v1"}, "help", options); err == nil {
 			handle = h
 		}
 	}

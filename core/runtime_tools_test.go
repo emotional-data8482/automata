@@ -39,7 +39,7 @@ func seedPendingRuntimeBatch(t *testing.T, store Store, runID string, calls []To
 	record := storedRuntimeRun{
 		Version: runtimeEncodingVersion, RunID: runID, DefinitionID: "agent", DefinitionRevision: "v1",
 		Task: "work", State: RuntimeRunning, Generation: 2,
-		Result:         RunResult{RunID: runID, Turns: 1, Steps: 1, FinalMessage: messages[1]},
+		Result:         RunResult{RunID: runID, Turns: 1, FinalMessage: messages[1]},
 		LastTransition: "provider_accepted", EffectiveTools: effectiveTools,
 		PendingBatchID: "0000000000000000", NextBatchOrdinal: 1,
 	}
@@ -102,7 +102,7 @@ func TestRuntimeRecoveryDoesNotRerunCompletedBatchSibling(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer runtime.Close()
-	if err := runtime.Register("agent", "v1", agent); err != nil {
+	if _, err := runtime.Register("agent", "v1", agent); err != nil {
 		t.Fatal(err)
 	}
 	if err := runtime.Recover(context.Background()); err != nil {
@@ -141,7 +141,7 @@ func TestRuntimeUncertainEffectRequiresAuthoritativeReconciliation(t *testing.T)
 		t.Fatal(err)
 	}
 	defer runtime.Close()
-	if err := runtime.Register("agent", "v1", agent); err != nil {
+	if _, err := runtime.Register("agent", "v1", agent); err != nil {
 		t.Fatal(err)
 	}
 	if err := runtime.Recover(context.Background()); err != nil {
@@ -194,7 +194,7 @@ func TestRuntimeCancellationRetainsLateReconciliationEvidence(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer runtime.Close()
-	if err := runtime.Register("agent", "v1", testAgent(&scriptedProvider{turns: []Message{asstText("unused")}})); err != nil {
+	if _, err := runtime.Register("agent", "v1", testAgent(&scriptedProvider{turns: []Message{asstText("unused")}})); err != nil {
 		t.Fatal(err)
 	}
 	if err := runtime.Recover(context.Background()); err != nil {
@@ -232,10 +232,10 @@ func TestRuntimeRetainsEffectReturnedWithError(t *testing.T) {
 		result.Effect = EffectReport{Status: EffectApplied, Receipt: "write-7"}
 		return result, errors.New("response decoding failed")
 	}, ToolEffectPolicy{Kind: ToolEffectMutating}))
-	if err := runtime.Register("agent", "v1", agent); err != nil {
+	if _, err := runtime.Register("agent", "v1", agent); err != nil {
 		t.Fatal(err)
 	}
-	result, err := runtime.Run(context.Background(), "agent", "v1", "work", SubmitOptions{})
+	result, err := runtime.Run(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "work")
 	if err == nil || !strings.Contains(err.Error(), "response decoding failed") {
 		t.Fatalf("result = %#v, error = %v", result, err)
 	}
@@ -255,10 +255,10 @@ func TestRuntimeReturnedErrorIsNotAutomaticallyUncertain(t *testing.T) {
 	agent.RegisterTool(FuncResult("legacy", "legacy", func(context.Context, struct{}) (ToolResult, error) {
 		return ToolResult{}, errors.New("ordinary failure")
 	}))
-	if err := runtime.Register("agent", "v1", agent); err != nil {
+	if _, err := runtime.Register("agent", "v1", agent); err != nil {
 		t.Fatal(err)
 	}
-	result, err := runtime.Run(context.Background(), "agent", "v1", "work", SubmitOptions{})
+	result, err := runtime.Run(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "work")
 	if err == nil {
 		t.Fatal("expected ordinary tool error")
 	}
@@ -281,10 +281,10 @@ func TestRuntimeMutatingToolMustReportEffect(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := runtime.Register("agent", "v1", agent); err != nil {
+	if _, err := runtime.Register("agent", "v1", agent); err != nil {
 		t.Fatal(err)
 	}
-	result, err := runtime.Run(context.Background(), "agent", "v1", "work", SubmitOptions{})
+	result, err := runtime.Run(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "work")
 	if !errors.Is(err, ErrRunNeedsAttention) {
 		t.Fatalf("missing report result = %#v, %v", result, err)
 	}
@@ -314,10 +314,10 @@ func TestRuntimeDurableBatchCommitsReverseCompletionInModelOrder(t *testing.T) {
 		close(fastDone)
 		return TextResult("fast result"), nil
 	}, ToolEffectPolicy{Kind: ToolEffectReadOnly}))
-	if err := runtime.Register("agent", "v1", agent); err != nil {
+	if _, err := runtime.Register("agent", "v1", agent); err != nil {
 		t.Fatal(err)
 	}
-	result, err := runtime.Run(context.Background(), "agent", "v1", "work", SubmitOptions{})
+	result, err := runtime.Run(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "work")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -340,10 +340,10 @@ func TestRuntimeToolOperationIdentityAndPanicEvidence(t *testing.T) {
 			result.Effect = EffectReport{Status: EffectApplied, Receipt: op.ID}
 			return result, nil
 		}, ToolEffectPolicy{Kind: ToolEffectMutating}))
-		if err := runtime.Register("agent", "v1", agent); err != nil {
+		if _, err := runtime.Register("agent", "v1", agent); err != nil {
 			t.Fatal(err)
 		}
-		result, err := runtime.Run(context.Background(), "agent", "v1", "work", SubmitOptions{})
+		result, err := runtime.Run(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "work")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -363,10 +363,10 @@ func TestRuntimeToolOperationIdentityAndPanicEvidence(t *testing.T) {
 		agent.RegisterTool(FuncResult("panic", "panic", func(context.Context, struct{}) (ToolResult, error) {
 			panic("boom")
 		}))
-		if err := runtime.Register("agent", "v1", agent); err != nil {
+		if _, err := runtime.Register("agent", "v1", agent); err != nil {
 			t.Fatal(err)
 		}
-		result, err := runtime.Run(context.Background(), "agent", "v1", "work", SubmitOptions{})
+		result, err := runtime.Run(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "work")
 		if err == nil || !strings.Contains(err.Error(), "panicked: boom") {
 			t.Fatalf("panic result = %#v, %v", result, err)
 		}
@@ -402,10 +402,10 @@ func TestRuntimeInvalidMutatingArgumentsAreKnownNotApplied(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := runtime.Register("agent", "v1", agent); err != nil {
+	if _, err := runtime.Register("agent", "v1", agent); err != nil {
 		t.Fatal(err)
 	}
-	result, err := runtime.Run(context.Background(), "agent", "v1", "work", SubmitOptions{})
+	result, err := runtime.Run(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "work")
 	if err != nil || result.Output != "recovered" || executions.Load() != 0 {
 		t.Fatalf("invalid mutation = %#v, %v; executions=%d", result, err, executions.Load())
 	}
@@ -448,10 +448,10 @@ func TestRuntimeSemanticGuardRejectsDuplicateMutationInModelOrder(t *testing.T) 
 	})
 	agent := testAgent(provider)
 	agent.RegisterTool(tool)
-	if err := runtime.Register("agent", "v1", agent); err != nil {
+	if _, err := runtime.Register("agent", "v1", agent); err != nil {
 		t.Fatal(err)
 	}
-	result, err := runtime.Run(context.Background(), "agent", "v1", "work", SubmitOptions{})
+	result, err := runtime.Run(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "work")
 	if err != nil {
 		t.Fatal(err)
 	}

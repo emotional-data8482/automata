@@ -22,35 +22,9 @@ type partialBlock struct {
 	input     strings.Builder // tool_use input (partial JSON)
 }
 
-// RunStream runs the agent directly like [Agent.Run] but delivers a live event stream to
-// onEvent as the run progresses: assistant content deltas ([StreamText]), each
-// tool call the model requests ([StreamToolCall]), and each tool result
-// ([StreamToolResult]). Switch on [StreamEvent.Kind] to handle each variant.
-//
-// If the provider does not implement [StreamProvider], it falls back to a single
-// non-streaming invocation and delivers the whole content as one [StreamText]
-// event; tool-call and tool-result events still fire. A nil onEvent is treated
-// as a no-op.
-//
-// onEvent may be called from multiple goroutines (tool results are produced
-// concurrently), but RunStream serializes the calls, so the callback need not be
-// safe for concurrent use.
-//
-// RunStream is a process-local convenience and is not persistent.
-// [Runtime.RunStream] provides the durable lifecycle with a detachable view.
-func (a *Agent) RunStream(ctx context.Context, task string, onEvent func(StreamEvent), opts ...RunOption) (RunResult, error) {
-	cfg := a.newRunConfig(opts)
-	scope, err := a.beginRun(ctx, cfg, nil, nil, "stream")
-	if err != nil {
-		return scope.finish(scope.result, err)
-	}
-	cfg.scope = scope
-	result, err := a.runStream(scope.ctx, newLoop(a, nil), task, onEvent, cfg)
-	return scope.finish(result, err)
-}
-
-// runStream drives a pre-built loop through the streaming path. Split from
-// RunStream so a [Session] can supply a loop seeded with its transcript.
+// runStream drives a loop through one worker segment, streaming provisional
+// events to onEvent. Providers without [StreamProvider] are invoked once per
+// turn and their content is delivered as whole-message events.
 func (a *Agent) runStream(ctx context.Context, l *loop, task string, onEvent func(StreamEvent), cfg runConfig) (RunResult, error) {
 	if onEvent == nil {
 		onEvent = func(StreamEvent) {}
@@ -58,7 +32,6 @@ func (a *Agent) runStream(ctx context.Context, l *loop, task string, onEvent fun
 
 	sp, streamOK := a.provider.(StreamProvider)
 
-	l.streaming = true
 	var mu sync.Mutex
 	l.emit = func(ev StreamEvent) {
 		mu.Lock()

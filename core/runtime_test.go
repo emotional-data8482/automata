@@ -44,10 +44,10 @@ func TestRuntimeUsesExistingLoopAndStableRunIdentity(t *testing.T) {
 	provider := &scriptedProvider{turns: []Message{asstText("done")}}
 	agent := testAgent(provider)
 	runtime := newTestRuntime(t)
-	if err := runtime.Register("answerer", "v1", agent); err != nil {
+	if _, err := runtime.Register("answerer", "v1", agent); err != nil {
 		t.Fatal(err)
 	}
-	result, err := runtime.Run(context.Background(), "answerer", "v1", "work", SubmitOptions{})
+	result, err := runtime.Run(context.Background(), DefinitionRef{ID: "answerer", Revision: "v1"}, "work")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,37 +65,37 @@ func TestRuntimeUsesExistingLoopAndStableRunIdentity(t *testing.T) {
 
 func TestRuntimeAdmissionIsIdempotent(t *testing.T) {
 	runtime := newTestRuntime(t)
-	if err := runtime.Register("agent", "v1", testAgent(&scriptedProvider{turns: []Message{asstText("ok")}})); err != nil {
+	if _, err := runtime.Register("agent", "v1", testAgent(&scriptedProvider{turns: []Message{asstText("ok")}})); err != nil {
 		t.Fatal(err)
 	}
-	options := SubmitOptions{Scope: "tenant", Key: "task-1"}
-	a, err := runtime.Submit(context.Background(), "agent", "v1", "same", options)
+	options := WithIdempotencyKey("tenant", "task-1")
+	a, err := runtime.Submit(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "same", options)
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := runtime.Submit(context.Background(), "agent", "v1", "same", options)
+	b, err := runtime.Submit(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "same", options)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if a.ID() != b.ID() {
 		t.Fatalf("duplicate admission IDs = %q, %q", a.ID(), b.ID())
 	}
-	if _, err := runtime.Submit(context.Background(), "agent", "v1", "changed", options); !errors.Is(err, ErrAdmissionConflict) {
+	if _, err := runtime.Submit(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "changed", options); !errors.Is(err, ErrAdmissionConflict) {
 		t.Fatalf("changed duplicate = %v", err)
 	}
 }
 
 func TestRuntimeCompletedAdmissionRetryReturnsStoredResult(t *testing.T) {
 	runtime := newTestRuntime(t)
-	if err := runtime.Register("agent", "v1", testAgent(&scriptedProvider{turns: []Message{asstText("ok")}})); err != nil {
+	if _, err := runtime.Register("agent", "v1", testAgent(&scriptedProvider{turns: []Message{asstText("ok")}})); err != nil {
 		t.Fatal(err)
 	}
-	options := SubmitOptions{Scope: "tenant", Key: "completed-task"}
-	first, err := runtime.Run(context.Background(), "agent", "v1", "same", options)
+	options := WithIdempotencyKey("tenant", "completed-task")
+	first, err := runtime.Run(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "same", options)
 	if err != nil {
 		t.Fatal(err)
 	}
-	retried, err := runtime.Submit(context.Background(), "agent", "v1", "same", options)
+	retried, err := runtime.Submit(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "same", options)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -124,17 +124,17 @@ func TestRuntimeDurableChildConcurrentSiblingsComplete(t *testing.T) {
 		AssistantMessage(toolUse("sub-1", "child", `{"topic":"a"}`), toolUse("sub-2", "child", `{"topic":"b"}`)),
 		asstText("parent done"),
 	}})
-	parent.RegisterTool(DurableChildTool(childDefinition, DurableChildPolicy{DefinitionID: "child", Revision: "v1"}))
+	parent.RegisterTool(NewChildTool(childDefinition, DefinitionRef{ID: "child", Revision: "v1"}))
 	parent.WithToolPolicy(ToolPolicy{MaxCalls: 2})
 
 	runtime := newTestRuntime(t)
-	if err := runtime.Register("child", "v1", child); err != nil {
+	if _, err := runtime.Register("child", "v1", child); err != nil {
 		t.Fatal(err)
 	}
-	if err := runtime.Register("parent", "v1", parent); err != nil {
+	if _, err := runtime.Register("parent", "v1", parent); err != nil {
 		t.Fatal(err)
 	}
-	handle, err := runtime.Submit(context.Background(), "parent", "v1", "go", SubmitOptions{})
+	handle, err := runtime.Submit(context.Background(), DefinitionRef{ID: "parent", Revision: "v1"}, "go")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -214,21 +214,21 @@ func TestRuntimeDurableChildBudgetDeniedSiblingKeepsIdentity(t *testing.T) {
 		AssistantMessage(toolUse("sub-1", "child", `{"topic":"a"}`), toolUse("sub-2", "child", `{"topic":"b"}`)),
 		asstText("parent done"),
 	}}).WithToolPolicy(ToolPolicy{MaxCalls: 1})
-	parent.RegisterTool(DurableChildTool(childTestDefinition("child"), DurableChildPolicy{DefinitionID: "child", Revision: "v1"}))
+	parent.RegisterTool(NewChildTool(childTestDefinition("child"), DefinitionRef{ID: "child", Revision: "v1"}))
 
 	runtime := newTestRuntime(t)
-	if err := runtime.Register("child", "v1", child); err != nil {
+	if _, err := runtime.Register("child", "v1", child); err != nil {
 		t.Fatal(err)
 	}
-	if err := runtime.Register("parent", "v1", parent); err != nil {
+	if _, err := runtime.Register("parent", "v1", parent); err != nil {
 		t.Fatal(err)
 	}
 	var budgetEvent StreamEvent
-	result, err := runtime.RunStream(context.Background(), "parent", "v1", "go", func(event StreamEvent) {
+	result, err := runtime.RunStream(context.Background(), DefinitionRef{ID: "parent", Revision: "v1"}, "go", func(event StreamEvent) {
 		if event.Kind == StreamToolResult && errors.Is(event.Err, ErrToolBudgetExhausted) {
 			budgetEvent = event
 		}
-	}, SubmitOptions{})
+	})
 	if err != nil {
 		t.Fatalf("RunStream: %v", err)
 	}
@@ -294,12 +294,12 @@ func TestRuntimeRunStreamStartsAdmittedWorkAfterViewCancellation(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = runtime.Close() })
-	if err := runtime.Register("agent", "v1", testAgent(provider)); err != nil {
+	if _, err := runtime.Register("agent", "v1", testAgent(provider)); err != nil {
 		t.Fatal(err)
 	}
 
 	store.armed.Store(true)
-	result, err := runtime.RunStream(view, "agent", "v1", "work", nil, SubmitOptions{})
+	result, err := runtime.RunStream(view, DefinitionRef{ID: "agent", Revision: "v1"}, "work", nil)
 	runID := onlyStoredRunID(t, base)
 	if !errors.Is(err, context.Canceled) || result.RunID != runID {
 		t.Errorf("detached stream = %#v, %v; want run %q and context cancellation", result, err, runID)
@@ -326,12 +326,12 @@ func TestRuntimeRunStreamStartsAdmittedWorkAfterSnapshotFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = runtime.Close() })
-	if err := runtime.Register("agent", "v1", testAgent(provider)); err != nil {
+	if _, err := runtime.Register("agent", "v1", testAgent(provider)); err != nil {
 		t.Fatal(err)
 	}
 
 	store.armed.Store(true)
-	result, err := runtime.RunStream(context.Background(), "agent", "v1", "work", nil, SubmitOptions{})
+	result, err := runtime.RunStream(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "work", nil)
 	runID := onlyStoredRunID(t, base)
 	if !errors.Is(err, readErr) || result.RunID != runID {
 		t.Errorf("failed attachment = %#v, %v; want run %q and read error", result, err, runID)
@@ -357,22 +357,22 @@ func TestRuntimeRunStreamDisconnectRetainsIdentityWithoutDetachedRead(t *testing
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = runtime.Close() })
-	if err := runtime.Register("agent", "v1", testAgent(provider)); err != nil {
+	if _, err := runtime.Register("agent", "v1", testAgent(provider)); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(provider.unblock)
 
 	view, cancel := context.WithCancel(context.Background())
-	finished := make(chan BackgroundResult, 1)
+	finished := make(chan runOutcomeResult, 1)
 	go func() {
-		result, err := runtime.RunStream(view, "agent", "v1", "work", nil, SubmitOptions{})
-		finished <- BackgroundResult{Result: result, Err: err}
+		result, err := runtime.RunStream(view, DefinitionRef{ID: "agent", Revision: "v1"}, "work", nil)
+		finished <- runOutcomeResult{Result: result, Err: err}
 	}()
 	waitForSignal(t, provider.started, "provider start")
 	store.failReads.Store(true)
 	cancel()
 
-	detached := waitForBackgroundResult(t, finished)
+	detached := waitForRunOutcome(t, finished)
 	if !errors.Is(detached.Err, context.Canceled) || detached.Result.RunID == "" {
 		t.Fatalf("detached stream = %#v, %v; want admitted identity and context cancellation", detached.Result, detached.Err)
 	}
@@ -403,12 +403,12 @@ func TestRuntimeRunStreamDoesNotStartUnknownAdmissionOutcome(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = runtime.Close() })
-	if err := runtime.Register("agent", "v1", testAgent(provider)); err != nil {
+	if _, err := runtime.Register("agent", "v1", testAgent(provider)); err != nil {
 		t.Fatal(err)
 	}
 
 	store.armed.Store(true)
-	result, err := runtime.RunStream(context.Background(), "agent", "v1", "work", nil, SubmitOptions{})
+	result, err := runtime.RunStream(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "work", nil)
 	if !errors.Is(err, commitErr) || result.RunID != "" {
 		t.Fatalf("unknown admission result = %#v, %v", result, err)
 	}
@@ -430,13 +430,13 @@ func TestRuntimeRunStreamDoesNotStartCanceledAdmission(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = runtime.Close() })
-	if err := runtime.Register("agent", "v1", testAgent(provider)); err != nil {
+	if _, err := runtime.Register("agent", "v1", testAgent(provider)); err != nil {
 		t.Fatal(err)
 	}
 	view, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	result, err := runtime.RunStream(view, "agent", "v1", "work", nil, SubmitOptions{})
+	result, err := runtime.RunStream(view, DefinitionRef{ID: "agent", Revision: "v1"}, "work", nil)
 	if !errors.Is(err, context.Canceled) || result.RunID != "" {
 		t.Fatalf("canceled admission = %#v, %v", result, err)
 	}
@@ -461,13 +461,13 @@ func TestRuntimeStaleStreamSchedulingDoesNotPoisonCompletedRun(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = runtime.Close() })
-	if err := runtime.Register("agent", "v1", testAgent(provider)); err != nil {
+	if _, err := runtime.Register("agent", "v1", testAgent(provider)); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(provider.unblock)
 	t.Cleanup(store.unblock)
-	options := SubmitOptions{Scope: "tenant", Key: "stale-stream"}
-	handle, err := runtime.Submit(context.Background(), "agent", "v1", "work", options)
+	options := WithIdempotencyKey("tenant", "stale-stream")
+	handle, err := runtime.Submit(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "work", options)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -476,10 +476,10 @@ func TestRuntimeStaleStreamSchedulingDoesNotPoisonCompletedRun(t *testing.T) {
 	terminal, unsubscribe := runtime.subscribe(handle.ID())
 	defer unsubscribe()
 	store.pause.Store(true)
-	attached := make(chan BackgroundResult, 1)
+	attached := make(chan runOutcomeResult, 1)
 	go func() {
-		result, err := runtime.RunStream(context.Background(), "agent", "v1", "work", nil, options)
-		attached <- BackgroundResult{Result: result, Err: err}
+		result, err := runtime.RunStream(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "work", nil, options)
+		attached <- runOutcomeResult{Result: result, Err: err}
 	}()
 	waitForSignal(t, store.reached, "stream snapshot")
 
@@ -492,7 +492,7 @@ func TestRuntimeStaleStreamSchedulingDoesNotPoisonCompletedRun(t *testing.T) {
 	staleAttempt, unsubscribeStale := runtime.subscribe(handle.ID())
 	defer unsubscribeStale()
 	store.unblock()
-	reattached := waitForBackgroundResult(t, attached)
+	reattached := waitForRunOutcome(t, attached)
 	if reattached.Err != nil || reattached.Result.RunID != first.RunID || reattached.Result.Output != first.Output {
 		t.Fatalf("reattached result = %#v, %v; want %#v", reattached.Result, reattached.Err, first)
 	}
@@ -514,11 +514,11 @@ func TestRuntimeStaleStreamSchedulingDoesNotPoisonCompletedRun(t *testing.T) {
 func TestRuntimeDuplicateSchedulingWhileLiveIsHarmless(t *testing.T) {
 	provider := &countingBarrierRuntimeProvider{started: make(chan struct{}), release: make(chan struct{})}
 	runtime := newTestRuntime(t)
-	if err := runtime.Register("agent", "v1", testAgent(provider)); err != nil {
+	if _, err := runtime.Register("agent", "v1", testAgent(provider)); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(provider.unblock)
-	handle, err := runtime.Submit(context.Background(), "agent", "v1", "work", SubmitOptions{})
+	handle, err := runtime.Submit(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "work")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -546,10 +546,10 @@ func TestRuntimeClaimFailurePreservesRunIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = runtime.Close() })
-	if err := runtime.Register("agent", "v1", testAgent(&countingRuntimeProvider{})); err != nil {
+	if _, err := runtime.Register("agent", "v1", testAgent(&countingRuntimeProvider{})); err != nil {
 		t.Fatal(err)
 	}
-	handle, err := runtime.Submit(context.Background(), "agent", "v1", "work", SubmitOptions{})
+	handle, err := runtime.Submit(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "work")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -571,11 +571,11 @@ func TestRuntimeStaleSchedulingPreservesGenuineWorkerFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = runtime.Close() })
-	if err := runtime.Register("agent", "v1", testAgent(provider)); err != nil {
+	if _, err := runtime.Register("agent", "v1", testAgent(provider)); err != nil {
 		t.Fatal(err)
 	}
-	options := SubmitOptions{Scope: "tenant", Key: "failed-finalization"}
-	handle, err := runtime.Submit(context.Background(), "agent", "v1", "work", options)
+	options := WithIdempotencyKey("tenant", "failed-finalization")
+	handle, err := runtime.Submit(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "work", options)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -588,7 +588,7 @@ func TestRuntimeStaleSchedulingPreservesGenuineWorkerFailure(t *testing.T) {
 
 	view, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	attached, err := runtime.RunStream(view, "agent", "v1", "work", nil, options)
+	attached, err := runtime.RunStream(view, DefinitionRef{ID: "agent", Revision: "v1"}, "work", nil, options)
 	if !errors.Is(err, finishErr) || attached.RunID != first.RunID || attached.Output != first.Output {
 		t.Fatalf("reattached worker failure = %#v, %v; want %#v", attached, err, first)
 	}
@@ -610,7 +610,7 @@ func TestRuntimeInvalidPersistedStateIsAClaimFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = runtime.Close() })
-	if err := runtime.Register("agent", "v1", testAgent(&countingRuntimeProvider{})); err != nil {
+	if _, err := runtime.Register("agent", "v1", testAgent(&countingRuntimeProvider{})); err != nil {
 		t.Fatal(err)
 	}
 	record := storedRuntimeRun{
@@ -636,10 +636,10 @@ func TestRuntimeInvalidPersistedStateIsAClaimFailure(t *testing.T) {
 func TestRuntimeViewCancellationDoesNotCancelRun(t *testing.T) {
 	provider := &barrierRuntimeProvider{started: make(chan struct{}), release: make(chan struct{})}
 	runtime := newTestRuntime(t)
-	if err := runtime.Register("agent", "v1", testAgent(provider)); err != nil {
+	if _, err := runtime.Register("agent", "v1", testAgent(provider)); err != nil {
 		t.Fatal(err)
 	}
-	handle, err := runtime.Submit(context.Background(), "agent", "v1", "work", SubmitOptions{})
+	handle, err := runtime.Submit(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "work")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -670,11 +670,11 @@ func TestRuntimeAwaitCancellationRetainsIdentityWithoutDetachedRead(t *testing.T
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = runtime.Close() })
-	if err := runtime.Register("agent", "v1", testAgent(provider)); err != nil {
+	if _, err := runtime.Register("agent", "v1", testAgent(provider)); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(provider.unblock)
-	handle, err := runtime.Submit(context.Background(), "agent", "v1", "work", SubmitOptions{})
+	handle, err := runtime.Submit(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "work")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -707,14 +707,14 @@ func TestRuntimeAwaitCancellationRetainsIdentityWithoutDetachedRead(t *testing.T
 func TestRuntimeSyncHelperDisconnectCanReattachByAdmissionIdentity(t *testing.T) {
 	provider := &barrierRuntimeProvider{started: make(chan struct{}), release: make(chan struct{})}
 	runtime := newTestRuntime(t)
-	if err := runtime.Register("agent", "v1", testAgent(provider)); err != nil {
+	if _, err := runtime.Register("agent", "v1", testAgent(provider)); err != nil {
 		t.Fatal(err)
 	}
 	view, cancel := context.WithCancel(context.Background())
 	finished := make(chan error, 1)
-	options := SubmitOptions{Scope: "tenant", Key: "reattach"}
+	options := WithIdempotencyKey("tenant", "reattach")
 	go func() {
-		_, err := runtime.Run(view, "agent", "v1", "work", options)
+		_, err := runtime.Run(view, DefinitionRef{ID: "agent", Revision: "v1"}, "work", options)
 		finished <- err
 	}()
 	<-provider.started
@@ -722,7 +722,7 @@ func TestRuntimeSyncHelperDisconnectCanReattachByAdmissionIdentity(t *testing.T)
 	if err := <-finished; !errors.Is(err, context.Canceled) {
 		t.Fatalf("sync view disconnect = %v", err)
 	}
-	handle, err := runtime.Submit(context.Background(), "agent", "v1", "work", options)
+	handle, err := runtime.Submit(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "work", options)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -735,15 +735,15 @@ func TestRuntimeSyncHelperDisconnectCanReattachByAdmissionIdentity(t *testing.T)
 
 func TestRuntimeStreamIsAViewOfSameRun(t *testing.T) {
 	runtime := newTestRuntime(t)
-	if err := runtime.Register("agent", "v1", testAgent(&scriptedProvider{turns: []Message{asstText("streamed")}})); err != nil {
+	if _, err := runtime.Register("agent", "v1", testAgent(&scriptedProvider{turns: []Message{asstText("streamed")}})); err != nil {
 		t.Fatal(err)
 	}
 	var text string
-	result, err := runtime.RunStream(context.Background(), "agent", "v1", "work", func(event StreamEvent) {
+	result, err := runtime.RunStream(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "work", func(event StreamEvent) {
 		if event.Kind == StreamText {
 			text += event.Text
 		}
-	}, SubmitOptions{})
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -755,10 +755,10 @@ func TestRuntimeStreamIsAViewOfSameRun(t *testing.T) {
 func TestRuntimeExplicitCancelOwnsLogicalCancellation(t *testing.T) {
 	provider := &cancelRuntimeProvider{started: make(chan struct{})}
 	runtime := newTestRuntime(t)
-	if err := runtime.Register("agent", "v1", testAgent(provider)); err != nil {
+	if _, err := runtime.Register("agent", "v1", testAgent(provider)); err != nil {
 		t.Fatal(err)
 	}
-	handle, err := runtime.Submit(context.Background(), "agent", "v1", "work", SubmitOptions{})
+	handle, err := runtime.Submit(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "work")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -772,13 +772,9 @@ func TestRuntimeExplicitCancelOwnsLogicalCancellation(t *testing.T) {
 	}
 }
 
-func TestRuntimeUsesRequestTransformsButNotDirectRunObservers(t *testing.T) {
+func TestRuntimeUsesRequestTransforms(t *testing.T) {
 	var transforms atomic.Int32
-	var legacyObservations atomic.Int32
 	agent, err := New(&scriptedProvider{turns: []Message{asstText("done")}}, AgentConfig{
-		Observers: []RunObserver{func(context.Context, RunEvent) {
-			legacyObservations.Add(1)
-		}},
 		PreSendHooks: []PreSendHook{func(_ context.Context, request Request) (Request, error) {
 			transforms.Add(1)
 			return request, nil
@@ -788,15 +784,15 @@ func TestRuntimeUsesRequestTransformsButNotDirectRunObservers(t *testing.T) {
 		t.Fatal(err)
 	}
 	runtime := newTestRuntime(t)
-	if err := runtime.Register("agent", "v1", agent); err != nil {
+	if _, err := runtime.Register("agent", "v1", agent); err != nil {
 		t.Fatal(err)
 	}
-	result, err := runtime.Run(context.Background(), "agent", "v1", "work", SubmitOptions{})
+	result, err := runtime.Run(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "work")
 	if err != nil || result.Status != RunCompleted {
 		t.Fatalf("durable result = %#v, %v", result, err)
 	}
-	if transforms.Load() != 1 || legacyObservations.Load() != 0 {
-		t.Fatalf("request transforms=%d legacy observations=%d", transforms.Load(), legacyObservations.Load())
+	if transforms.Load() != 1 {
+		t.Fatalf("request transforms=%d", transforms.Load())
 	}
 }
 
@@ -841,15 +837,15 @@ func TestRuntimeCommittedHooksAreBoundedVisibleAndDoNotRewriteResult(t *testing.
 		},
 	}
 	var err error
-	runtime, err = NewEphemeralRuntime(hooks...)
+	runtime, err = NewRuntime(context.Background(), RuntimeConfig{Store: NewMemoryStore(), Hooks: hooks})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer runtime.Close()
-	if err := runtime.Register("agent", "v1", testAgent(&scriptedProvider{turns: []Message{asstText("done")}})); err != nil {
+	if _, err := runtime.Register("agent", "v1", testAgent(&scriptedProvider{turns: []Message{asstText("done")}})); err != nil {
 		t.Fatal(err)
 	}
-	result, err := runtime.Run(context.Background(), "agent", "v1", "work", SubmitOptions{})
+	result, err := runtime.Run(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "work")
 	if err != nil || result.Output != "done" || result.Status != RunCompleted {
 		t.Fatalf("execution result = %#v, %v", result, err)
 	}
@@ -878,7 +874,7 @@ func TestRuntimeRejectsInvalidCommittedHooks(t *testing.T) {
 		{{Name: "negative", Timeout: -time.Second, Handle: func(context.Context, RunSnapshot) error { return nil }}},
 		{{Name: "duplicate", Handle: func(context.Context, RunSnapshot) error { return nil }}, {Name: "duplicate", Handle: func(context.Context, RunSnapshot) error { return nil }}},
 	} {
-		if _, err := NewEphemeralRuntime(hooks...); err == nil {
+		if _, err := NewRuntime(context.Background(), RuntimeConfig{Store: NewMemoryStore(), Hooks: hooks}); err == nil {
 			t.Fatalf("accepted hooks %#v", hooks)
 		}
 	}
@@ -891,10 +887,10 @@ func TestRuntimeRecoverUsesPinnedBindingAndConservativeAttention(t *testing.T) {
 		t.Fatal(err)
 	}
 	agent := testAgent(&scriptedProvider{turns: []Message{asstText("recovered")}})
-	if err := first.Register("agent", "v1", agent); err != nil {
+	if _, err := first.Register("agent", "v1", agent); err != nil {
 		t.Fatal(err)
 	}
-	handle, err := first.submit(context.Background(), "agent", "v1", "work", SubmitOptions{}, false)
+	handle, err := first.submit(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "work", nil, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -908,7 +904,7 @@ func TestRuntimeRecoverUsesPinnedBindingAndConservativeAttention(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer reopened.Close()
-	if err := reopened.Register("agent", "v1", agent); err != nil {
+	if _, err := reopened.Register("agent", "v1", agent); err != nil {
 		t.Fatal(err)
 	}
 	if err := reopened.Recover(context.Background()); err != nil {
@@ -941,7 +937,7 @@ func TestRuntimeRecoverUsesPinnedBindingAndConservativeAttention(t *testing.T) {
 	if err != nil || snapshot.State != RuntimeNeedsAttention || snapshot.Attention == nil || snapshot.Attention.Kind != AttentionExecution || snapshot.Attention.Reason == "" {
 		t.Fatalf("missing binding snapshot = %#v, %v", snapshot, err)
 	}
-	if err := missing.Register("agent", "v2", testAgent(&scriptedProvider{turns: []Message{asstText("late binding")}})); err != nil {
+	if _, err := missing.Register("agent", "v2", testAgent(&scriptedProvider{turns: []Message{asstText("late binding")}})); err != nil {
 		t.Fatal(err)
 	}
 	if err := missing.Recover(context.Background()); err != nil {
@@ -987,10 +983,10 @@ func TestRuntimeRecoverUsesPinnedBindingAndConservativeAttention(t *testing.T) {
 func TestRuntimeRecoverDoesNotReclassifyLiveRun(t *testing.T) {
 	provider := &barrierRuntimeProvider{started: make(chan struct{}), release: make(chan struct{})}
 	runtime := newTestRuntime(t)
-	if err := runtime.Register("agent", "v1", testAgent(provider)); err != nil {
+	if _, err := runtime.Register("agent", "v1", testAgent(provider)); err != nil {
 		t.Fatal(err)
 	}
-	handle, err := runtime.Submit(context.Background(), "agent", "v1", "work", SubmitOptions{})
+	handle, err := runtime.Submit(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "work")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1019,10 +1015,10 @@ func TestRuntimePersistsAcceptedProviderTurnBeforeToolDispatch(t *testing.T) {
 	tool := &countingTool{}
 	agent := testAgent(&scriptedProvider{turns: []Message{asstTool("c1", "counter", `{}`)}})
 	agent.RegisterTool(tool)
-	if err := runtime.Register("agent", "v1", agent); err != nil {
+	if _, err := runtime.Register("agent", "v1", agent); err != nil {
 		t.Fatal(err)
 	}
-	handle, err := runtime.Submit(context.Background(), "agent", "v1", "work", SubmitOptions{})
+	handle, err := runtime.Submit(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "work")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1040,10 +1036,10 @@ func TestRuntimePersistsAcceptedProviderTurnBeforeToolDispatch(t *testing.T) {
 
 func TestRuntimeRestoresDeadlineErrorClassification(t *testing.T) {
 	runtime := newTestRuntime(t)
-	if err := runtime.Register("agent", "v1", testAgent(&cancelRuntimeProvider{started: make(chan struct{})})); err != nil {
+	if _, err := runtime.Register("agent", "v1", testAgent(&cancelRuntimeProvider{started: make(chan struct{})})); err != nil {
 		t.Fatal(err)
 	}
-	result, err := runtime.Run(context.Background(), "agent", "v1", "work", SubmitOptions{Deadline: time.Now().Add(20 * time.Millisecond)})
+	result, err := runtime.Run(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "work", WithDeadline(time.Now().Add(20*time.Millisecond)))
 	if !errors.Is(err, context.DeadlineExceeded) || result.Status != RunCancelled {
 		t.Fatalf("deadline result = %#v, %v", result, err)
 	}
@@ -1055,17 +1051,17 @@ func TestRuntimeDefinitionRegistrationIsImmutable(t *testing.T) {
 	a := testAgent(provider)
 	a.systemPrompt = "original"
 	b := testAgent(&scriptedProvider{turns: []Message{asstText("b")}})
-	if err := runtime.Register("agent", "v1", a); err != nil {
+	if _, err := runtime.Register("agent", "v1", a); err != nil {
 		t.Fatal(err)
 	}
-	if err := runtime.Register("agent", "v1", a); err != nil {
+	if _, err := runtime.Register("agent", "v1", a); err != nil {
 		t.Fatalf("idempotent registration = %v", err)
 	}
-	if err := runtime.Register("agent", "v1", b); !errors.Is(err, ErrDefinitionConflict) {
+	if _, err := runtime.Register("agent", "v1", b); !errors.Is(err, ErrDefinitionConflict) {
 		t.Fatalf("replacement registration = %v", err)
 	}
 	a.systemPrompt = "mutated after registration"
-	if _, err := runtime.Run(context.Background(), "agent", "v1", "work", SubmitOptions{}); err != nil {
+	if _, err := runtime.Run(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "work"); err != nil {
 		t.Fatal(err)
 	}
 	if got := provider.received[0][0].Text(); got != "original" {
@@ -1075,15 +1071,15 @@ func TestRuntimeDefinitionRegistrationIsImmutable(t *testing.T) {
 
 func TestRuntimeCloseYieldsInterruptedWorkerToAttention(t *testing.T) {
 	provider := &barrierRuntimeProvider{started: make(chan struct{}), release: make(chan struct{})}
-	store := newEphemeralStore()
+	store := NewMemoryStore()
 	runtime, err := NewRuntime(context.Background(), RuntimeConfig{Store: store})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := runtime.Register("agent", "v1", testAgent(provider)); err != nil {
+	if _, err := runtime.Register("agent", "v1", testAgent(provider)); err != nil {
 		t.Fatal(err)
 	}
-	handle, err := runtime.Submit(context.Background(), "agent", "v1", "work", SubmitOptions{})
+	handle, err := runtime.Submit(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "work")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1341,13 +1337,19 @@ func waitForRuntimeTerminal(t *testing.T, events <-chan runtimeStreamItem) {
 	}
 }
 
-func waitForBackgroundResult(t *testing.T, result <-chan BackgroundResult) BackgroundResult {
+// runOutcomeResult carries a run's result and error out of a goroutine.
+type runOutcomeResult struct {
+	Result RunResult
+	Err    error
+}
+
+func waitForRunOutcome(t *testing.T, result <-chan runOutcomeResult) runOutcomeResult {
 	t.Helper()
 	select {
 	case value := <-result:
 		return value
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for background result")
-		return BackgroundResult{}
+		return runOutcomeResult{}
 	}
 }

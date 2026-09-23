@@ -82,8 +82,8 @@ func (e nonRetryableToolEffectError) Retryable() bool { return false }
 // WithToolRetry opts into retries of eligible returned Go errors, preserving rich
 // results. ErrorResult with nil error is never retried, and a result reporting
 // EffectApplied or EffectUnknown is returned immediately with its error even if
-// that error is retryable. Do not wrap AsTool: retrying it would repeat the
-// entire child operation and its side effects.
+// that error is retryable. Runtime rejects a retried [ChildTool]: retrying it
+// would repeat the entire child run and its side effects.
 func WithToolRetry(t Tool, cfg retry.Config) Tool { return &retryTool{Tool: t, cfg: cfg} }
 
 type legacyErrorTool struct{ Tool }

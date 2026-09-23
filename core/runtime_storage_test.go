@@ -14,15 +14,16 @@ import (
 
 // --- encoding fixtures -------------------------------------------------------
 
-// Golden fixtures lock the version 8 record encoding and the admission digest
+// Golden fixtures lock the version 9 record encoding and the admission digest
 // rule. Changing either changes every persisted record and requires a new
 // encoding version, not a silent rewrite. Version 7 added durable child runs,
 // parent operation links, and internal child waits; version 8 keys transcript
 // chunks by first message index and adds the committed event log and run
-// indexes.
+// indexes. Version 9 adds string decisions, child call tags, and persisted
+// structured-output violations.
 func TestRuntimeRecordEncodingIsStable(t *testing.T) {
 	record := storedRuntimeRun{
-		Version: 8, RunID: "run-1", DefinitionID: "agent", DefinitionRevision: "v1",
+		Version: 9, RunID: "run-1", DefinitionID: "agent", DefinitionRevision: "v1",
 		Task: "work", Deadline: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC),
 		State: RuntimeRunning, Generation: 7,
 		Result:             RunResult{RunID: "run-1", Status: RunCompleted, Output: "done", Turns: 2},
@@ -36,13 +37,13 @@ func TestRuntimeRecordEncodingIsStable(t *testing.T) {
 		t.Fatal(err)
 	}
 	// RunResult persists with Go field names (it has no JSON tags); this
-	// fixture locks that encoding until T03's version decision is revisited.
-	want := `{"version":8,"run_id":"run-1","definition_id":"agent","definition_revision":"v1",` +
+	// fixture locks that encoding for storage version 9.
+	want := `{"version":9,"run_id":"run-1","definition_id":"agent","definition_revision":"v1",` +
 		`"task":"work","deadline":"2026-01-02T03:04:05Z","state":"running","generation":7,` +
 		`"result":{"RunID":"run-1","Status":"completed","Turns":2,"ProviderAttempts":0,` +
-		`"ProviderStopReason":"","RawProviderStopReason":"","Diagnostics":null,"Output":"done",` +
+		`"ProviderStopReason":"","Diagnostics":null,"Output":"done",` +
 		`"FinalMessage":{"role":""},"Messages":null,"Usage":{"InputTokens":0,"OutputTokens":0,` +
-		`"CacheCreationTokens":0,"CacheReadTokens":0},"Steps":0,"StopReason":"","RawStopReason":""},` +
+		`"CacheCreationTokens":0,"CacheReadTokens":0},"StopReason":"","RawStopReason":""},` +
 		`"transcript_chunks":3,"transcript_messages":9,"last_transition":"batch_committed",` +
 		`"hook_results":[{"name":"audit"}],"tool_budget":{}}`
 	if string(data) != want {
@@ -64,7 +65,7 @@ func TestRuntimeRecordEncodingIsStable(t *testing.T) {
 	if legacy.TranscriptChunks != 3 {
 		t.Fatalf("fixture decode = %#v", legacy)
 	}
-	bumped := strings.Replace(want, `"version":8`, `"version":99`, 1)
+	bumped := strings.Replace(want, `"version":9`, `"version":99`, 1)
 	if _, err := decodeRuntimeRun([]byte(bumped)); err == nil ||
 		!strings.Contains(err.Error(), "unsupported runtime run version 99") {
 		t.Fatalf("unsupported version = %v", err)
@@ -107,10 +108,10 @@ func TestRuntimeTranscriptIsStoredAsAppendOnlyFacts(t *testing.T) {
 	}) (string, error) {
 		return "pong", nil
 	}))
-	if err := runtime.Register("agent", "v1", agent); err != nil {
+	if _, err := runtime.Register("agent", "v1", agent); err != nil {
 		t.Fatal(err)
 	}
-	result, err := runtime.Run(context.Background(), "agent", "v1", "work", SubmitOptions{})
+	result, err := runtime.Run(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "work")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -213,10 +214,10 @@ func TestRuntimeCompactChangesDoNotRewriteUnboundedHistories(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer runtime.Close()
-		if err := runtime.Register("agent", "v1", newAgent(turns)); err != nil {
+		if _, err := runtime.Register("agent", "v1", newAgent(turns)); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := runtime.Run(context.Background(), "agent", "v1", "work", SubmitOptions{}); err != nil {
+		if _, err := runtime.Run(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "work"); err != nil {
 			t.Fatal(err)
 		}
 		return store.writes.Load()
@@ -245,13 +246,13 @@ func TestRuntimeLostAdmissionAcknowledgementResolvesOnRetry(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = runtime.Close() })
-	if err := runtime.Register("agent", "v1", testAgent(provider)); err != nil {
+	if _, err := runtime.Register("agent", "v1", testAgent(provider)); err != nil {
 		t.Fatal(err)
 	}
-	options := SubmitOptions{Scope: "tenant", Key: "lost-ack"}
+	options := WithIdempotencyKey("tenant", "lost-ack")
 
 	store.armed.Store(true)
-	if _, err := runtime.Submit(context.Background(), "agent", "v1", "work", options); !errors.Is(err, store.err) {
+	if _, err := runtime.Submit(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "work", options); !errors.Is(err, store.err) {
 		t.Fatalf("lost acknowledgement = %v", err)
 	}
 	runID := onlyStoredRunID(t, base)
@@ -260,7 +261,7 @@ func TestRuntimeLostAdmissionAcknowledgementResolvesOnRetry(t *testing.T) {
 	if err := runtime.Handle(runID).Cancel(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	retried, err := runtime.Submit(context.Background(), "agent", "v1", "work", options)
+	retried, err := runtime.Submit(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "work", options)
 	if err != nil || retried.ID() != runID {
 		t.Fatalf("resolved admission = %q, %v; want run %q", retried.ID(), err, runID)
 	}
@@ -280,14 +281,14 @@ func TestRuntimeLostAdmissionAcknowledgementResolvesOnRetry(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = runtime2.Close() })
-	if err := runtime2.Register("agent", "v1", testAgent(provider)); err != nil {
+	if _, err := runtime2.Register("agent", "v1", testAgent(provider)); err != nil {
 		t.Fatal(err)
 	}
 	store2.armed.Store(true)
-	if _, err := runtime2.Submit(context.Background(), "agent", "v1", "work", options); err == nil {
+	if _, err := runtime2.Submit(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "work", options); err == nil {
 		t.Fatal("expected unknown admission outcome")
 	}
-	resumed, err := runtime2.Submit(context.Background(), "agent", "v1", "work", options)
+	resumed, err := runtime2.Submit(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "work", options)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -310,11 +311,11 @@ func TestRuntimeCancelReceiptSurvivesLaterCommits(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = runtime.Close() })
-	if err := runtime.Register("agent", "v1", testAgent(&countingRuntimeProvider{})); err != nil {
+	if _, err := runtime.Register("agent", "v1", testAgent(&countingRuntimeProvider{})); err != nil {
 		t.Fatal(err)
 	}
 	store.armed.Store(true)
-	if _, err := runtime.Submit(context.Background(), "agent", "v1", "work", SubmitOptions{Scope: "tenant", Key: "cancel-receipt"}); err == nil {
+	if _, err := runtime.Submit(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "work", WithIdempotencyKey("tenant", "cancel-receipt")); err == nil {
 		t.Fatal("expected unknown admission outcome")
 	}
 	runID := onlyStoredRunID(t, base)
@@ -379,11 +380,11 @@ func TestRuntimeTransactionFaultsPreserveEvidenceAndRecover(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := runtime.Register("agent", "v1", testAgent(&countingRuntimeProvider{})); err != nil {
+			if _, err := runtime.Register("agent", "v1", testAgent(&countingRuntimeProvider{})); err != nil {
 				t.Fatal(err)
 			}
 			var handle *RunHandle
-			handle, err = runtime.Submit(context.Background(), "agent", "v1", "work", SubmitOptions{})
+			handle, err = runtime.Submit(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "work")
 			if scenario.submitFails {
 				if err == nil {
 					t.Fatal("injected admission failure was invisible")
@@ -419,7 +420,7 @@ func TestRuntimeTransactionFaultsPreserveEvidenceAndRecover(t *testing.T) {
 				t.Fatal(err)
 			}
 			t.Cleanup(func() { _ = recovered.Close() })
-			if err := recovered.Register("agent", "v1", testAgent(&countingRuntimeProvider{})); err != nil {
+			if _, err := recovered.Register("agent", "v1", testAgent(&countingRuntimeProvider{})); err != nil {
 				t.Fatal(err)
 			}
 			if err := recovered.Recover(context.Background()); err != nil {
@@ -488,7 +489,7 @@ func TestRuntimePreservesUnsupportedRecordsWithoutRewrite(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = runtime.Close() })
-	if err := runtime.Register("agent", "v1", testAgent(&countingRuntimeProvider{})); err != nil {
+	if _, err := runtime.Register("agent", "v1", testAgent(&countingRuntimeProvider{})); err != nil {
 		t.Fatal(err)
 	}
 	future := storedRuntimeRun{

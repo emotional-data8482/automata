@@ -35,8 +35,9 @@ profile.cov
 # Binary files
 examples/claude/claude
 examples/deep_research/deep_research
+examples/durable_host/durable_host
+examples/durable_typed/durable_typed
 examples/openai/openai
-examples/typed_agents/typed_agents
 
 # Example artifacts
 examples/deep_research/why-is-the-sky-blue.md

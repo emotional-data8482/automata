@@ -55,11 +55,11 @@ func BenchmarkRuntimeToolTurns(b *testing.B) {
 				if err != nil {
 					b.Fatal(err)
 				}
-				if err := runtime.Register("agent", "v1", toolTurnsAgent(b, turns)); err != nil {
+				if _, err := runtime.Register("agent", "v1", toolTurnsAgent(b, turns)); err != nil {
 					b.Fatal(err)
 				}
 				before, beforeCommits := counting.writes.Load(), store.writes.Load()
-				if _, err := runtime.Run(context.Background(), "agent", "v1", "work", SubmitOptions{}); err != nil {
+				if _, err := runtime.Run(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "work"); err != nil {
 					b.Fatal(err)
 				}
 				bytes += counting.writes.Load() - before
@@ -85,12 +85,12 @@ func BenchmarkRuntimeConversationTurn(b *testing.B) {
 				b.Fatal(err)
 			}
 			defer runtime.Close()
-			if err := runtime.Register("chat", "v1", testAgent(fixedAnswerProvider{answer: strings.Repeat("a", 2048)})); err != nil {
+			if _, err := runtime.Register("chat", "v1", testAgent(fixedAnswerProvider{answer: strings.Repeat("a", 2048)})); err != nil {
 				b.Fatal(err)
 			}
 			head := ""
 			for i := range history {
-				result, err := runtime.Run(context.Background(), "chat", "v1", fmt.Sprintf("q%d", i), SubmitOptions{Conversation: ConversationOptions{ID: "bench", ExpectedHead: head}})
+				result, err := runtime.Run(context.Background(), DefinitionRef{ID: "chat", Revision: "v1"}, fmt.Sprintf("q%d", i), WithConversation(ConversationRef{ID: "bench"}, head))
 				if err != nil {
 					b.Fatal(err)
 				}
@@ -100,7 +100,7 @@ func BenchmarkRuntimeConversationTurn(b *testing.B) {
 			b.ResetTimer()
 			for i := range b.N {
 				before := counting.writes.Load()
-				result, err := runtime.Run(context.Background(), "chat", "v1", fmt.Sprintf("next %d", i), SubmitOptions{Conversation: ConversationOptions{ID: "bench", ExpectedHead: head}})
+				result, err := runtime.Run(context.Background(), DefinitionRef{ID: "chat", Revision: "v1"}, fmt.Sprintf("next %d", i), WithConversation(ConversationRef{ID: "bench"}, head))
 				if err != nil {
 					b.Fatal(err)
 				}
@@ -171,10 +171,10 @@ func BenchmarkRuntimeRecover(b *testing.B) {
 // completedToolRun runs a finished run of N tool turns and returns its ID.
 func completedToolRun(b *testing.B, runtime *Runtime, turns int) string {
 	b.Helper()
-	if err := runtime.Register("agent", "v1", toolTurnsAgent(b, turns)); err != nil {
+	if _, err := runtime.Register("agent", "v1", toolTurnsAgent(b, turns)); err != nil {
 		b.Fatal(err)
 	}
-	result, err := runtime.Run(context.Background(), "agent", "v1", "work", SubmitOptions{})
+	result, err := runtime.Run(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "work")
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -222,14 +222,14 @@ func BenchmarkRuntimeObserverLag(b *testing.B) {
 	quietBenchLogs(b)
 	runtime := newBenchRuntime(b)
 	provider := &benchQuestionProvider{}
-	if err := runtime.Register("asker", "v1", questionTestAgent(b, provider)); err != nil {
+	if _, err := runtime.Register("asker", "v1", questionTestAgent(b, provider)); err != nil {
 		b.Fatal(err)
 	}
 	var lag time.Duration
 	b.ResetTimer()
 	for range b.N {
 		b.StopTimer()
-		handle, err := runtime.Submit(context.Background(), "asker", "v1", "help", SubmitOptions{})
+		handle, err := runtime.Submit(context.Background(), DefinitionRef{ID: "asker", Revision: "v1"}, "help")
 		if err != nil {
 			b.Fatal(err)
 		}
