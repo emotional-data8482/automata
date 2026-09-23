@@ -216,8 +216,11 @@ attention) at its logical deadline, expires waits at `ExpiresAfter`, and
 repairs a child completion or attention notice whose parent wake was lost.
 Commits schedule it, so it costs nothing while idle. `Close` stops it.
 `Recover` remains the startup step that adopts a previous owner's runs and
-arms their timers. A run stranded by a storage failure in this process stays
-visible to `Await` as that failure until an explicit `Recover`.
+arms their timers; returning from `Recover` does not guarantee that those runs
+are terminal. Background work, including committed-run hook delivery, may
+still be finishing. Use `Await` or observe the run snapshot when terminal
+completion is required. A run stranded by a storage failure in this process
+stays visible to `Await` as that failure until an explicit `Recover`.
 
 ### Payload limits and integrity
 

@@ -2535,13 +2535,11 @@ func TestRuntimeDurableChildAttentionParentHonorsDeadline(t *testing.T) {
 	if err := runtime.Recover(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	for runID, kind := range map[string]string{parentID: "deadline", childResult.RunID: "deadline"} {
-		snapshot, err := runtime.Handle(runID).Snapshot(context.Background())
-		if err != nil {
-			t.Fatal(err)
-		}
-		if snapshot.State != RuntimeTerminal || snapshot.Failure == nil || snapshot.Failure.Kind != FailureKind(kind) {
-			t.Fatalf("run %s = %s failure %#v, want terminal %s", runID, snapshot.State, snapshot.Failure, kind)
+	for _, runID := range []string{parentID, childResult.RunID} {
+		// Recover may return while the driver finishes committed-run hooks.
+		snapshot := waitForRunState(t, runtime, runID, RuntimeTerminal)
+		if snapshot.Failure == nil || snapshot.Failure.Kind != FailureDeadline {
+			t.Fatalf("run %s failure = %#v, want deadline", runID, snapshot.Failure)
 		}
 	}
 }

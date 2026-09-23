@@ -709,8 +709,11 @@ func (r *Runtime) Handle(runID string) *RunHandle {
 // follows RuntimeConfig.ProviderRecovery, and a dispatched tool call becomes
 // uncertain and needs reconciliation. Suspended runs have their deadlines,
 // child outcomes, and wait expiries applied and their timers armed for the
-// background driver. A run whose payload is unavailable or too large needs
-// attention while recovery continues with the others.
+// background driver. Recover may return before background work, including
+// committed-run hook delivery, makes a run terminal; use Await or observe its
+// snapshot when terminal completion is required. A run whose payload is
+// unavailable or too large needs attention while recovery continues with the
+// others.
 func (r *Runtime) Recover(ctx context.Context) error {
 	var records []storedRuntimeRun
 	if err := r.transaction(ctx, false, func(tx StoreTransaction) error {
