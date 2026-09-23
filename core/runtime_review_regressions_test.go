@@ -338,52 +338,86 @@ func TestRuntimeOutOfOrderNotifyCannotHideSettledState(t *testing.T) {
 	}
 }
 
-// One terminal run whose tool invocation fails its digest blocks every later
-// Prune call for every run: the oldest-first pass stops at the damaged run.
+// One terminal run whose tool invocation evidence is damaged blocks every
+// later Prune call for every run: the oldest-first pass stops at the damaged
+// run. Damage that hides evidence (a missing invocation) must also keep the
+// damaged run, whose remaining evidence may be all that is left of an
+// uncertain effect. A forged result leaves the invocation states readable, so
+// only history pruning, which rewrites results, has to skip that run.
 func TestRuntimePruneSkipsDamagedRunAndContinues(t *testing.T) {
-	base := NewMemoryStore()
-	runtime, err := NewRuntime(context.Background(), RuntimeConfig{Store: noCloseStore{Store: base}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer runtime.Close()
-	agent := testAgent(&scriptedProvider{turns: []Message{asstTool("e1", "extra", `{}`), asstText("done"), asstText("second")}})
-	agent.RegisterTool(Func("extra", "ordinary work", func(context.Context, struct{}) (string, error) { return "original", nil }))
-	if err := runtime.Register("agent", "v1", agent); err != nil {
-		t.Fatal(err)
-	}
-	damaged, err := runtime.Run(context.Background(), "agent", "v1", "one", SubmitOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	healthy, err := runtime.Run(context.Background(), "agent", "v1", "two", SubmitOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Bit rot in the first run's invocation result (digest left unchanged).
-	if err := base.Transaction(context.Background(), true, func(tx StoreTransaction) error {
-		var key string
-		var raw []byte
-		if err := tx.Scan(runtimeInvocationsBucket, damaged.RunID+"/", func(k string, v []byte) error {
-			key, raw = k, v
-			return nil
-		}); err != nil {
-			return err
-		}
-		return tx.Put(runtimeInvocationsBucket, key, []byte(strings.Replace(string(raw), "original", "forged!!", 1)))
-	}); err != nil {
-		t.Fatal(err)
-	}
-	time.Sleep(2 * time.Millisecond)
-	for i := 0; i < 2; i++ {
-		if _, err := runtime.Prune(context.Background(), RetentionPolicy{Events: time.Nanosecond}); err != nil {
-			t.Fatalf("Prune #%d = %v", i+1, err)
-		}
-	}
-	page, err := runtime.Handle(healthy.RunID).Events(context.Background(), 0, 10)
-	t.Logf("healthy run still has %d events (err %v)", len(page.Events), err)
-	if len(page.Events) > 0 {
-		t.Fatal("a damaged run blocked retention of an unrelated healthy run")
+	for _, tc := range []struct {
+		name string
+		// kept reports that the damage hides invocation states, so every
+		// retention class must skip the run.
+		kept   bool
+		damage func(tx StoreTransaction, key string, raw []byte) error
+	}{
+		{"forged result", false, func(tx StoreTransaction, key string, raw []byte) error {
+			// Bit rot in the result, digest left unchanged.
+			return tx.Put(runtimeInvocationsBucket, key, []byte(strings.Replace(string(raw), "original", "forged!!", 1)))
+		}},
+		{"truncated record", true, func(tx StoreTransaction, key string, raw []byte) error {
+			return tx.Put(runtimeInvocationsBucket, key, raw[:len(raw)-1])
+		}},
+		{"missing invocation", true, func(tx StoreTransaction, key string, _ []byte) error {
+			return tx.Delete(runtimeInvocationsBucket, key)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			base := NewMemoryStore()
+			runtime, err := NewRuntime(context.Background(), RuntimeConfig{Store: noCloseStore{Store: base}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer runtime.Close()
+			agent := testAgent(&scriptedProvider{turns: []Message{asstTool("e1", "extra", `{}`), asstText("done"), asstText("second")}})
+			agent.RegisterTool(Func("extra", "ordinary work", func(context.Context, struct{}) (string, error) { return "original", nil }))
+			if err := runtime.Register("agent", "v1", agent); err != nil {
+				t.Fatal(err)
+			}
+			damaged, err := runtime.Run(context.Background(), "agent", "v1", "one", SubmitOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			healthy, err := runtime.Run(context.Background(), "agent", "v1", "two", SubmitOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := base.Transaction(context.Background(), true, func(tx StoreTransaction) error {
+				var key string
+				var raw []byte
+				if err := tx.Scan(runtimeInvocationsBucket, damaged.RunID+"/", func(k string, v []byte) error {
+					key, raw = k, v
+					return nil
+				}); err != nil {
+					return err
+				}
+				return tc.damage(tx, key, raw)
+			}); err != nil {
+				t.Fatal(err)
+			}
+			time.Sleep(2 * time.Millisecond)
+			all := RetentionPolicy{Events: pruneNow, History: pruneNow, Runs: pruneNow}
+			for i := 0; i < 2; i++ {
+				report, err := runtime.Prune(context.Background(), all)
+				if err != nil {
+					t.Fatalf("Prune #%d = %v", i+1, err)
+				}
+				if (tc.kept || i == 0) && report.Skipped == 0 {
+					t.Fatalf("Prune #%d = %#v, want the damaged run skipped", i+1, report)
+				}
+			}
+			if _, err := runtime.Handle(healthy.RunID).Snapshot(context.Background()); !errors.Is(err, ErrRunPruned) {
+				t.Fatalf("healthy run after prune = %v, want ErrRunPruned: a damaged run blocked retention", err)
+			}
+			if !tc.kept {
+				return
+			}
+			page, err := runtime.Handle(damaged.RunID).Events(context.Background(), 0, 10)
+			if err != nil || len(page.Events) == 0 {
+				t.Fatalf("damaged run events = %d, %v; want its evidence kept", len(page.Events), err)
+			}
+		})
 	}
 }
 

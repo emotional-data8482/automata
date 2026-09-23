@@ -311,29 +311,17 @@ func completeChildInvocation(tx StoreTransaction, wait storedWait, result ToolRe
 // non-terminal descendant. Such a child must never be consumed as an ordinary
 // completed (or failed) tool call; the parent stays blocked with explicit
 // child attention instead. The whole subtree matters because a canceled child
-// terminalizes before its non-cooperative descendants settle.
+// terminalizes before its non-cooperative descendants settle. Evidence that
+// cannot be read, or a batch missing invocations it committed with, is
+// reported as ErrPayloadUnavailable: absent evidence is never read as
+// resolved.
 func childHasUnresolvedEvidence(tx StoreTransaction, child storedRuntimeRun) (bool, error) {
 	seen := map[string]bool{child.RunID: true}
 	queue := []string{child.RunID}
 	for len(queue) > 0 {
 		runID := queue[0]
 		queue = queue[1:]
-		unresolved := false
-		err := tx.Scan(runtimeInvocationsBucket, runID+"/", func(_ string, raw []byte) error {
-			// Only the state matters here, so the result payload is neither
-			// decoded nor verified.
-			var invocation struct {
-				RunID string              `json:"run_id"`
-				State ToolInvocationState `json:"state"`
-			}
-			if err := json.Unmarshal(raw, &invocation); err != nil {
-				return err
-			}
-			if invocation.RunID == runID && (invocation.State == ToolInvocationUncertain || invocation.State == ToolInvocationDispatched) {
-				unresolved = true
-			}
-			return nil
-		})
+		unresolved, err := runHasUnresolvedInvocations(tx, runID)
 		if err != nil || unresolved {
 			return unresolved, err
 		}
@@ -357,6 +345,61 @@ func childHasUnresolvedEvidence(tx StoreTransaction, child storedRuntimeRun) (bo
 		}
 	}
 	return false, nil
+}
+
+// runHasUnresolvedInvocations reports whether one run holds uncertain or
+// dispatched invocations. Only states matter, so result payloads are neither
+// decoded nor verified, but every batch must hold exactly the invocations it
+// was created with (they commit in one transaction).
+func runHasUnresolvedInvocations(tx StoreTransaction, runID string) (bool, error) {
+	unresolved := false
+	counts := make(map[string]int)
+	err := tx.Scan(runtimeInvocationsBucket, runID+"/", func(key string, raw []byte) error {
+		var invocation struct {
+			RunID   string              `json:"run_id"`
+			BatchID string              `json:"batch_id"`
+			State   ToolInvocationState `json:"state"`
+		}
+		if err := json.Unmarshal(raw, &invocation); err != nil {
+			return fmt.Errorf("%w: tool invocation %s: %v", ErrPayloadUnavailable, key, err)
+		}
+		if invocation.RunID != runID {
+			return nil
+		}
+		counts[invocation.BatchID]++
+		if invocation.State == ToolInvocationUncertain || invocation.State == ToolInvocationDispatched {
+			unresolved = true
+		}
+		return nil
+	})
+	if err != nil {
+		return false, err
+	}
+	err = tx.Scan(runtimeBatchesBucket, runID+"/", func(key string, raw []byte) error {
+		var batch struct {
+			RunID   string `json:"run_id"`
+			BatchID string `json:"batch_id"`
+			Count   int    `json:"count"`
+		}
+		if err := json.Unmarshal(raw, &batch); err != nil {
+			return fmt.Errorf("%w: tool batch %s: %v", ErrPayloadUnavailable, key, err)
+		}
+		if batch.RunID != runID {
+			return nil
+		}
+		if got := counts[batch.BatchID]; got != batch.Count {
+			return fmt.Errorf("%w: run %s tool batch %s has %d invocations, want %d", ErrPayloadUnavailable, runID, batch.BatchID, got, batch.Count)
+		}
+		delete(counts, batch.BatchID)
+		return nil
+	})
+	if err != nil {
+		return false, err
+	}
+	for batchID := range counts {
+		return false, fmt.Errorf("%w: run %s has invocations for missing tool batch %s", ErrPayloadUnavailable, runID, batchID)
+	}
+	return unresolved, nil
 }
 
 // linkedChildRunIDs lists the child runs admitted by runID. Records are read
