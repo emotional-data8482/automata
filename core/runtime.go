@@ -778,7 +778,7 @@ func (r *Runtime) recoverRecord(ctx context.Context, record storedRuntimeRun) er
 		// Enforce the deadline, consume children that settled while this
 		// owner was away, expire elapsed waits, and arm the driver for
 		// whatever is still pending.
-		if err := r.maintainSuspended(ctx, record); err != nil {
+		if err := r.maintainSuspended(ctx, record, r.completeRunHooks); err != nil {
 			return err
 		}
 		return r.armSuspended(ctx, record.RunID)
@@ -817,7 +817,7 @@ func (r *Runtime) recoverRecord(ctx context.Context, record storedRuntimeRun) er
 			// logical deadline applies as for a waiting run, and a later
 			// clean child completion can unblock ordinary continuation
 			// instead of leaving a stale attention.
-			if err := r.maintainSuspended(ctx, record); err != nil {
+			if err := r.maintainSuspended(ctx, record, r.completeRunHooks); err != nil {
 				return err
 			}
 			return r.armSuspended(ctx, record.RunID)

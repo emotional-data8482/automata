@@ -147,7 +147,9 @@ func (r *Runtime) observeCommits(commits []runCommit) {
 // due time. A terminal child run is due when a descendant settled beneath it:
 // its parent wake climbs to the nearest live ancestor, so the repair repeats
 // that climb. Errors are left for the next trigger or Recover: the driver is a
-// backstop and never records a worker failure of its own.
+// backstop and never records a worker failure of its own. Committed-run hooks
+// are delivered off the driver goroutine, so a slow hook never delays another
+// run's deadline, wait expiry, or child-wake repair.
 func (r *Runtime) maintainRun(ctx context.Context, runID string) {
 	r.mu.Lock()
 	_, live := r.live[runID]
@@ -166,10 +168,28 @@ func (r *Runtime) maintainRun(ctx context.Context, runID string) {
 	if !suspendedForDeadline(record) {
 		return
 	}
-	if err := r.maintainSuspended(ctx, record); err != nil {
+	if err := r.maintainSuspended(ctx, record, r.goCompleteRunHooks); err != nil {
 		return
 	}
 	_ = r.armSuspended(ctx, runID)
+}
+
+// goCompleteRunHooks delivers a finalized run's committed-run hooks on a
+// goroutine the Runtime waits for on Close. A delivery that never starts
+// leaves the run finalizing with no hook invoked, which Recover completes.
+func (r *Runtime) goCompleteRunHooks(runID string) error {
+	r.mu.Lock()
+	if r.closing || r.closed {
+		r.mu.Unlock()
+		return nil
+	}
+	r.wg.Add(1)
+	r.mu.Unlock()
+	go func() {
+		defer r.wg.Done()
+		_ = r.completeRunHooks(runID)
+	}()
+	return nil
 }
 
 func (r *Runtime) compactRecord(ctx context.Context, runID string) (storedRuntimeRun, error) {
@@ -184,11 +204,15 @@ func (r *Runtime) compactRecord(ctx context.Context, runID string) (storedRuntim
 
 // maintainSuspended applies, in order, the checks for a run suspended without
 // a worker: its logical deadline, its linked children's outcomes, and the
-// expiry of its waits. Recover and the driver share it.
-func (r *Runtime) maintainSuspended(ctx context.Context, record storedRuntimeRun) error {
+// expiry of its waits. Recover and the driver share it; completeHooks delivers
+// the hooks of a run the deadline finalized.
+func (r *Runtime) maintainSuspended(ctx context.Context, record storedRuntimeRun, completeHooks func(runID string) error) error {
 	finalized, err := r.expireWaitingDeadline(ctx, record.RunID)
-	if err != nil || finalized {
+	if err != nil {
 		return err
+	}
+	if finalized {
+		return completeHooks(record.RunID)
 	}
 	// Child waits are rechecked before generic wait expiry: a linked child may
 	// have terminalized without its wake reaching this run, or be ready to

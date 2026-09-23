@@ -256,6 +256,8 @@ func finalizeWaitingDeadline(tx StoreTransaction, record *storedRuntimeRun, now 
 	return err
 }
 
+// expireWaitingDeadline finalizes a suspended run whose logical deadline has
+// passed. The caller delivers the finalized run's committed-run hooks.
 func (r *Runtime) expireWaitingDeadline(ctx context.Context, runID string) (bool, error) {
 	finalized := false
 	err := r.transaction(ctx, true, func(tx StoreTransaction) error {
@@ -272,9 +274,6 @@ func (r *Runtime) expireWaitingDeadline(ctx context.Context, runID string) (bool
 		finalized = true
 		return nil
 	})
-	if err == nil && finalized {
-		err = r.completeRunHooks(runID)
-	}
 	return finalized, err
 }
 

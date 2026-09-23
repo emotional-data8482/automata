@@ -165,6 +165,7 @@ func TestRuntimeDriverRepairsLostChildWakeWithoutRecover(t *testing.T) {
 		t.Fatalf("child provider calls = %d, want 1", got)
 	}
 }
+
 // Without any host Recover call, a lost wake from a grandchild that settles
 // beneath a canceled (terminal) child is repaired through that child: the
 // driver repeats the wake's climb to the root, which stops needing child
@@ -229,5 +230,50 @@ func TestRuntimeDriverRepairsLostWakeThroughTerminalChild(t *testing.T) {
 	}
 	if final.Accounting.Tree.Unsettled != 0 || final.Attention != nil {
 		t.Fatalf("parent after settlement: attention %#v, unsettled descendants %d", final.Attention, final.Accounting.Tree.Unsettled)
+	}
+}
+
+// A slow committed-run hook on one run the driver finalized must not hold
+// the driver: another run's logical deadline still finalizes on time.
+func TestRuntimeDriverSlowHookDoesNotDelayOtherDeadlines(t *testing.T) {
+	entered, release := make(chan struct{}), make(chan struct{})
+	var calls atomic.Int64
+	runtime, err := NewRuntime(context.Background(), RuntimeConfig{Store: NewMemoryStore(), Hooks: []CommittedRunHook{{
+		Name: "slow", Timeout: 5 * time.Second,
+		Handle: func(ctx context.Context, _ RunSnapshot) error {
+			if calls.Add(1) == 1 {
+				close(entered)
+				select {
+				case <-release:
+				case <-ctx.Done():
+				}
+			}
+			return nil
+		},
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = runtime.Close() })
+	defer close(release)
+	for _, name := range []string{"first", "second"} {
+		provider := &scriptedProvider{turns: []Message{asstTool("q-1", "ask_user", `{"prompt":"region?"}`)}}
+		if err := runtime.Register(name, "v1", questionTestAgent(t, provider)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	first, err := runtime.Submit(context.Background(), "first", "v1", "help", SubmitOptions{Deadline: time.Now().Add(100 * time.Millisecond)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForRuntimeWait(t, first)
+	second, err := runtime.Submit(context.Background(), "second", "v1", "help", SubmitOptions{Deadline: time.Now().Add(200 * time.Millisecond)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForRuntimeWait(t, second)
+	waitForSignal(t, entered, "first run's hook")
+	if _, err := awaitWithin(t, second, time.Second); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("second run past its deadline = %v, want DeadlineExceeded while the first run's hook is running", err)
 	}
 }
