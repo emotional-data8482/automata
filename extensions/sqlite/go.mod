@@ -3,7 +3,7 @@ module github.com/emotional-data8482/automata/extensions/sqlite
 go 1.26.2
 
 require (
-	github.com/emotional-data8482/automata v0.0.0
+	github.com/emotional-data8482/automata v0.5.0
 	modernc.org/sqlite v1.51.0
 )
 
@@ -18,5 +18,3 @@ require (
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
 )
-
-replace github.com/emotional-data8482/automata => ../..

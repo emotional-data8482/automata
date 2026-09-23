@@ -3,7 +3,7 @@ module github.com/emotional-data8482/automata/examples/durable_typed
 go 1.26.2
 
 require (
-	github.com/emotional-data8482/automata v0.4.0
+	github.com/emotional-data8482/automata v0.5.0
 	github.com/emotional-data8482/automata/extensions/sqlite v0.0.0
 )
 
