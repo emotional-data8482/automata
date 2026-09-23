@@ -509,9 +509,9 @@ func syncRunIndexes(tx StoreTransaction, record storedRuntimeRun) error {
 // changed. Each commit also leaves the run's committed state and event head
 // on the signal, taken from the commit's own after-image, so a waiter can
 // skip storage reads for transitions that cannot end its wait. A wake is only
-// a hint: if a commit's outcome was unknown, the waiter's next read settles
-// it, and a missed wake cannot happen because a waiter subscribes before it
-// reads.
+// a hint: a commit whose outcome is unknown wakes waiters without recording
+// its proposed state, so their next reads settle it, and a missed wake cannot
+// happen because a waiter subscribes before it reads.
 type commitHub struct {
 	mu      sync.Mutex
 	closed  bool
@@ -527,6 +527,12 @@ type commitSignal struct {
 	// delivered out of commit order never roll the state back.
 	state RuntimeState
 	head  uint64
+	// uncertainHead is the highest event head proposed by a commit whose
+	// outcome is unknown and not yet superseded by a confirmed commit at or
+	// beyond it. While set, state and head may be stale and every wake must
+	// read storage.
+	uncertainHead uint64
+	uncertain     bool
 	// gone records that retention deleted the run.
 	gone bool
 }
@@ -551,14 +557,15 @@ type commitSubscription struct {
 
 // commitView is what a waiter knows between reads: a channel closed by the
 // next commit on the run, the latest committed state and event head the hub
-// saw (empty and zero when unknown), and whether the run was deleted or the
-// Runtime closed.
+// saw (empty and zero when unknown), whether a commit with an unknown outcome
+// makes those stale, and whether the run was deleted or the Runtime closed.
 type commitView struct {
-	changed <-chan struct{}
-	state   RuntimeState
-	head    uint64
-	gone    bool
-	closed  bool
+	changed   <-chan struct{}
+	state     RuntimeState
+	head      uint64
+	uncertain bool
+	gone      bool
+	closed    bool
 }
 
 // subscribe registers a waiter on runID until close.
@@ -585,6 +592,9 @@ func (s *commitSubscription) next() commitView {
 	if s.signal == nil || s.hub.closed {
 		return commitView{changed: closedSignal, closed: true}
 	}
+	if s.signal.uncertain {
+		return commitView{changed: s.signal.ch, head: s.signal.head, uncertain: true, gone: s.signal.gone}
+	}
 	return commitView{changed: s.signal.ch, state: s.signal.state, head: s.signal.head, gone: s.signal.gone}
 }
 
@@ -602,9 +612,12 @@ func (s *commitSubscription) close() {
 	})
 }
 
-// notify wakes the waiters of each committed run and records what the commit
-// made of it.
-func (h *commitHub) notify(commits []runCommit) {
+// notify wakes the waiters of each committed run. A confirmed commit records
+// what it made of the run; one whose outcome is unknown (the store reported an
+// error after the transaction body ran) records nothing it proposed, because a
+// rolled-back commit's sequence numbers are reused by the next commit, and
+// instead makes waiters read until a confirmed commit supersedes it.
+func (h *commitHub) notify(commits []runCommit, confirmed bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.closed {
@@ -615,12 +628,18 @@ func (h *commitHub) notify(commits []runCommit) {
 		if signal == nil {
 			continue
 		}
-		if commit.pruned {
+		if !confirmed {
+			signal.uncertain = true
+			signal.uncertainHead = max(signal.uncertainHead, commit.head)
+		} else if commit.pruned {
 			signal.gone = true
 		} else if commit.head > signal.head {
 			signal.head = commit.head
 			if commit.state != "" {
 				signal.state = commit.state
+			}
+			if signal.uncertain && commit.head >= signal.uncertainHead {
+				signal.uncertain, signal.uncertainHead = false, 0
 			}
 		}
 		close(signal.ch)
@@ -668,9 +687,10 @@ func mayHaveSettled(state RuntimeState) bool {
 }
 
 // afterCommit wakes waiters on the runs a writable transaction changed and
-// schedules the driver work those changes imply.
-func (r *Runtime) afterCommit(commits []runCommit) {
-	r.hub.notify(commits)
+// schedules the driver work those changes imply. confirmed is false when the
+// store reported an error, so the commit may or may not have persisted.
+func (r *Runtime) afterCommit(commits []runCommit, confirmed bool) {
+	r.hub.notify(commits, confirmed)
 	r.observeCommits(commits)
 }
 
@@ -710,7 +730,7 @@ func (h *RunHandle) WaitEvents(ctx context.Context, after uint64, limit int) (Ev
 	read := true
 	for {
 		view := sub.next()
-		if read || view.gone || view.closed || view.head > after {
+		if read || view.uncertain || view.gone || view.closed || view.head > after {
 			page, err := h.Events(ctx, after, limit)
 			if err != nil || len(page.Events) > 0 {
 				return page, err

@@ -467,8 +467,9 @@ func (r *Runtime) transaction(ctx context.Context, writable bool, fn func(StoreT
 	if len(commits) > 0 {
 		// Wake waiters even when the store reports an error after fn ran: the
 		// commit outcome may be unknown, and a spurious wake only costs each
-		// waiter one compact read.
-		r.afterCommit(commits)
+		// waiter one compact read. The hub records the proposed state only
+		// for a confirmed commit.
+		r.afterCommit(commits, err == nil)
 	}
 	return err
 }

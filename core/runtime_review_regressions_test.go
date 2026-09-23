@@ -331,7 +331,7 @@ func TestRuntimeOutOfOrderNotifyCannotHideSettledState(t *testing.T) {
 	runtime.hub.notify([]runCommit{
 		{runID: handle.ID(), head: head + 1, state: RuntimeNeedsAttention},
 		{runID: handle.ID(), head: head, state: RuntimeWaiting},
-	})
+	}, true)
 	err = <-done
 	if !errors.Is(err, ErrRunNeedsAttention) {
 		t.Fatalf("Await = %v, want ErrRunNeedsAttention (durable state is needs_attention)", err)
@@ -417,5 +417,83 @@ func TestRuntimeWaitEventsReturnsWhenRuntimeCloses(t *testing.T) {
 	t.Logf("WaitEvents returned err=%v after %v", r.err, r.took)
 	if r.err == context.DeadlineExceeded {
 		t.Fatalf("WaitEvents did not observe Close; it only returned at ctx deadline (%v)", r.took)
+	}
+}
+
+// rollbackOnceStore reports a failed commit, once, after the transaction body
+// ran: the commit's proposed events and state never persist.
+type rollbackOnceStore struct {
+	Store
+	armed atomic.Bool
+}
+
+func (s *rollbackOnceStore) Transaction(ctx context.Context, writable bool, fn func(StoreTransaction) error) error {
+	return s.Store.Transaction(ctx, writable, func(tx StoreTransaction) error {
+		if err := fn(tx); err != nil {
+			return err
+		}
+		if writable && s.armed.CompareAndSwap(true, false) {
+			return errors.New("injected commit failure")
+		}
+		return nil
+	})
+}
+
+// A rolled-back commit's notification must not record its proposed state:
+// the next commit reuses the same event sequence, and a hub that believed the
+// rolled-back state would ignore the real one and strand Await.
+func TestRuntimeRolledBackCommitCannotHideSettledState(t *testing.T) {
+	store := &rollbackOnceStore{Store: NewMemoryStore()}
+	runtime, err := NewRuntime(context.Background(), RuntimeConfig{Store: store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+	handle, _ := submitWaitingQuestion(t, runtime)
+	events := allEvents(t, handle)
+	head := events[len(events)-1].Sequence
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := handle.Await(ctx)
+		done <- err
+	}()
+	eventsDone := make(chan error, 1)
+	go func() {
+		page, err := handle.WaitEvents(ctx, head, 10)
+		if err == nil && len(page.Events) == 0 {
+			err = errors.New("no events")
+		}
+		eventsDone <- err
+	}()
+	time.Sleep(50 * time.Millisecond) // both waiters are parked
+
+	change := func(state RuntimeState) error {
+		return runtime.transaction(context.Background(), true, func(tx StoreTransaction) error {
+			record, err := getRuntimeRun(tx, handle.ID())
+			if err != nil {
+				return err
+			}
+			record.State = state
+			if state == RuntimeNeedsAttention {
+				record.AttentionKind, record.AttentionReason = "execution", "review"
+			}
+			return putRuntimeRun(tx, record)
+		})
+	}
+	store.armed.Store(true)
+	if err := change(RuntimeRunning); err == nil {
+		t.Fatal("injected rollback did not fail the commit")
+	}
+	if err := change(RuntimeNeedsAttention); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; !errors.Is(err, ErrRunNeedsAttention) {
+		t.Fatalf("Await = %v, want ErrRunNeedsAttention (durable state is needs_attention)", err)
+	}
+	if err := <-eventsDone; err != nil {
+		t.Fatalf("WaitEvents = %v", err)
 	}
 }
