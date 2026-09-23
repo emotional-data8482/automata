@@ -285,7 +285,7 @@ func TestRuntimeDurableChildBudgetDeniedSiblingKeepsIdentity(t *testing.T) {
 }
 
 func TestRuntimeRunStreamStartsAdmittedWorkAfterViewCancellation(t *testing.T) {
-	base := &memoryStore{buckets: make(map[string]map[string][]byte)}
+	base := NewMemoryStore().(*memoryStore)
 	view, cancel := context.WithCancel(context.Background())
 	store := &afterAdmissionStore{Store: base, after: cancel}
 	provider := &countingRuntimeProvider{}
@@ -317,7 +317,7 @@ func TestRuntimeRunStreamStartsAdmittedWorkAfterViewCancellation(t *testing.T) {
 }
 
 func TestRuntimeRunStreamStartsAdmittedWorkAfterSnapshotFailure(t *testing.T) {
-	base := &memoryStore{buckets: make(map[string]map[string][]byte)}
+	base := NewMemoryStore().(*memoryStore)
 	readErr := errors.New("injected attachment read failure")
 	store := &failReadAfterAdmissionStore{Store: base, err: readErr}
 	provider := &countingRuntimeProvider{}
@@ -349,7 +349,7 @@ func TestRuntimeRunStreamStartsAdmittedWorkAfterSnapshotFailure(t *testing.T) {
 }
 
 func TestRuntimeRunStreamDisconnectRetainsIdentityWithoutDetachedRead(t *testing.T) {
-	base := &memoryStore{buckets: make(map[string]map[string][]byte)}
+	base := NewMemoryStore().(*memoryStore)
 	store := &failRuntimeReadsStore{Store: base, err: errors.New("injected detached read failure")}
 	provider := &countingBarrierRuntimeProvider{started: make(chan struct{}), release: make(chan struct{})}
 	runtime, err := NewRuntime(context.Background(), RuntimeConfig{Store: store})
@@ -394,7 +394,7 @@ func TestRuntimeRunStreamDisconnectRetainsIdentityWithoutDetachedRead(t *testing
 }
 
 func TestRuntimeRunStreamDoesNotStartUnknownAdmissionOutcome(t *testing.T) {
-	base := &memoryStore{buckets: make(map[string]map[string][]byte)}
+	base := NewMemoryStore().(*memoryStore)
 	commitErr := errors.New("admission commit outcome unknown")
 	store := &unknownAdmissionStore{Store: base, err: commitErr}
 	provider := &countingRuntimeProvider{}
@@ -423,7 +423,7 @@ func TestRuntimeRunStreamDoesNotStartUnknownAdmissionOutcome(t *testing.T) {
 }
 
 func TestRuntimeRunStreamDoesNotStartCanceledAdmission(t *testing.T) {
-	base := &memoryStore{buckets: make(map[string]map[string][]byte)}
+	base := NewMemoryStore().(*memoryStore)
 	provider := &countingRuntimeProvider{}
 	runtime, err := NewRuntime(context.Background(), RuntimeConfig{Store: base})
 	if err != nil {
@@ -449,7 +449,7 @@ func TestRuntimeRunStreamDoesNotStartCanceledAdmission(t *testing.T) {
 }
 
 func TestRuntimeStaleStreamSchedulingDoesNotPoisonCompletedRun(t *testing.T) {
-	base := &memoryStore{buckets: make(map[string]map[string][]byte)}
+	base := NewMemoryStore().(*memoryStore)
 	store := &pauseReadStore{
 		Store:   base,
 		reached: make(chan struct{}),
@@ -539,7 +539,7 @@ func TestRuntimeDuplicateSchedulingWhileLiveIsHarmless(t *testing.T) {
 
 func TestRuntimeClaimFailurePreservesRunIdentity(t *testing.T) {
 	claimErr := errors.New("injected claim failure")
-	base := &memoryStore{buckets: make(map[string]map[string][]byte)}
+	base := NewMemoryStore().(*memoryStore)
 	store := &failWritableTransactionStore{Store: base, failAt: 3, err: claimErr}
 	runtime, err := NewRuntime(context.Background(), RuntimeConfig{Store: store})
 	if err != nil {
@@ -563,8 +563,8 @@ func TestRuntimeClaimFailurePreservesRunIdentity(t *testing.T) {
 
 func TestRuntimeStaleSchedulingPreservesGenuineWorkerFailure(t *testing.T) {
 	finishErr := errors.New("injected finalization failure")
-	base := &memoryStore{buckets: make(map[string]map[string][]byte)}
-	store := &failWritableTransactionStore{Store: base, failAt: 6, err: finishErr}
+	base := NewMemoryStore().(*memoryStore)
+	store := &writeFaultStore{Store: base, match: enteringState(RuntimeFinalizing), err: finishErr}
 	provider := &countingRuntimeProvider{}
 	runtime, err := NewRuntime(context.Background(), RuntimeConfig{Store: store})
 	if err != nil {
@@ -604,7 +604,7 @@ func TestRuntimeStaleSchedulingPreservesGenuineWorkerFailure(t *testing.T) {
 }
 
 func TestRuntimeInvalidPersistedStateIsAClaimFailure(t *testing.T) {
-	base := &memoryStore{buckets: make(map[string]map[string][]byte)}
+	base := NewMemoryStore().(*memoryStore)
 	runtime, err := NewRuntime(context.Background(), RuntimeConfig{Store: base})
 	if err != nil {
 		t.Fatal(err)
@@ -662,7 +662,7 @@ func TestRuntimeViewCancellationDoesNotCancelRun(t *testing.T) {
 }
 
 func TestRuntimeAwaitCancellationRetainsIdentityWithoutDetachedRead(t *testing.T) {
-	base := &memoryStore{buckets: make(map[string]map[string][]byte)}
+	base := NewMemoryStore().(*memoryStore)
 	store := &failRuntimeReadsStore{Store: base, err: errors.New("injected detached read failure")}
 	provider := &countingBarrierRuntimeProvider{started: make(chan struct{}), release: make(chan struct{})}
 	runtime, err := NewRuntime(context.Background(), RuntimeConfig{Store: store})
@@ -885,7 +885,7 @@ func TestRuntimeRejectsInvalidCommittedHooks(t *testing.T) {
 }
 
 func TestRuntimeRecoverUsesPinnedBindingAndConservativeAttention(t *testing.T) {
-	store := &memoryStore{buckets: make(map[string]map[string][]byte)}
+	store := NewMemoryStore().(*memoryStore)
 	first, err := NewRuntime(context.Background(), RuntimeConfig{Store: noCloseStore{Store: store}})
 	if err != nil {
 		t.Fatal(err)
@@ -1009,8 +1009,8 @@ func TestRuntimeRecoverDoesNotReclassifyLiveRun(t *testing.T) {
 }
 
 func TestRuntimePersistsAcceptedProviderTurnBeforeToolDispatch(t *testing.T) {
-	base := &memoryStore{buckets: make(map[string]map[string][]byte)}
-	store := &failWritableTransactionStore{Store: base, failAt: 4}
+	base := NewMemoryStore().(*memoryStore)
+	store := &writeFaultStore{Store: base, match: committingTransition("provider_accepted")}
 	runtime, err := NewRuntime(context.Background(), RuntimeConfig{Store: store})
 	if err != nil {
 		t.Fatal(err)

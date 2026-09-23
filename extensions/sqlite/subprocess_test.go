@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -44,6 +45,8 @@ func TestMain(m *testing.M) {
 		runChildLostWakeOwner()
 	case "child-cancel-owner":
 		runChildCancelOwner()
+	case "provider-attempt-owner":
+		runProviderAttemptOwner()
 	}
 	os.Exit(m.Run())
 }
@@ -74,24 +77,16 @@ func runInterruptedOwnerChild() {
 		fmt.Println("submit-error: " + err.Error())
 		os.Exit(3)
 	}
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		snapshot, err := handle.Snapshot(ctx)
-		if err != nil {
-			fmt.Println("snapshot-error: " + err.Error())
-			os.Exit(3)
-		}
-		if snapshot.State == core.RuntimeRunning {
-			break
-		}
-		if time.Now().After(deadline) {
-			fmt.Println("never-started: " + string(snapshot.State))
-			os.Exit(3)
-		}
-		time.Sleep(2 * time.Millisecond)
+	select {
+	case <-blockingProviderInvoked:
+	case <-time.After(10 * time.Second):
+		fmt.Println("never-invoked")
+		os.Exit(3)
 	}
 	fmt.Println("running " + handle.ID())
-	select {} // Killed by the parent test process.
+	for {
+		time.Sleep(time.Hour) // Killed by the parent test process.
+	}
 }
 
 func runEffectDispatchOwnerChild() {
@@ -267,7 +262,16 @@ func (effectDispatchProvider) Invoke(context.Context, core.Request) (core.Respon
 
 type blockingProvider struct{}
 
+// blockingProviderInvoked closes when a blockingProvider holds a request. Its
+// attempt record committed before the call, so the owner is killed with the
+// attempt in flight.
+var (
+	blockingProviderInvoked = make(chan struct{})
+	blockingProviderOnce    sync.Once
+)
+
 func (blockingProvider) Invoke(ctx context.Context, _ core.Request) (core.Response, error) {
+	blockingProviderOnce.Do(func() { close(blockingProviderInvoked) })
 	<-ctx.Done()
 	<-make(chan struct{}) // A killed owner never unwinds gracefully.
 	return core.Response{}, ctx.Err()
@@ -460,7 +464,10 @@ func TestInterruptedOwnerRunBecomesAttention(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The provider held the request when the owner died, so the attempt's
+	// outcome is unknown and it is never silently sent again.
 	if snapshot.State != core.RuntimeNeedsAttention || snapshot.Attention == nil ||
+		snapshot.Attention.Kind != core.AttentionProvider || snapshot.Accounting.UnknownAttempts != 1 ||
 		!strings.Contains(snapshot.Attention.Reason, "previous owner stopped during execution") {
 		t.Fatalf("recovered snapshot = %#v", snapshot)
 	}
@@ -527,7 +534,12 @@ func TestStructuredCorrectionSurvivesProcessKill(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := core.NewRuntime(ctx, core.RuntimeConfig{Store: store})
+	// The owner was killed inside the correction turn's provider call, after
+	// its attempt record committed: that attempt's outcome is unknown. The
+	// host explicitly authorizes one fresh attempt in its place.
+	reopened, err := core.NewRuntime(ctx, core.RuntimeConfig{
+		Store: store, ProviderRecovery: core.ProviderRecoveryPolicy{MaxFreshAttempts: 1},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -553,8 +565,10 @@ func TestStructuredCorrectionSurvivesProcessKill(t *testing.T) {
 	if string(result.StructuredOutput) != `{"summary":"done"}` || result.Status != core.RunCompleted {
 		t.Fatalf("reopened result = %#v", result)
 	}
-	if result.Turns != 4 {
-		t.Fatalf("turns = %d, want 4 cumulative provider turns across restart", result.Turns)
+	// Two turns before the correction, the interrupted correction turn, and
+	// the fresh attempt's two turns: the interrupted turn keeps its budget.
+	if result.Turns != 5 {
+		t.Fatalf("turns = %d, want 5 cumulative provider turns across restart", result.Turns)
 	}
 	data, err := os.ReadFile(oracle)
 	if err != nil {
@@ -566,6 +580,9 @@ func TestStructuredCorrectionSurvivesProcessKill(t *testing.T) {
 	snapshot, err := handle.Snapshot(ctx)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if snapshot.Accounting.UnknownAttempts != 1 || snapshot.Accounting.FreshAttempts != 1 {
+		t.Fatalf("unknown attempts = %d, fresh attempts = %d; want 1 and 1", snapshot.Accounting.UnknownAttempts, snapshot.Accounting.FreshAttempts)
 	}
 	receipt := ""
 	denied := false

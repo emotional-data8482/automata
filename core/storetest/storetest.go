@@ -248,6 +248,197 @@ func Conformance(t *testing.T, open func(t *testing.T) core.Store) {
 		}
 	})
 
+	t.Run("ScanPageSeeksPastEarlierKeys", func(t *testing.T) {
+		store := open(t)
+		if err := store.Transaction(context.Background(), true, func(tx core.StoreTransaction) error {
+			for _, key := range []string{"a/1", "a/2", "m", "m/1", "m/2", "m0", "z/1"} {
+				if err := tx.Put("b", key, []byte(key)); err != nil {
+					return err
+				}
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		var seen []string
+		err := store.Transaction(context.Background(), false, func(tx core.StoreTransaction) error {
+			_, err := tx.ScanPage("b", "m/", "a/2", 0, func(key string, value []byte) error {
+				if string(value) != key {
+					t.Fatalf("value for %q = %q", key, value)
+				}
+				seen = append(seen, key)
+				return nil
+			})
+			return err
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(seen) != 2 || seen[0] != "m/1" || seen[1] != "m/2" {
+			t.Fatalf("seen = %v, want [m/1 m/2]", seen)
+		}
+	})
+
+	t.Run("KeysMayContainNUL", func(t *testing.T) {
+		// Core composes scoped keys with NUL separators and scans their
+		// prefixes; ordering and prefix matching must treat NUL as a byte.
+		store := open(t)
+		keys := []string{"a\x00b\x00c", "a\x00b\x00d", "a\x00bz", "a\x01"}
+		if err := store.Transaction(context.Background(), true, func(tx core.StoreTransaction) error {
+			for _, key := range keys {
+				if err := tx.Put("b", key, []byte(key)); err != nil {
+					return err
+				}
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		var seen []string
+		if err := store.Transaction(context.Background(), true, func(tx core.StoreTransaction) error {
+			if value, err := tx.Get("b", "a\x00b\x00d"); err != nil || string(value) != "a\x00b\x00d" {
+				t.Fatalf("NUL key = %q, %v", value, err)
+			}
+			if err := tx.Scan("b", "a\x00b\x00", func(key string, _ []byte) error {
+				seen = append(seen, key)
+				return nil
+			}); err != nil {
+				return err
+			}
+			return tx.Delete("b", "a\x00b\x00c")
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if len(seen) != 2 || seen[0] != "a\x00b\x00c" || seen[1] != "a\x00b\x00d" {
+			t.Fatalf("NUL prefix scan = %q", seen)
+		}
+		if err := store.Transaction(context.Background(), false, func(tx core.StoreTransaction) error {
+			_, err := tx.Get("b", "a\x00b\x00c")
+			if !errors.Is(err, core.ErrStoreKeyNotFound) {
+				t.Fatalf("deleted NUL key = %v", err)
+			}
+			_, err = tx.Get("b", "a\x00b")
+			if !errors.Is(err, core.ErrStoreKeyNotFound) {
+				t.Fatalf("NUL-truncated key matched: %v", err)
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("DeleteRemovesKeysAndIgnoresMissing", func(t *testing.T) {
+		store := open(t)
+		if err := store.Transaction(context.Background(), true, func(tx core.StoreTransaction) error {
+			for _, key := range []string{"k/1", "k/2", "k/3"} {
+				if err := tx.Put("b", key, []byte(key)); err != nil {
+					return err
+				}
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.Transaction(context.Background(), true, func(tx core.StoreTransaction) error {
+			if err := tx.Delete("b", "k/2"); err != nil {
+				return err
+			}
+			if err := tx.Delete("b", "missing"); err != nil {
+				return err
+			}
+			if err := tx.Delete("no-bucket", "k"); err != nil {
+				return err
+			}
+			if _, err := tx.Get("b", "k/2"); !errors.Is(err, core.ErrStoreKeyNotFound) {
+				t.Fatalf("deleted key visible in its transaction: %v", err)
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		var seen []string
+		if err := store.Transaction(context.Background(), false, func(tx core.StoreTransaction) error {
+			if _, err := tx.Get("b", "k/2"); !errors.Is(err, core.ErrStoreKeyNotFound) {
+				t.Fatalf("deleted key = %v, want ErrStoreKeyNotFound", err)
+			}
+			return tx.Scan("b", "k/", func(key string, _ []byte) error {
+				seen = append(seen, key)
+				return nil
+			})
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if len(seen) != 2 || seen[0] != "k/1" || seen[1] != "k/3" {
+			t.Fatalf("scan after delete = %v, want [k/1 k/3]", seen)
+		}
+	})
+
+	t.Run("FailedTransactionRestoresDeletesAndOverwrites", func(t *testing.T) {
+		store := open(t)
+		if err := store.Transaction(context.Background(), true, func(tx core.StoreTransaction) error {
+			if err := tx.Put("b", "a", []byte("1")); err != nil {
+				return err
+			}
+			return tx.Put("b", "b", []byte("2"))
+		}); err != nil {
+			t.Fatal(err)
+		}
+		boom := errors.New("boom")
+		err := store.Transaction(context.Background(), true, func(tx core.StoreTransaction) error {
+			if err := tx.Delete("b", "a"); err != nil {
+				return err
+			}
+			if err := tx.Put("b", "a", []byte("replaced")); err != nil {
+				return err
+			}
+			if err := tx.Put("b", "b", []byte("overwritten")); err != nil {
+				return err
+			}
+			if err := tx.Delete("b", "b"); err != nil {
+				return err
+			}
+			if err := tx.Put("b", "c", []byte("new")); err != nil {
+				return err
+			}
+			return boom
+		})
+		if !errors.Is(err, boom) {
+			t.Fatalf("transaction error = %v", err)
+		}
+		var seen []string
+		if err := store.Transaction(context.Background(), false, func(tx core.StoreTransaction) error {
+			return tx.Scan("b", "", func(key string, value []byte) error {
+				seen = append(seen, key+"="+string(value))
+				return nil
+			})
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if len(seen) != 2 || seen[0] != "a=1" || seen[1] != "b=2" {
+			t.Fatalf("state after rollback = %v, want [a=1 b=2]", seen)
+		}
+	})
+
+	t.Run("ReadOnlyTransactionRejectsDelete", func(t *testing.T) {
+		store := open(t)
+		if err := store.Transaction(context.Background(), true, func(tx core.StoreTransaction) error {
+			return tx.Put("b", "k", []byte("v"))
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.Transaction(context.Background(), false, func(tx core.StoreTransaction) error {
+			return tx.Delete("b", "k")
+		}); err == nil {
+			t.Fatal("read-only transaction accepted a delete")
+		}
+		if err := store.Transaction(context.Background(), false, func(tx core.StoreTransaction) error {
+			_, err := tx.Get("b", "k")
+			return err
+		}); err != nil {
+			t.Fatalf("rejected delete removed the key: %v", err)
+		}
+	})
+
 	t.Run("ScanVisitErrorFailsTransaction", func(t *testing.T) {
 		store := open(t)
 		if err := store.Transaction(context.Background(), true, func(tx core.StoreTransaction) error {

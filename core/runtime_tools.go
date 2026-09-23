@@ -50,6 +50,59 @@ type storedToolInvocation struct {
 	// ChildRunID links a durable child invocation to its admitted child run.
 	// It is empty for ordinary tool invocations.
 	ChildRunID string `json:"child_run_id,omitempty"`
+	// ResultDigest covers the encoded Result exactly as stored. It is stamped
+	// on every write and verified against the stored bytes on every read, so
+	// a missing, altered, or truncated result is reported as
+	// ErrPayloadUnavailable instead of becoming canonical history.
+	ResultDigest string `json:"result_digest,omitempty"`
+	// ResultPruned records that retention removed Result; the effect report
+	// and state remain.
+	ResultPruned bool `json:"result_pruned,omitempty"`
+}
+
+// storedToolInvocationFields has the fields of storedToolInvocation without
+// its JSON methods.
+type storedToolInvocationFields storedToolInvocation
+
+func toolResultDigest(result ToolResult) (string, error) {
+	data, err := json.Marshal(result)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+func (i storedToolInvocation) MarshalJSON() ([]byte, error) {
+	digest, err := toolResultDigest(i.Result)
+	if err != nil {
+		return nil, err
+	}
+	fields := storedToolInvocationFields(i)
+	fields.ResultDigest = digest
+	return json.Marshal(fields)
+}
+
+func (i *storedToolInvocation) UnmarshalJSON(data []byte) error {
+	// The outer Result shadows the embedded one, capturing the stored bytes
+	// for verification before they are decoded.
+	var stored struct {
+		storedToolInvocationFields
+		Result json.RawMessage `json:"result"`
+	}
+	if err := json.Unmarshal(data, &stored); err != nil {
+		return err
+	}
+	sum := sha256.Sum256(stored.Result)
+	if stored.ResultDigest == "" || hex.EncodeToString(sum[:]) != stored.ResultDigest {
+		return fmt.Errorf("%w: tool invocation %s result fails its integrity check", ErrPayloadUnavailable, stored.OperationID)
+	}
+	fields := stored.storedToolInvocationFields
+	if err := json.Unmarshal(stored.Result, &fields.Result); err != nil {
+		return fmt.Errorf("%w: tool invocation %s result: %v", ErrPayloadUnavailable, stored.OperationID, err)
+	}
+	*i = storedToolInvocation(fields)
+	return nil
 }
 
 type storedEffectGuard struct {
@@ -136,16 +189,17 @@ func loadToolBatchSnapshots(tx StoreTransaction, runID string) ([]ToolBatchSnaps
 		snapshot := ToolBatchSnapshot{BatchID: batch.BatchID, Ordinal: batch.Ordinal, Committed: batch.Committed}
 		for _, invocation := range invocations {
 			snapshot.Invocations = append(snapshot.Invocations, ToolInvocationSnapshot{
-				OperationID: invocation.OperationID,
-				Ordinal:     invocation.Ordinal,
-				Call:        cloneBlock(invocation.Call).(ToolUseBlock),
-				State:       invocation.State,
-				Result:      cloneToolResult(invocation.Result),
-				Effect:      invocation.Effect,
-				Error:       invocation.Error,
-				GuardKey:    invocation.GuardDisplay,
-				WaitID:      invocation.WaitID,
-				ChildRunID:  invocation.ChildRunID,
+				OperationID:  invocation.OperationID,
+				Ordinal:      invocation.Ordinal,
+				Call:         cloneBlock(invocation.Call).(ToolUseBlock),
+				State:        invocation.State,
+				Result:       cloneToolResult(invocation.Result),
+				ResultPruned: invocation.ResultPruned,
+				Effect:       invocation.Effect,
+				Error:        invocation.Error,
+				GuardKey:     invocation.GuardDisplay,
+				WaitID:       invocation.WaitID,
+				ChildRunID:   invocation.ChildRunID,
 			})
 		}
 		snapshots = append(snapshots, snapshot)
@@ -602,6 +656,18 @@ func (r *Runtime) completeToolInvocation(ctx context.Context, invocation storedT
 	} else {
 		invocation.State = ToolInvocationCompleted
 	}
+	if encoded, err := json.Marshal(invocation); err != nil {
+		return err
+	} else if len(encoded) > r.maxPayload {
+		// The result cannot be stored whole, and a truncated result would
+		// become false canonical history. Keep the effect report and leave the
+		// invocation for an authoritative (smaller) resolution: the run needs
+		// attention and Reconcile continues it without running the tool again.
+		invocation.State = ToolInvocationUncertain
+		invocation.Result = ToolResult{}
+		invocation.Fatal = false
+		setInvocationError(&invocation, fmt.Errorf("%w: tool result record is %d bytes, over the %d-byte limit", ErrPayloadTooLarge, len(encoded), r.maxPayload))
+	}
 	return r.transaction(context.WithoutCancel(ctx), true, func(tx StoreTransaction) error {
 		if invocation.GuardKey != "" {
 			status := effect.Status
@@ -834,6 +900,9 @@ func (r *Runtime) executeDurableToolBatch(ctx context.Context, runID string, l *
 	var fatalErr error
 	for i, invocation := range current {
 		if invocation.State != ToolInvocationCompleted {
+			if invocation.Error != "" {
+				return nil, fmt.Errorf("%w: %w (%s: %s)", errDurableBatchIncomplete, ErrToolEffectUncertain, invocation.OperationID, invocation.Error)
+			}
 			return nil, fmt.Errorf("%w: %w (%s)", errDurableBatchIncomplete, ErrToolEffectUncertain, invocation.OperationID)
 		}
 		results[i] = invocationResultMessage(invocation)
@@ -949,7 +1018,11 @@ func (r *Runtime) recoverToolBatch(ctx context.Context, record storedRuntimeRun)
 				}
 			}
 		}
-		if record.LastTransition == "batch_ready" || record.LastTransition == "response_classified" || record.LastTransition == "batch_committed" {
+		switch record.LastTransition {
+		case "", "batch_ready", "response_classified", "batch_committed", transitionProviderAttemptRecovered:
+			// No provider attempt is in flight: every attempt commits its record
+			// before sending, and none is open. A run with no transition yet
+			// stopped before its first attempt record.
 			return true, r.makeRunReady(ctx, record.RunID, record.Generation)
 		}
 		return false, nil
@@ -1027,6 +1100,7 @@ func (r *Runtime) makeRunReady(ctx context.Context, runID string, generation uin
 		record.State = RuntimeReady
 		record.AttentionReason = ""
 		record.AttentionKind = ""
+		record.PayloadError, record.PayloadNeeded = "", 0
 		record.Generation++
 		return putRuntimeRun(tx, record)
 	})

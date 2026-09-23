@@ -14,13 +14,15 @@ import (
 
 // --- encoding fixtures -------------------------------------------------------
 
-// Golden fixtures lock the version 7 record encoding and the admission digest
+// Golden fixtures lock the version 8 record encoding and the admission digest
 // rule. Changing either changes every persisted record and requires a new
 // encoding version, not a silent rewrite. Version 7 added durable child runs,
-// parent operation links, and internal child waits.
+// parent operation links, and internal child waits; version 8 keys transcript
+// chunks by first message index and adds the committed event log and run
+// indexes.
 func TestRuntimeRecordEncodingIsStable(t *testing.T) {
 	record := storedRuntimeRun{
-		Version: 7, RunID: "run-1", DefinitionID: "agent", DefinitionRevision: "v1",
+		Version: 8, RunID: "run-1", DefinitionID: "agent", DefinitionRevision: "v1",
 		Task: "work", Deadline: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC),
 		State: RuntimeRunning, Generation: 7,
 		Result:             RunResult{RunID: "run-1", Status: RunCompleted, Output: "done", Turns: 2},
@@ -35,7 +37,7 @@ func TestRuntimeRecordEncodingIsStable(t *testing.T) {
 	}
 	// RunResult persists with Go field names (it has no JSON tags); this
 	// fixture locks that encoding until T03's version decision is revisited.
-	want := `{"version":7,"run_id":"run-1","definition_id":"agent","definition_revision":"v1",` +
+	want := `{"version":8,"run_id":"run-1","definition_id":"agent","definition_revision":"v1",` +
 		`"task":"work","deadline":"2026-01-02T03:04:05Z","state":"running","generation":7,` +
 		`"result":{"RunID":"run-1","Status":"completed","Turns":2,"ProviderAttempts":0,` +
 		`"ProviderStopReason":"","RawProviderStopReason":"","Diagnostics":null,"Output":"done",` +
@@ -62,7 +64,7 @@ func TestRuntimeRecordEncodingIsStable(t *testing.T) {
 	if legacy.TranscriptChunks != 3 {
 		t.Fatalf("fixture decode = %#v", legacy)
 	}
-	bumped := strings.Replace(want, `"version":7`, `"version":99`, 1)
+	bumped := strings.Replace(want, `"version":8`, `"version":99`, 1)
 	if _, err := decodeRuntimeRun([]byte(bumped)); err == nil ||
 		!strings.Contains(err.Error(), "unsupported runtime run version 99") {
 		t.Fatalf("unsupported version = %v", err)
@@ -137,8 +139,25 @@ func TestRuntimeTranscriptIsStoredAsAppendOnlyFacts(t *testing.T) {
 	if len(raw.Result.Messages) != 0 {
 		t.Fatal("run record persisted an inline transcript")
 	}
-	if raw.TranscriptChunks != 5 || raw.TranscriptMessages != 6 {
-		t.Fatalf("transcript counts = %d chunks, %d messages; want 5 chunks over 6 messages", raw.TranscriptChunks, raw.TranscriptMessages)
+	// The task commits with the first provider attempt record, then each
+	// accepted turn and each committed batch appends one chunk.
+	if raw.TranscriptChunks != 6 || raw.TranscriptMessages != 6 {
+		t.Fatalf("transcript counts = %d chunks, %d messages; want 6 chunks over 6 messages", raw.TranscriptChunks, raw.TranscriptMessages)
+	}
+	// Version 8 keys every chunk by the index of its first message.
+	var keys []string
+	if err := store.Transaction(context.Background(), false, func(tx StoreTransaction) error {
+		return tx.Scan(runtimeFactsBucket, result.RunID+"/", func(key string, _ []byte) error {
+			keys = append(keys, key)
+			return nil
+		})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for i, key := range keys {
+		if key != transcriptFactKey(result.RunID, i) {
+			t.Fatalf("chunk keys = %v, want one chunk starting at each message index", keys)
+		}
 	}
 	if !reflect.DeepEqual(record.Result.Messages, result.Messages) {
 		t.Fatal("reassembled transcript differs from the returned result")
@@ -218,7 +237,7 @@ func TestRuntimeCompactChangesDoNotRewriteUnboundedHistories(t *testing.T) {
 // --- receipts and lost acknowledgements --------------------------------------
 
 func TestRuntimeLostAdmissionAcknowledgementResolvesOnRetry(t *testing.T) {
-	base := &memoryStore{buckets: make(map[string]map[string][]byte)}
+	base := NewMemoryStore().(*memoryStore)
 	store := &unknownAdmissionStore{Store: base, err: errors.New("admission commit outcome unknown")}
 	provider := &countingRuntimeProvider{}
 	runtime, err := NewRuntime(context.Background(), RuntimeConfig{Store: store})
@@ -254,7 +273,7 @@ func TestRuntimeLostAdmissionAcknowledgementResolvesOnRetry(t *testing.T) {
 	}
 
 	// The same flow without cancel B resumes the run exactly once.
-	base2 := &memoryStore{buckets: make(map[string]map[string][]byte)}
+	base2 := NewMemoryStore().(*memoryStore)
 	store2 := &unknownAdmissionStore{Store: base2, err: errors.New("admission commit outcome unknown")}
 	runtime2, err := NewRuntime(context.Background(), RuntimeConfig{Store: store2})
 	if err != nil {
@@ -284,7 +303,7 @@ func TestRuntimeLostAdmissionAcknowledgementResolvesOnRetry(t *testing.T) {
 }
 
 func TestRuntimeCancelReceiptSurvivesLaterCommits(t *testing.T) {
-	base := &memoryStore{buckets: make(map[string]map[string][]byte)}
+	base := NewMemoryStore().(*memoryStore)
 	store := &unknownAdmissionStore{Store: base, err: errors.New("admission commit outcome unknown")}
 	runtime, err := NewRuntime(context.Background(), RuntimeConfig{Store: store})
 	if err != nil {
@@ -342,16 +361,19 @@ func TestRuntimeTransactionFaultsPreserveEvidenceAndRecover(t *testing.T) {
 	for _, scenario := range []scenario{
 		{failAt: 2, submitFails: true}, // admission commit outcome unknown
 		{failAt: 3, recordState: RuntimeReady, recoveredState: RuntimeTerminal},
-		{failAt: 4, recordState: RuntimeNeedsAttention, recoveredState: RuntimeNeedsAttention},
+		// The provider attempt record failed, so the provider was never
+		// called: the run needs attention, and recovery resumes it safely.
+		{failAt: 4, recordState: RuntimeNeedsAttention, recoveredState: RuntimeTerminal},
 		{failAt: 5, recordState: RuntimeNeedsAttention, recoveredState: RuntimeNeedsAttention},
+		{failAt: 6, recordState: RuntimeNeedsAttention, recoveredState: RuntimeNeedsAttention},
 		// A classified final response is a safe continuation boundary in v3.
-		{failAt: 6, recordState: RuntimeRunning, recoveredState: RuntimeTerminal},
+		{failAt: 7, recordState: RuntimeRunning, recoveredState: RuntimeTerminal},
 		// No hook is configured, so none can have been delivered: recovery
 		// commits the finalized result as terminal.
-		{failAt: 7, recordState: RuntimeFinalizing, recoveredState: RuntimeTerminal},
+		{failAt: 8, recordState: RuntimeFinalizing, recoveredState: RuntimeTerminal},
 	} {
 		t.Run(fmt.Sprintf("faultAt%d", scenario.failAt), func(t *testing.T) {
-			base := &memoryStore{buckets: make(map[string]map[string][]byte)}
+			base := NewMemoryStore().(*memoryStore)
 			store := &failWritableTransactionStore{Store: noCloseStore{Store: base}, failAt: scenario.failAt}
 			runtime, err := NewRuntime(context.Background(), RuntimeConfig{Store: store})
 			if err != nil {
@@ -460,7 +482,7 @@ func TestRuntimeDistinguishesStorageFailureFromMissingRun(t *testing.T) {
 }
 
 func TestRuntimePreservesUnsupportedRecordsWithoutRewrite(t *testing.T) {
-	base := &memoryStore{buckets: make(map[string]map[string][]byte)}
+	base := NewMemoryStore().(*memoryStore)
 	runtime, err := NewRuntime(context.Background(), RuntimeConfig{Store: base})
 	if err != nil {
 		t.Fatal(err)
@@ -485,6 +507,10 @@ func TestRuntimePreservesUnsupportedRecordsWithoutRewrite(t *testing.T) {
 			return err
 		}
 		rawFuture = data
+		// A future writer indexes its non-terminal runs like this build does.
+		if err := tx.Put(runtimeActiveBucket, future.RunID, nil); err != nil {
+			return err
+		}
 		return tx.Put(runtimeRunsBucket, future.RunID, data)
 	}); err != nil {
 		t.Fatal(err)
@@ -507,7 +533,7 @@ func TestRuntimePreservesUnsupportedRecordsWithoutRewrite(t *testing.T) {
 }
 
 func TestRuntimeUnsupportedStorageVersionIsRejectedWithoutRewrite(t *testing.T) {
-	base := &memoryStore{buckets: make(map[string]map[string][]byte)}
+	base := NewMemoryStore().(*memoryStore)
 	store := noCloseStore{Store: base}
 	if err := base.Transaction(context.Background(), true, func(tx StoreTransaction) error {
 		data, _ := json.Marshal(99)
@@ -553,17 +579,24 @@ func (tx *countingScanPageTransaction) ScanPage(bucket, prefix, after string, li
 }
 
 func TestRuntimeRecoverPagesThroughRuns(t *testing.T) {
-	base := &memoryStore{buckets: make(map[string]map[string][]byte)}
+	base := NewMemoryStore().(*memoryStore)
 	store := &countingScanPageStore{Store: base}
 	runtime, err := NewRuntime(context.Background(), RuntimeConfig{Store: store})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = runtime.Close() })
-	for i := range runtimeRecoverPageSize*3 + 5 {
+	// Admitted runs of an unregistered definition stay ready through recovery;
+	// terminal runs are never paged because recovery reads the active index.
+	const active = runtimeRecoverPageSize*3 + 5
+	for i := range 2 * active {
+		state, definition := RuntimeReady, "unregistered"
+		if i%2 == 1 {
+			state, definition = RuntimeTerminal, "agent"
+		}
 		record := storedRuntimeRun{
-			Version: runtimeEncodingVersion, RunID: fmt.Sprintf("%032x", i), DefinitionID: "agent",
-			DefinitionRevision: "v1", Task: "work", State: RuntimeTerminal, Generation: 1,
+			Version: runtimeEncodingVersion, RunID: fmt.Sprintf("%032x", i), DefinitionID: definition,
+			DefinitionRevision: "v1", Task: "work", State: state, Generation: 1,
 			Result: RunResult{RunID: fmt.Sprintf("%032x", i), Status: RunCompleted, Output: "done"},
 		}
 		if err := base.Transaction(context.Background(), true, func(tx StoreTransaction) error {
@@ -575,7 +608,8 @@ func TestRuntimeRecoverPagesThroughRuns(t *testing.T) {
 	if err := runtime.Recover(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if got := store.scans.Load(); got < 4 {
-		t.Fatalf("recovery used %d scan pages, want at least 4", got)
+	// Four full or partial pages of active runs plus the empty end page.
+	if got := store.scans.Load(); got < 4 || got > 5 {
+		t.Fatalf("recovery used %d scan pages, want 4 or 5 for %d active runs", got, active)
 	}
 }

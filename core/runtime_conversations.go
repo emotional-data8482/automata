@@ -97,73 +97,72 @@ func getConversation(tx StoreTransaction, key string) (storedConversation, error
 }
 
 // admitConversationTurnTx reserves the conversation's single active slot for
-// runID and returns the transcript the turn starts from: the head's committed
-// history followed by task, appended exactly once. It returns nil when there
-// is no committed history, and the turn then starts like any new run. The
-// caller resolves an exact idempotent retry first, so a head that moved after
-// a lost acknowledgement never rejects the original admission.
-func admitConversationTurnTx(tx StoreTransaction, options ConversationOptions, definitionID, revision, task, runID string) ([]Message, error) {
+// runID and returns the head whose committed transcript the turn continues.
+// It returns ok false when there is no committed history, and the turn then
+// starts like any new run. The caller resolves an exact idempotent retry
+// first, so a head that moved after a lost acknowledgement never rejects the
+// original admission.
+func admitConversationTurnTx(tx StoreTransaction, options ConversationOptions, definitionID, revision, task, runID string) (head storedRuntimeRun, ok bool, err error) {
 	key := conversationKey(options.Scope, options.ID)
 	conversation, err := getConversation(tx, key)
 	switch {
 	case errors.Is(err, ErrConversationNotFound):
 		if options.ExpectedHead != "" {
-			return nil, fmt.Errorf("%w: conversation %q has no committed turn %s", ErrConversationConflict, options.ID, options.ExpectedHead)
+			return head, false, fmt.Errorf("%w: conversation %q has no committed turn %s", ErrConversationConflict, options.ID, options.ExpectedHead)
 		}
 		conversation = storedConversation{
 			Version: runtimeEncodingVersion, Scope: options.Scope, ID: options.ID,
 			DefinitionID: definitionID, DefinitionRevision: revision,
 		}
 	case err != nil:
-		return nil, err
+		return head, false, err
 	default:
 		if conversation.DefinitionID != definitionID || conversation.DefinitionRevision != revision {
-			return nil, fmt.Errorf("%w: conversation %q is pinned to %s@%s", ErrConversationConflict, options.ID, conversation.DefinitionID, conversation.DefinitionRevision)
+			return head, false, fmt.Errorf("%w: conversation %q is pinned to %s@%s", ErrConversationConflict, options.ID, conversation.DefinitionID, conversation.DefinitionRevision)
 		}
 		if conversation.ActiveRunID != "" {
-			return nil, fmt.Errorf("%w: run %s", ErrConversationBusy, conversation.ActiveRunID)
+			return head, false, fmt.Errorf("%w: run %s", ErrConversationBusy, conversation.ActiveRunID)
 		}
 		if conversation.Head != options.ExpectedHead {
-			return nil, fmt.Errorf("%w: head is %q, not %q", ErrConversationConflict, conversation.Head, options.ExpectedHead)
+			return head, false, fmt.Errorf("%w: head is %q, not %q", ErrConversationConflict, conversation.Head, options.ExpectedHead)
 		}
 	}
-	var seed []Message
 	if conversation.Head != "" {
-		if seed, err = continuationHistory(tx, conversation.Head, task); err != nil {
-			return nil, err
+		if head, ok, err = continuationHead(tx, conversation.Head, task); err != nil {
+			return head, false, err
 		}
 	}
 	conversation.ActiveRunID = runID
-	return seed, putStoredJSON(tx, runtimeConversationsBucket, key, conversation)
+	return head, ok, putStoredJSON(tx, runtimeConversationsBucket, key, conversation)
 }
 
-// continuationHistory returns the terminal head's committed transcript
-// followed by task. It never fabricates results: a head whose history is
-// structurally incomplete, or whose subtree retains uncertain effects or
-// unsettled descendants, blocks the conversation.
-func continuationHistory(tx StoreTransaction, headRunID, task string) ([]Message, error) {
+// continuationHead validates that the terminal head's committed transcript
+// followed by task is a continuable history and returns the head. It never
+// fabricates results: a head whose history is structurally incomplete, or
+// whose subtree retains uncertain effects or unsettled descendants, blocks
+// the conversation. ok is false when the head has no committed history.
+func continuationHead(tx StoreTransaction, headRunID, task string) (storedRuntimeRun, bool, error) {
 	head, err := loadRuntimeRun(tx, headRunID)
 	if err != nil {
-		return nil, fmt.Errorf("conversation head %s: %w", headRunID, err)
+		return head, false, fmt.Errorf("conversation head %s: %w", headRunID, err)
 	}
 	if head.State != RuntimeTerminal {
-		return nil, fmt.Errorf("%w: head run %s is %s", ErrConversationBlocked, head.RunID, head.State)
+		return head, false, fmt.Errorf("%w: head run %s is %s", ErrConversationBlocked, head.RunID, head.State)
 	}
 	unresolved, err := childHasUnresolvedEvidence(tx, head)
 	if err != nil {
-		return nil, err
+		return head, false, err
 	}
 	if unresolved {
-		return nil, fmt.Errorf("%w: head run %s retains unresolved effects or descendants", ErrConversationBlocked, head.RunID)
+		return head, false, fmt.Errorf("%w: head run %s retains unresolved effects or descendants", ErrConversationBlocked, head.RunID)
 	}
 	if len(head.Result.Messages) == 0 {
-		return nil, nil
+		return head, false, nil
 	}
-	messages := append(cloneMessages(head.Result.Messages), UserMessage(task))
-	if err := validateHistory(messages); err != nil {
-		return nil, fmt.Errorf("%w: head run %s: %v", ErrConversationBlocked, head.RunID, err)
+	if err := validateHistory(append(head.Result.Messages, UserMessage(task))); err != nil {
+		return head, false, fmt.Errorf("%w: head run %s: %v", ErrConversationBlocked, head.RunID, err)
 	}
-	return messages, nil
+	return head, true, nil
 }
 
 // releaseConversationTx advances the conversation head to a terminal turn and

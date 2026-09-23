@@ -3,7 +3,6 @@ package core
 import (
 	"context"
 	"errors"
-	"fmt"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -119,12 +118,18 @@ func TestRuntimeCancelDuringUncertainToolRemainsTerminal(t *testing.T) {
 }
 
 func TestRuntimeRecoveryRetainsFatalBatchOutcome(t *testing.T) {
-	// Transactions 9 and 10 are batch commit and execution finalization.
-	// Both sides of the batch-commit boundary must preserve the fatal result.
-	for _, failAt := range []int32{9, 10} {
-		t.Run(fmt.Sprintf("transaction%d", failAt), func(t *testing.T) {
-			base := &memoryStore{buckets: make(map[string]map[string][]byte)}
-			store := &failWritableTransactionStore{Store: noCloseStore{Store: base}, failAt: failAt}
+	// Both sides of the batch-commit boundary must preserve the fatal result:
+	// the batch commit itself, and execution finalization after it.
+	for _, boundary := range []struct {
+		name  string
+		match func(string, []byte) bool
+	}{
+		{"batch_commit", committingTransition("batch_committed")},
+		{"finalization", enteringState(RuntimeFinalizing)},
+	} {
+		t.Run(boundary.name, func(t *testing.T) {
+			base := NewMemoryStore().(*memoryStore)
+			store := &writeFaultStore{Store: noCloseStore{Store: base}, match: boundary.match}
 			runtime, err := NewRuntime(context.Background(), RuntimeConfig{Store: store})
 			if err != nil {
 				t.Fatal(err)
@@ -145,7 +150,7 @@ func TestRuntimeRecoveryRetainsFatalBatchOutcome(t *testing.T) {
 				t.Fatal("injected persistence failure was invisible")
 			}
 			record := getRecord(t, base, result.RunID)
-			if failAt == 10 && (record.LastTransition != "batch_committed" || record.State != RuntimeRunning) {
+			if boundary.name == "finalization" && (record.LastTransition != "batch_committed" || record.State != RuntimeRunning) {
 				t.Fatalf("wrong fault boundary: %#v", record)
 			}
 			if err := runtime.Close(); err != nil {

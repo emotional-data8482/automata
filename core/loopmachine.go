@@ -416,6 +416,12 @@ func (m *loopMachine) invokeProvider() loopState {
 	l, ctx, a, result, step, log, span := m.loop, m.ctx, m.loop.agent, &m.result, m.step, m.log, m.span
 	_, _, _, _, _, _, _ = l, ctx, a, result, step, log, span
 
+	// Runtime records the attempt before sending it: after a crash, an open
+	// attempt record means the provider may have received this request, so
+	// recovery never silently sends it again.
+	if err := m.persistTransition(transitionProviderAttemptStarted); err != nil {
+		return m.fail(&durableTransitionFailure{cause: err})
+	}
 	invokeCtx, invokeSpan := a.tracer.Start(ctx, "provider.invoke",
 		tracing.Int("step", step),
 	)

@@ -2170,8 +2170,8 @@ func TestRuntimeDurableTreeAccountingCountsEachRunOnce(t *testing.T) {
 	assertTree("after duplicate wake and recovery")
 }
 
-// seedInterruptedRun commits a running run whose owner stopped after a tool
-// batch committed, so the next step was a provider call.
+// seedInterruptedRun commits a running run whose owner stopped right after
+// committing lastTransition.
 func seedInterruptedRun(t *testing.T, store Store, runID, lastTransition string, messages []Message) {
 	t.Helper()
 	record := storedRuntimeRun{
@@ -2191,35 +2191,45 @@ func seedInterruptedRun(t *testing.T, store Store, runID, lastTransition string,
 	}
 }
 
-// Recovery records unknown provider-attempt evidence exactly once when the
-// stopped owner's next step was a provider call, and never when it was not.
+// afterBatchMessages is a committed transcript whose next step is a provider
+// turn.
+var afterBatchMessages = []Message{
+	UserMessage("go"),
+	asstTool("t1", "extra", `{}`),
+	ToolResultBlockMessage("t1", Blocks{TextBlock{Text: "ok"}}, false),
+}
+
+// Recovery records unknown provider-attempt evidence exactly once, and only
+// when an attempt record is open: the provider may have received that
+// request. A run that stopped before its next attempt record never reached
+// the provider and resumes; one with an open record needs attention instead
+// of silently sending the request again.
 func TestRuntimeRecoveryRecordsUnknownProviderAttemptOnce(t *testing.T) {
-	base := &memoryStore{buckets: make(map[string]map[string][]byte)}
+	base := NewMemoryStore().(*memoryStore)
 	initializer, err := NewRuntime(context.Background(), RuntimeConfig{Store: noCloseStore{Store: base}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	_ = initializer.Close()
-	afterBatch := []Message{
-		UserMessage("go"),
-		asstTool("t1", "extra", `{}`),
-		ToolResultBlockMessage("t1", Blocks{TextBlock{Text: "ok"}}, false),
-	}
-	seedInterruptedRun(t, base, "after-batch", "batch_committed", afterBatch)
+	seedInterruptedRun(t, base, "after-batch", "batch_committed", afterBatchMessages)
 	seedInterruptedRun(t, base, "after-accept", "provider_accepted", []Message{UserMessage("go"), asstText("final")})
+	seedInterruptedRun(t, base, "in-flight", transitionProviderAttemptStarted, afterBatchMessages)
+	// Claimed, then stopped before its first attempt record committed.
+	seedInterruptedRun(t, base, "claimed", "", nil)
 
 	runtime, err := NewRuntime(context.Background(), RuntimeConfig{Store: noCloseStore{Store: base}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = runtime.Close() })
-	agent := testAgent(&repeatingChildProvider{})
+	provider := &repeatingChildProvider{}
+	agent := testAgent(provider)
 	agent.RegisterTool(Func("extra", "ordinary work", func(context.Context, struct{}) (string, error) { return "ok", nil }))
 	if err := runtime.Register("agent", "v1", agent); err != nil {
 		t.Fatal(err)
 	}
 	// A repeated pass over the same interrupted generation counts it once.
-	scanned, err := runtimeRecord(runtime, "after-batch")
+	scanned, err := runtimeRecord(runtime, "in-flight")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2229,7 +2239,7 @@ func TestRuntimeRecoveryRecordsUnknownProviderAttemptOnce(t *testing.T) {
 	if err := runtime.Recover(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	for runID, wantUnknown := range map[string]int{"after-batch": 1, "after-accept": 0} {
+	for runID, wantUnknown := range map[string]int{"after-batch": 0, "after-accept": 0, "claimed": 0} {
 		result, err := runtime.Handle(runID).Await(context.Background())
 		if err != nil {
 			t.Fatalf("%s: %v", runID, err)
@@ -2241,20 +2251,160 @@ func TestRuntimeRecoveryRecordsUnknownProviderAttemptOnce(t *testing.T) {
 		if snapshot.Accounting.UnknownAttempts != wantUnknown || snapshot.Accounting.Tree.UnknownAttempts != wantUnknown {
 			t.Fatalf("%s: unknown attempts = %d (tree %d), want %d", runID, snapshot.Accounting.UnknownAttempts, snapshot.Accounting.Tree.UnknownAttempts, wantUnknown)
 		}
-		// The unknown attempt contributes no invented usage.
 		if result.Usage.InputTokens != 5 {
 			t.Fatalf("%s: usage = %#v, want only recorded usage", runID, result.Usage)
 		}
 	}
-	if err := runtime.Recover(context.Background()); err != nil {
-		t.Fatal(err)
+	// Only the resumed after-batch and claimed runs called the provider.
+	if got := provider.calls.Load(); got != 2 {
+		t.Fatalf("provider calls = %d, want 2 (after-batch and claimed)", got)
 	}
-	record, err := runtimeRecord(runtime, "after-batch")
+	inFlight := runtime.Handle("in-flight")
+	if _, err := inFlight.Await(context.Background()); !errors.Is(err, ErrRunNeedsAttention) {
+		t.Fatalf("interrupted attempt = %v, want ErrRunNeedsAttention", err)
+	}
+	snapshot, err := inFlight.Snapshot(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if record.UnknownAttempts != 1 {
-		t.Fatalf("unknown attempts after another recovery = %d, want 1", record.UnknownAttempts)
+	if snapshot.Attention == nil || snapshot.Attention.Kind != AttentionProvider || snapshot.Accounting.UnknownAttempts != 1 || snapshot.Accounting.FreshAttempts != 0 ||
+		snapshot.Result.Usage.InputTokens != 5 || snapshot.Result.ProviderAttempts != 2 {
+		t.Fatalf("interrupted attempt snapshot = attention %#v unknown %d fresh %d usage %#v attempts %d",
+			snapshot.Attention, snapshot.Accounting.UnknownAttempts, snapshot.Accounting.FreshAttempts, snapshot.Result.Usage, snapshot.Result.ProviderAttempts)
+	}
+	if err := runtime.Recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	record, err := runtimeRecord(runtime, "in-flight")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.UnknownAttempts != 1 || record.State != RuntimeNeedsAttention || provider.calls.Load() != 2 {
+		t.Fatalf("after another recovery: unknown %d, state %s, provider calls %d", record.UnknownAttempts, record.State, provider.calls.Load())
+	}
+}
+
+// An explicit ProviderRecovery bound authorizes fresh attempts in place of
+// interrupted ones. Each is recorded, bounded per run, and distinguishable
+// from the unknown attempt it replaces; raising the bound later lets a run
+// already in provider attention continue on the next Recover.
+func TestRuntimeProviderRecoveryPolicyAuthorizesBoundedFreshAttempts(t *testing.T) {
+	base := NewMemoryStore().(*memoryStore)
+	initializer, err := NewRuntime(context.Background(), RuntimeConfig{Store: noCloseStore{Store: base}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = initializer.Close()
+	seedInterruptedRun(t, base, "fresh", transitionProviderAttemptStarted, afterBatchMessages)
+	seedInterruptedRun(t, base, "exhausted", transitionProviderAttemptStarted, afterBatchMessages)
+	if err := base.Transaction(context.Background(), true, func(tx StoreTransaction) error {
+		record, err := getRuntimeRun(tx, "exhausted")
+		if err != nil {
+			return err
+		}
+		record.FreshAttempts = 1
+		return putRuntimeRun(tx, record)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	open := func(maxFresh int) (*Runtime, *repeatingChildProvider) {
+		runtime, err := NewRuntime(context.Background(), RuntimeConfig{
+			Store: noCloseStore{Store: base}, ProviderRecovery: ProviderRecoveryPolicy{MaxFreshAttempts: maxFresh},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		provider := &repeatingChildProvider{}
+		agent := testAgent(provider)
+		agent.RegisterTool(Func("extra", "ordinary work", func(context.Context, struct{}) (string, error) { return "ok", nil }))
+		if err := runtime.Register("agent", "v1", agent); err != nil {
+			t.Fatal(err)
+		}
+		if err := runtime.Recover(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		return runtime, provider
+	}
+	if _, err := NewRuntime(context.Background(), RuntimeConfig{Store: NewMemoryStore(), ProviderRecovery: ProviderRecoveryPolicy{MaxFreshAttempts: -1}}); err == nil {
+		t.Fatal("negative MaxFreshAttempts accepted")
+	}
+
+	runtime, provider := open(1)
+	result, err := runtime.Handle("fresh").Await(context.Background())
+	if err != nil || result.Output != "child done" {
+		t.Fatalf("fresh attempt = %#v, %v", result, err)
+	}
+	fresh, err := runtime.Handle("fresh").Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The fresh attempt is a new turn and attempt: one attempt was recorded
+	// before the interruption, the interrupted one counts, and the fresh one
+	// adds a third.
+	if fresh.Accounting.FreshAttempts != 1 || fresh.Accounting.UnknownAttempts != 1 || result.Turns != 2 || result.ProviderAttempts != 3 || provider.calls.Load() != 1 {
+		t.Fatalf("fresh attempt accounting: fresh %d unknown %d turns %d attempts %d calls %d",
+			fresh.Accounting.FreshAttempts, fresh.Accounting.UnknownAttempts, result.Turns, result.ProviderAttempts, provider.calls.Load())
+	}
+	if _, err := runtime.Handle("exhausted").Await(context.Background()); !errors.Is(err, ErrRunNeedsAttention) {
+		t.Fatalf("exhausted bound = %v, want ErrRunNeedsAttention", err)
+	}
+	_ = runtime.Close()
+
+	runtime, provider = open(2)
+	defer runtime.Close()
+	result, err = runtime.Handle("exhausted").Await(context.Background())
+	if err != nil || result.Output != "child done" || provider.calls.Load() != 1 {
+		t.Fatalf("raised bound = %#v, %v, calls %d", result, err, provider.calls.Load())
+	}
+	if record, _ := runtimeRecord(runtime, "exhausted"); record.FreshAttempts != 2 || record.UnknownAttempts != 1 {
+		t.Fatalf("raised bound accounting: fresh %d unknown %d", record.FreshAttempts, record.UnknownAttempts)
+	}
+}
+
+// Stopping the worker while a provider call is in flight is the same
+// uncertainty as a crash: the run needs provider attention with one unknown
+// attempt, and the recovery policy decides whether a fresh attempt follows.
+func TestRuntimeWorkerStopDuringProviderAttemptNeedsProviderAttention(t *testing.T) {
+	base := NewMemoryStore().(*memoryStore)
+	provider := &cancelRuntimeProvider{started: make(chan struct{})}
+	runtime, err := NewRuntime(context.Background(), RuntimeConfig{Store: noCloseStore{Store: base}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Register("agent", "v1", testAgent(provider)); err != nil {
+		t.Fatal(err)
+	}
+	handle, err := runtime.Submit(context.Background(), "agent", "v1", "work", SubmitOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForSignal(t, provider.started, "provider start")
+	// Closing cancels the worker while the provider call is in flight.
+	if err := runtime.Close(); err != nil {
+		t.Fatal(err)
+	}
+	record := getRecord(t, base, handle.ID())
+	if record.State != RuntimeNeedsAttention || record.AttentionKind != "provider" || record.UnknownAttempts != 1 {
+		t.Fatalf("stopped attempt = %s kind %q unknown %d", record.State, record.AttentionKind, record.UnknownAttempts)
+	}
+
+	fresh := &countingRuntimeProvider{}
+	reopened, err := NewRuntime(context.Background(), RuntimeConfig{
+		Store: noCloseStore{Store: base}, ProviderRecovery: ProviderRecoveryPolicy{MaxFreshAttempts: 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if err := reopened.Register("agent", "v1", testAgent(fresh)); err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.Recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	result, err := reopened.Handle(handle.ID()).Await(context.Background())
+	if err != nil || result.Output != "done" || fresh.calls.Load() != 1 {
+		t.Fatalf("fresh attempt after stop = %#v, %v, calls %d", result, err, fresh.calls.Load())
 	}
 }
 

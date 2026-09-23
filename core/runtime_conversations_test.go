@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"reflect"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -290,9 +292,9 @@ func TestRuntimeConversationContinuesFailedHistoryButBlocksIncomplete(t *testing
 // was delivered is finished by recovery, which advances the head and frees
 // the conversation for the next turn.
 func TestRuntimeConversationRecoveryReleasesFinalizedTurn(t *testing.T) {
-	base := &memoryStore{buckets: make(map[string]map[string][]byte)}
-	// Write 7 is the terminal hook-outcome commit for a plain turn.
-	runtime, err := NewRuntime(context.Background(), RuntimeConfig{Store: &failWritableTransactionStore{Store: noCloseStore{Store: base}, failAt: 7}})
+	base := NewMemoryStore().(*memoryStore)
+	// Fault the terminal hook-outcome commit of a plain turn.
+	runtime, err := NewRuntime(context.Background(), RuntimeConfig{Store: &writeFaultStore{Store: noCloseStore{Store: base}, match: enteringState(RuntimeTerminal)}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -334,15 +336,15 @@ func TestRuntimeConversationRecoveryReleasesFinalizedTurn(t *testing.T) {
 // acknowledges the interrupted delivery; the acknowledgement advances the
 // head with the turn's completed result and never re-invokes the hook.
 func TestRuntimeConversationAcknowledgedHooksReleaseTurn(t *testing.T) {
-	base := &memoryStore{buckets: make(map[string]map[string][]byte)}
+	base := NewMemoryStore().(*memoryStore)
 	var deliveries atomic.Int32
 	hooks := []CommittedRunHook{{Name: "audit", Handle: func(context.Context, RunSnapshot) error {
 		deliveries.Add(1)
 		return nil
 	}}}
-	// Write 8 records the delivered hook outcome; faulting it leaves the
-	// delivery interrupted after the marker.
-	runtime, err := NewRuntime(context.Background(), RuntimeConfig{Store: &failWritableTransactionStore{Store: noCloseStore{Store: base}, failAt: 8}, Hooks: hooks})
+	// The terminal commit records the delivered hook outcome; faulting it
+	// leaves the delivery interrupted after the marker.
+	runtime, err := NewRuntime(context.Background(), RuntimeConfig{Store: &writeFaultStore{Store: noCloseStore{Store: base}, match: enteringState(RuntimeTerminal)}, Hooks: hooks})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -384,5 +386,64 @@ func TestRuntimeConversationAcknowledgedHooksReleaseTurn(t *testing.T) {
 	// One delivery before the interruption, one for the new turn; none repeated.
 	if got := deliveries.Load(); got != 2 {
 		t.Fatalf("hook deliveries = %d, want 2", got)
+	}
+}
+
+// fixedAnswerProvider answers every turn with the same large text.
+type fixedAnswerProvider struct{ answer string }
+
+func (p fixedAnswerProvider) Invoke(context.Context, Request) (Response, error) {
+	return fixtureResponse(asstText(p.answer)), nil
+}
+
+// Conversation turns reference the head's committed transcript instead of
+// copying it: each turn stores only its own messages, so storage grows
+// linearly with the conversation rather than quadratically, while every turn
+// still reads the whole conversation and its events cover only what it added.
+func TestRuntimeConversationTurnsReferenceHistoryWithoutCopying(t *testing.T) {
+	runtime := newTestRuntime(t)
+	answer := strings.Repeat("a", 2048)
+	if err := runtime.Register("chat", "v1", testAgent(fixedAnswerProvider{answer: answer})); err != nil {
+		t.Fatal(err)
+	}
+	const turns = 8
+	head := ""
+	var ownBytes []int
+	var last RunResult
+	for turn := range turns {
+		result, err := runtime.Run(context.Background(), "chat", "v1", fmt.Sprintf("question %d", turn), turnOptions(head))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(result.Messages) != 2*(turn+1) || result.Messages[len(result.Messages)-1].Text() != answer {
+			t.Fatalf("turn %d transcript has %d messages, want the whole conversation", turn, len(result.Messages))
+		}
+		size := 0
+		if err := runtime.transaction(context.Background(), false, func(tx StoreTransaction) error {
+			return tx.Scan(runtimeFactsBucket, result.RunID+"/", func(_ string, raw []byte) error {
+				size += len(raw)
+				return nil
+			})
+		}); err != nil {
+			t.Fatal(err)
+		}
+		ownBytes = append(ownBytes, size)
+		head, last = result.RunID, result
+	}
+	if ownBytes[turns-1] > ownBytes[0]+64 {
+		t.Fatalf("per-turn transcript bytes grew with history: %v", ownBytes)
+	}
+	var covered int
+	for _, event := range allEvents(t, runtime.Handle(last.RunID)) {
+		if event.Kind != CommittedMessages {
+			continue
+		}
+		if event.MessageIndex < 2*(turns-1) {
+			t.Fatalf("last turn's messages event starts at %d, inside the referenced history", event.MessageIndex)
+		}
+		covered += event.MessageCount
+	}
+	if covered != 2 {
+		t.Fatalf("last turn's events cover %d messages, want its own task and answer", covered)
 	}
 }

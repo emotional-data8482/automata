@@ -181,6 +181,14 @@ func (tx *transaction) Put(bucket, key string, value []byte) error {
 	return err
 }
 
+func (tx *transaction) Delete(bucket, key string) error {
+	if !tx.writable {
+		return fmt.Errorf("read-only sqlite store transaction")
+	}
+	_, err := tx.tx.Exec(`DELETE FROM runtime_kv WHERE bucket=? AND key=?`, bucket, key)
+	return err
+}
+
 func (tx *transaction) Scan(bucket, prefix string, visit func(string, []byte) error) error {
 	_, err := tx.ScanPage(bucket, prefix, "", 0, visit)
 	return err
@@ -190,9 +198,10 @@ func (tx *transaction) ScanPage(bucket, prefix, after string, limit int, visit f
 	if visit == nil {
 		return "", fmt.Errorf("nil scan visitor")
 	}
-	// Stream in key order with a bounded page size. Keys sharing a prefix are
-	// contiguous in ascending order, so the first mismatch after a match ends
-	// the range without reading the rest of the bucket.
+	// Seek straight to the prefix range with the (bucket, key) primary key and
+	// stream it in bounded pages. Keys sharing a prefix are contiguous in
+	// ascending order, so the first key outside the prefix ends the range
+	// without reading the rest of the bucket.
 	pageSize := 256
 	if limit > 0 && limit < pageSize {
 		pageSize = limit
@@ -200,9 +209,14 @@ func (tx *transaction) ScanPage(bucket, prefix, after string, limit int, visit f
 	var last string
 	visited := 0
 	cursor := after
-	seenMatch := false
 	for limit <= 0 || visited < limit {
-		rows, err := tx.tx.Query(`SELECT key, value FROM runtime_kv WHERE bucket=? AND key>? ORDER BY key LIMIT ?`, bucket, cursor, pageSize)
+		// Give SQLite a single lower bound so it seeks the index to the range
+		// start instead of choosing between two constraints.
+		query, bound := `SELECT key, value FROM runtime_kv WHERE bucket=? AND key>? ORDER BY key LIMIT ?`, cursor
+		if cursor < prefix {
+			query, bound = `SELECT key, value FROM runtime_kv WHERE bucket=? AND key>=? ORDER BY key LIMIT ?`, prefix
+		}
+		rows, err := tx.tx.Query(query, bucket, bound, pageSize)
 		if err != nil {
 			return last, err
 		}
@@ -218,13 +232,9 @@ func (tx *transaction) ScanPage(bucket, prefix, after string, limit int, visit f
 			}
 			cursor = key
 			if !strings.HasPrefix(key, prefix) {
-				if seenMatch {
-					done = true
-					break
-				}
-				continue
+				done = true
+				break
 			}
-			seenMatch = true
 			if err := visit(key, append([]byte(nil), value...)); err != nil {
 				rows.Close()
 				return last, err

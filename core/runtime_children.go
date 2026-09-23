@@ -217,7 +217,12 @@ func durableChildDeclaration(tool Tool) (*durableChildTool, error) {
 // leaves the child RuntimeReady so registration followed by Recover makes
 // progress.
 func (r *Runtime) scheduleChild(ctx context.Context, childRunID string) {
-	record, err := r.load(ctx, childRunID)
+	var record storedRuntimeRun
+	err := r.transaction(ctx, false, func(tx StoreTransaction) error {
+		var err error
+		record, err = getRuntimeRun(tx, childRunID)
+		return err
+	})
 	if err != nil {
 		// Scheduling is a hint; the recovery scan is the durable backstop for
 		// storage failures here.
@@ -285,7 +290,20 @@ func completeChildInvocation(tx StoreTransaction, wait storedWait, result ToolRe
 	invocation.Result = normalizeResult(cloneToolResult(result))
 	invocation.Result.Effect = EffectReport{}
 	invocation.Effect = EffectReport{Status: EffectNone}
-	return putStoredJSON(tx, runtimeInvocationsBucket, invocationStorageKey(wait.RunID, wait.BatchID, wait.Ordinal), invocation)
+	key := invocationStorageKey(wait.RunID, wait.BatchID, wait.Ordinal)
+	err = putStoredJSON(tx, runtimeInvocationsBucket, key, invocation)
+	if errors.Is(err, ErrPayloadTooLarge) {
+		// The child's answer cannot be stored whole on the parent invocation,
+		// and a truncated answer would become false history. The rejected
+		// write stored nothing; leave the invocation for an authoritative
+		// (smaller) resolution instead: the parent needs attention and
+		// Reconcile continues it without running the child again.
+		invocation.State = ToolInvocationUncertain
+		invocation.Result = ToolResult{}
+		setInvocationError(&invocation, err)
+		err = putStoredJSON(tx, runtimeInvocationsBucket, key, invocation)
+	}
+	return err
 }
 
 // childHasUnresolvedEvidence reports whether a terminal child's subtree still
@@ -302,7 +320,12 @@ func childHasUnresolvedEvidence(tx StoreTransaction, child storedRuntimeRun) (bo
 		queue = queue[1:]
 		unresolved := false
 		err := tx.Scan(runtimeInvocationsBucket, runID+"/", func(_ string, raw []byte) error {
-			var invocation storedToolInvocation
+			// Only the state matters here, so the result payload is neither
+			// decoded nor verified.
+			var invocation struct {
+				RunID string              `json:"run_id"`
+				State ToolInvocationState `json:"state"`
+			}
 			if err := json.Unmarshal(raw, &invocation); err != nil {
 				return err
 			}

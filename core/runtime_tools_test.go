@@ -75,7 +75,7 @@ func seedPendingRuntimeBatch(t *testing.T, store Store, runID string, calls []To
 }
 
 func TestRuntimeRecoveryDoesNotRerunCompletedBatchSibling(t *testing.T) {
-	base := &memoryStore{buckets: make(map[string]map[string][]byte)}
+	base := NewMemoryStore().(*memoryStore)
 	initializer, err := NewRuntime(context.Background(), RuntimeConfig{Store: noCloseStore{Store: base}})
 	if err != nil {
 		t.Fatal(err)
@@ -122,7 +122,7 @@ func TestRuntimeRecoveryDoesNotRerunCompletedBatchSibling(t *testing.T) {
 }
 
 func TestRuntimeUncertainEffectRequiresAuthoritativeReconciliation(t *testing.T) {
-	base := &memoryStore{buckets: make(map[string]map[string][]byte)}
+	base := NewMemoryStore().(*memoryStore)
 	initializer, err := NewRuntime(context.Background(), RuntimeConfig{Store: noCloseStore{Store: base}})
 	if err != nil {
 		t.Fatal(err)
@@ -181,7 +181,7 @@ func TestRuntimeUncertainEffectRequiresAuthoritativeReconciliation(t *testing.T)
 }
 
 func TestRuntimeCancellationRetainsLateReconciliationEvidence(t *testing.T) {
-	base := &memoryStore{buckets: make(map[string]map[string][]byte)}
+	base := NewMemoryStore().(*memoryStore)
 	initializer, err := NewRuntime(context.Background(), RuntimeConfig{Store: noCloseStore{Store: base}})
 	if err != nil {
 		t.Fatal(err)

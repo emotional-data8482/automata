@@ -76,6 +76,9 @@ func (r *Runtime) createInvocationWait(tx StoreTransaction, record storedRuntime
 func getStoredWait(tx StoreTransaction, runID, waitID string) (storedWait, error) {
 	raw, err := tx.Get(runtimeWaitsBucket, waitStorageKey(runID, waitID))
 	if errors.Is(err, ErrStoreKeyNotFound) {
+		if missing := missingRunError(tx, runID); errors.Is(missing, ErrRunPruned) {
+			return storedWait{}, missing
+		}
 		return storedWait{}, ErrWaitNotFound
 	}
 	if err != nil {
@@ -203,6 +206,13 @@ func (r *Runtime) expireRunWaits(ctx context.Context, runID string) (bool, error
 func historicalWaitResult(wait storedWait, digest string) (bool, error) {
 	if wait.State == WaitPending {
 		return false, nil
+	}
+	if wait.State == WaitExpired && wait.ResolutionError == "expired" {
+		// The wait expired while pending, so no resolution was ever accepted:
+		// every late answer is rejected as expired, whether Runtime or an
+		// earlier late answer recorded the expiry. An approval accepted before
+		// it expired keeps its original receipt below.
+		return true, ErrWaitExpired
 	}
 	if wait.ResolutionDigest != digest {
 		return true, ErrWaitConflict

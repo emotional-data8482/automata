@@ -169,10 +169,13 @@ type ToolInvocationSnapshot struct {
 	Call        ToolUseBlock
 	State       ToolInvocationState
 	Result      ToolResult
-	Effect      EffectReport
-	Error       string
-	GuardKey    string
-	WaitID      string
+	// ResultPruned reports that retention removed Result (see
+	// [RetentionPolicy]); State and Effect remain authoritative.
+	ResultPruned bool
+	Effect       EffectReport
+	Error        string
+	GuardKey     string
+	WaitID       string
 	// ChildRunID links a durable child invocation to its admitted child run.
 	// It is empty for ordinary tool invocations.
 	ChildRunID string

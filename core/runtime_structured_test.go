@@ -35,7 +35,7 @@ type structuredFixture struct {
 }
 
 func newStructuredFixture() *structuredFixture {
-	return &structuredFixture{store: &memoryStore{buckets: make(map[string]map[string][]byte)}}
+	return &structuredFixture{store: NewMemoryStore().(*memoryStore)}
 }
 
 func (f *structuredFixture) writeTool() Tool {
