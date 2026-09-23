@@ -43,11 +43,11 @@ so importing `core` never pulls a vendor SDK into your build.
 ### Releases
 
 The root module, `tools`, and every extension are tagged independently
-(Go multi-module tagging: `v0.4.0`, `tools/v0.4.0`, `extensions/openai/v0.4.0`,
+(Go multi-module tagging: `v0.5.0`, `tools/v0.5.0`, `extensions/openai/v0.5.0`,
 …). One command does the whole dance:
 
 ```sh
-scripts/release.sh minor --push # or: v0.4.0 / patch / major
+scripts/release.sh minor --push # or: an explicit version / patch / major
 ```
 
 It bumps every submodule's `automata` require line, builds and tests the full
@@ -58,10 +58,11 @@ in a small follow-up commit and verifies each module still builds against the
 published pins (`GOWORK=off`). Run it without `--push` to stop after tagging
 for review. Published modules must require real tagged versions and carry
 no `replace` directives when tagged: a dependency's `replace` is ignored
-downstream. In-repo development uses `go.work`; the unreleased
-`extensions/sqlite` module temporarily replaces core with the local source,
-and the release script drops that replacement before tagging. `examples/*`
-keep `replace` directives as dev conveniences and are never tagged.
+downstream. In-repo development uses `go.work`; a published module may
+carry a temporary local core replacement while depending on unreleased core,
+but the release script drops it before tagging. The script also bumps Tavily's
+`tools` dependency to the new tag. `examples/*` keep `replace` directives
+as dev conveniences and are never tagged.
 
 ## Quickstart
 
@@ -544,8 +545,8 @@ Behavior changes to expect:
   error types keep only their message.
 - **Nesting.** A tool that runs another agent inside itself is not part of
   the parent's durable run. Use `ChildTool` for composition.
-- **Storage.** The encoding is version 9. No released version shipped the
-  runtime, so earlier pre-release stores are rejected, not migrated. See
+- **Storage.** v0.5.0 is the first released Runtime version, using encoding 9.
+  Earlier pre-release stores are rejected, not migrated. See
   [storage upgrades](docs/durable-runtime.md#storage-upgrades-and-backups).
 
 ## Agent skill

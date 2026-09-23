@@ -695,11 +695,11 @@ path when they cannot.
 
 The store records its encoding version (currently 9). A build opens only
 stores of its own version and rejects others at `NewRuntime`, without
-rewriting them, so a failed upgrade never damages data. No released version
-has shipped `Runtime`; version 9 is the first supported encoding, and
-earlier pre-release stores must be drained (every run terminal) and
-discarded. A future encoding change will ship with an explicit migration
-tool and its own version; the runtime will never migrate implicitly.
+rewriting them, so a failed upgrade never damages data. v0.5.0 is the first
+released `Runtime` version and uses encoding 9; earlier pre-release stores
+must be drained (every run terminal) and discarded. A future encoding
+change will ship with an explicit migration tool and its own version; the
+runtime will never migrate implicitly.
 
 Back up a SQLite store with the runtime closed (`Runtime.Close`, then copy
 the database file together with its `-wal` file), or while it is open with
