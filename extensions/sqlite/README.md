@@ -1,18 +1,17 @@
 # SQLite runtime store
 
-This module is the local persistent `core.Store` adapter selected by the
-durable-runtime T01 prototype and exposed for the T02 public lifecycle.
+This module is the supported local persistent `core.Store` adapter for
+`core.Runtime`. It passes the `core/storetest` conformance suite.
 
 It uses WAL, `synchronous=FULL`, one database connection, and a nonblocking OS
-advisory lock held for the store lifetime. The supported T02 envelope is one
-owner process on a local filesystem with reliable advisory locking. Opening a
-second owner fails with `ErrOwned`; unsupported schema versions are rejected
-before persistent PRAGMA changes.
+advisory lock held for the store lifetime. The supported envelope is one owner
+process on a local filesystem with reliable advisory locking. Opening a second
+owner fails with `ErrOwned`; unsupported schema versions are rejected before
+persistent PRAGMA changes. Prefix scans seek directly to their key range, so
+reading one run's transcript or events does not scan other runs' rows.
 
-The current owner lock uses Unix `flock`; this T02 adapter is therefore
-supported on Unix-like systems only. Cross-platform locking is deferred until
-the storage contract is hardened in T03.
-
-T03 will add the full conformance/fault matrix, recovery paging, historical
-control receipts, bounded encodings, and upgrade/backup policy. This module
-does not claim power-loss or distributed ownership guarantees yet.
+The owner lock uses Unix `flock`, so the adapter is supported on Unix-like
+systems only. Process-kill recovery is tested with subprocess crashes; the
+module does not claim power-loss or distributed ownership guarantees. Measured
+operating bounds are recorded in `docs/durable-runtime.md` and reproducible with
+`go test -run '^$' -bench SQLite`.

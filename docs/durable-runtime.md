@@ -55,7 +55,8 @@ historical durable outcomes, including after later run transitions.
   disconnecting it does not cancel the logical run.
 - `Runtime.Close` cancels its worker context and waits for execution to yield
   before closing storage. An interrupted whole-loop segment is conservatively
-  marked `RuntimeNeedsAttention`; it is never automatically replayed.
+  marked `RuntimeNeedsAttention` (`AttentionProvider` when a provider call was
+  in flight); it is never automatically replayed.
 - `RunHandle.Cancel` is the logical cancellation command. A persisted deadline
   in `SubmitOptions` has the same logical ownership. Both reach every required
   durable child (see [Durable children](#durable-children)).
@@ -63,8 +64,68 @@ historical durable outcomes, including after later run transitions.
 `Runtime.Run` is `Submit` plus `Await`. `Runtime.RunStream` admits the same kind
 of run and attaches a bounded live view; detaching the view does not own worker
 or logical cancellation. `RunHandle.Observe` exposes that provisional view
-separately. Durable cursors and replay are T08 work, so `Snapshot` is the
-authoritative T02 observation.
+separately. Committed facts are replayable through `RunHandle.Events` (see
+[Observation](#observation)).
+
+## Observation
+
+A run has two kinds of observation:
+
+- **Provisional deltas.** `RunHandle.Observe` and the `RunStream` callback
+  deliver live `StreamEvent`s from the worker (text and thinking deltas, tool
+  calls, tool results, usage). Each view has a bounded queue; a slow view
+  misses deltas and never delays the run.
+- **Committed events.** Every commit that changes a run's state, transcript,
+  tool invocations, or waits appends `CommittedEvent`s in the same commit:
+  state changes (with attention kind and reason), transcript messages
+  appended, tool invocation progress and effect status, and wait creation and
+  resolution. Internal markers (attempt records, budget counters) emit none. Sequence numbers are per run,
+  start at one, and have no holes. Runtime derives the events from the
+  committed writes themselves, so no transition can commit without its event.
+
+Read committed events in bounded pages from a cursor:
+
+```go
+cursor := snapshot.EventSequence // or 0 to replay from the start
+for {
+    page, err := handle.WaitEvents(ctx, cursor, 256)
+    if errors.Is(err, core.ErrEventGap) {
+        snapshot, err = handle.Snapshot(ctx) // resynchronize
+        if err != nil { return err }
+        cursor = snapshot.EventSequence
+        continue
+    }
+    if err != nil { return err }
+    for _, event := range page.Events {
+        apply(event)
+        if event.Kind == core.CommittedRunState && event.State == core.RuntimeTerminal {
+            return nil // no later commits follow a terminal state
+        }
+    }
+    cursor = page.Next
+}
+```
+
+`Events` returns immediately; `WaitEvents` first waits until the run commits
+past the cursor. Consumers pull, so there is no delivery buffer to overflow:
+a stalled or disconnected consumer costs nothing until it reads again, and it
+can resume from its cursor after a restart. A page holds at most 1024 events
+and attaches at most 4 MiB of transcript (always at least one event). Message
+events carry their messages, read from the transcript rather than stored
+twice; `MessagesPruned` marks messages removed by retention. A cursor behind
+the retained range or ahead of the committed head returns `ErrEventGap`:
+resynchronize with `Snapshot`, whose `EventSequence` is read in the same
+transaction as the rest of the snapshot.
+
+Waiting is driven by commits, not polling. `Await`, `Observe`, `RunStream`,
+and `WaitEvents` subscribe to the run's committed transitions in process. An
+idle waiter reads nothing; a wake that cannot end the wait (for example a
+transition between running states) reads nothing either, and `Await` reads the
+full result once, when the run is terminal or needs attention. After
+`Runtime.Close`, waiters stop waiting and return `ErrRuntimeClosed`; a run
+pruned by retention returns `ErrRunPruned`. `Snapshot`
+remains the authoritative full view, and its cost grows with the run's
+history.
 
 ## Committed hooks
 
@@ -97,10 +158,13 @@ canceled.
 
 ## Storage and recovery
 
-The provider-neutral `core.Store` contract is a small atomic transaction port.
-Core owns bucket names and versioned encodings; adapters own database details.
-`extensions/sqlite` is the supported T02 local candidate and keeps its driver out
-of the root module. It enforces one local owner with an OS advisory lock.
+The provider-neutral `core.Store` contract is a small atomic transaction port:
+`Get`, `Put`, `Delete`, and ordered `Scan`/`ScanPage` inside `Transaction`.
+Core owns bucket names and versioned encodings; adapters own database details
+and must pass `core/storetest`. `extensions/sqlite` is the supported local
+adapter and keeps its driver out of the root module. It enforces one local
+owner with an OS advisory lock. Storage encoding version 8 is current; stores
+written by an earlier version are rejected without being rewritten.
 
 On recovery, admitted-but-unstarted work can run after its exact binding is
 registered. Accepted provider turns and durable tool batches resume from their
@@ -113,10 +177,69 @@ transcript receives the complete batch in model request order only after every
 invocation has an authoritative outcome. A fatal batch outcome commits with
 that history; recovery finalizes the failure rather than continuing the model.
 
-Provider attempts have no per-attempt record. When recovery finds a run whose
-stopped owner's next step was a provider call, it counts one
-`RunSnapshot.Accounting.UnknownAttempts`: that attempt may have been sent, and its usage,
-if any, is not in `RunResult.Usage`. Runtime never invents usage for it.
+`Recover` pages through an index of non-terminal runs only, so its cost
+follows the active work, not the number of runs ever stored.
+
+### Provider attempts
+
+Runtime commits an attempt record immediately before each provider call. If a
+worker stops while that record is open, the provider may already have
+received (and billed) the request, and its response is lost. Recovery counts
+the attempt in `RunResult.ProviderAttempts` and in
+`RunSnapshot.Accounting.UnknownAttempts` (its usage, if any, is not in
+`RunResult.Usage`; Runtime never invents it; retries within one turn share one
+record) and never silently sends
+the request again: the run needs attention with `AttentionProvider`. A run
+stopped before its attempt record committed never reached the provider and
+resumes normally.
+
+A host that accepts the cost may authorize fresh attempts explicitly:
+
+```go
+runtime, err := core.NewRuntime(ctx, core.RuntimeConfig{
+    Store:            store,
+    ProviderRecovery: core.ProviderRecoveryPolicy{MaxFreshAttempts: 1},
+})
+```
+
+Within the bound, recovery starts a new provider turn from the committed
+transcript and counts it in `Accounting.FreshAttempts`; the fresh attempt
+consumes the turn budget like any turn. Beyond the bound the run needs
+attention; raising the bound and calling `Recover` again continues it, and
+`Cancel` ends it.
+
+### Background driver
+
+`NewRuntime` starts a driver that keeps suspended work moving without a host
+calling `Recover`: it finalizes a waiting run (or a parent blocked on child
+attention) at its logical deadline, expires waits at `ExpiresAfter`, and
+repairs a child completion or attention notice whose parent wake was lost.
+Commits schedule it, so it costs nothing while idle. `Close` stops it.
+`Recover` remains the startup step that adopts a previous owner's runs and
+arms their timers. A run stranded by a storage failure in this process stays
+visible to `Await` as that failure until an explicit `Recover`.
+
+### Payload limits and integrity
+
+Transcript chunks (one per provider turn or committed tool batch) and tool
+invocation records are the payload facts; the run record stays compact.
+`RuntimeConfig.MaxPayloadBytes` bounds each encoded payload (default
+`DefaultMaxPayloadBytes`, 16 MiB). Runtime never truncates: a provider turn
+or committed tool batch too large to store leaves the run in
+`RuntimeNeedsAttention` with its committed transcript unchanged, and recovery
+resumes it only after `MaxPayloadBytes` is raised to cover it. A tool result
+or durable child answer too large to store leaves its invocation
+`ToolInvocationUncertain` with its effect report intact, so `Reconcile` can
+supply an authoritative smaller result without running anything again.
+
+Every transcript chunk and tool result carries a SHA-256 digest checked on
+every read. A missing, truncated, or altered payload returns
+`ErrPayloadUnavailable` from `Snapshot` and `Events`; recovery marks that run
+as needing attention with the reason and continues with the others, and a
+worker that cannot load its history does the same instead of guessing. An
+acknowledged cancellation still finishes; `Cancel` is the exit for other runs
+with unavailable payloads. `Prune` skips such runs (`PruneReport.Skipped`) and
+continues.
 
 ## Tool effects and reconciliation
 
@@ -440,8 +563,71 @@ unanswered tool calls, uncertain effects, or unsettled children returns
 valid. A turn that needs attention keeps the conversation busy until it is
 reconciled, acknowledged (for interrupted hook delivery), or canceled.
 `Runtime.Conversation` returns the committed head, active run, and turn count.
-Each turn copies the committed history into its own transcript; bounding
-long-history cost is T08 work.
+A turn references the head's committed transcript instead of copying it and
+stores only what it adds, so storage grows linearly with the conversation.
+Each turn still reads the whole history, because the provider receives it.
+
+## Retention
+
+Nothing is deleted unless the host asks. `Runtime.Prune` applies a
+`RetentionPolicy` with an independent age per class, measured from each run's
+terminal commit:
+
+```go
+report, err := runtime.Prune(ctx, core.RetentionPolicy{
+    Events:  24 * time.Hour,      // committed event logs
+    History: 30 * 24 * time.Hour, // transcripts and tool result payloads
+    Runs:    90 * 24 * time.Hour, // whole run trees, leaving tombstones
+    Limit:   500,                 // runs per class per call; report.More says more are due
+})
+```
+
+Only settled runs are eligible: terminal, every descendant terminal, and no
+dispatched or uncertain tool invocation anywhere in the subtree. Retention
+therefore never removes evidence that a pending decision needs.
+
+- `Events` deletes the event log; older cursors return `ErrEventGap`.
+- `History` deletes transcript chunks and tool result payloads. The run keeps
+  its state, accepted output, final message, usage, and every invocation's
+  effect report; `RunSnapshot.HistoryPruned` and
+  `ToolInvocationSnapshot.ResultPruned` report the removal. Conversation turns
+  are skipped, because later turns reference their transcripts.
+- `Runs` deletes a root run and all its durable descendants, including their
+  receipts, and leaves a tombstone per run. Every operation on a pruned run,
+  and an exact retry of its admission or of any command against it, returns
+  `ErrRunPruned`; a changed submission under the same `Scope`/`Key` still
+  returns `ErrAdmissionConflict`. An expired identity never becomes new work.
+  Children are deleted only with their root, and conversation turns are kept.
+
+Effect guards are never pruned, so a semantic duplicate of a pruned run's
+mutation is still rejected. Each class keeps its own index of runs not yet
+processed, so repeated calls never rescan finished work.
+
+## Operating bounds
+
+The supported profile is one exclusive local owner of a SQLite store (WAL,
+`synchronous=FULL`) with process-crash recovery. These figures were measured
+on an Apple M5 Pro (darwin/arm64, Go 1.26.2, local SSD) with the benchmarks
+in `core/runtime_bench_test.go` and `extensions/sqlite/bench_test.go`. They
+describe how costs scale, not guaranteed latencies on other hardware.
+
+| Path | Bound | Measured |
+| --- | --- | --- |
+| Tool turn (2 KiB result) | 7 commits and constant bytes per turn, independent of history | about 12 KB and 1.2–1.3 ms per turn on SQLite, same at 16 and 64 turns |
+| Conversation turn (2 KiB answer) | constant bytes per turn, independent of prior turns | about 27 KB per turn after 1, 16, or 64 turns |
+| Idle `Await`/`Observe`/`WaitEvents` | no storage reads while nothing commits | 0 reads |
+| Commit to `WaitEvents` consumer | one page read per wake | about 20–30 µs (in-memory store) |
+| `Recover` | proportional to non-terminal runs only | 10 µs empty, 15 µs with 1,000 terminal runs on SQLite |
+| Event page | at most 1024 events and 4 MiB of transcript | 256 events of a 64-turn run: 4.7 ms on SQLite |
+| `Snapshot` | proportional to the run's history | 64-turn run: 6.9 ms on SQLite |
+| `Prune` | one transaction per run and class | about 0.6 ms per run (all classes) on SQLite |
+| One payload | `MaxPayloadBytes` (16 MiB default) | enforced, never truncated |
+
+The run record is rewritten on each transition and carries the final
+assistant message and output text, so bytes per turn grow with the size of
+the final answer (not with history). Run `go test ./core -run '^$' -bench
+Runtime` and `go test ./extensions/sqlite -run '^$' -bench SQLite` to
+reproduce the measurements.
 
 ## Transformation, observation, and history
 
@@ -453,8 +639,8 @@ long-history cost is T08 work.
 
 The old checkpoint callback was removed. Durable commits belong to Runtime;
 committed hooks consume those commits rather than acting as storage authority.
-T08 adds replayable persisted events and cursors for integrations that need
-reconnectable delivery rather than an in-process hook attempt.
+Integrations that need reconnectable delivery rather than an in-process hook
+attempt read committed events from a cursor (see [Observation](#observation)).
 
 Canonical conversation data remains JSON-encoded `[]core.Message`, with
 `Message.Blocks` as the source of truth. Pending provider/tool work is not
