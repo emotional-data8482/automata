@@ -29,7 +29,7 @@ It is built for agents inside web servers and job workers, not notebooks.
 | --- | --- |
 | `core` | `Agent` definitions, `Runtime`, tools, child agents, conversations, approvals, streaming, and the storage port |
 | `core/storetest` | Conformance suite for `core.Store` adapters |
-| `tools` (module) | First-party tools: `HTTPFetch`, `ReadFile`/`WriteFile` (sandboxed), `Shell` (allow-listed), `WebSearch`; `LoadAgentsMD` for AGENTS.md instructions |
+| `tools` (module) | First-party tools: `HTTPFetch`, `ReadFile`/`WriteFile` (sandboxed), `Shell` (allow-listed), `WebSearch`; `LoadAgentsMD` and `LoadSkills` for AGENTS.md instructions and Agent Skills |
 | `extensions/sqlite` (module) | The supported persistent store: one exclusive local owner, WAL, `synchronous=FULL` |
 | `extensions/claude` (module) | Anthropic provider; thinking, images, prompt caching, native structured output |
 | `extensions/openai` (module) | OpenAI Chat Completions provider (stdlib-only); any OpenAI-compatible base URL |
@@ -272,6 +272,33 @@ agent, err := core.New(provider, core.AgentConfig{
 The instructions are frozen with the agent, so a registered revision pins the
 text it ran with. Load again and register a new revision to pick up edits.
 Existing conversations keep the system message they started with.
+
+### Agent Skills
+
+`tools.LoadSkills` loads [Agent Skills](https://agentskills.io): each
+subdirectory with a `SKILL.md` under the given directories. Its `Catalog`
+lists each skill's name and description for the system prompt, and its
+read-only `load_skill` tool returns a skill's instructions, or a file the skill
+references, when the model asks for one:
+
+```go
+// Fragment
+skills, err := tools.LoadSkills(".agents/skills", filepath.Join(home, ".agents/skills"))
+if err != nil {
+	return err
+}
+agent, err := core.New(provider, core.AgentConfig{
+	SystemPrompt: basePrompt + "\n\n" + skills.Catalog(),
+	Tools:        []core.Tool{skills.Tool()},
+})
+```
+
+Loading validates each skill's `name` (it must match the directory) and
+`description`. A name defined twice is an error. `SKILL.md` bodies are read
+once and frozen with the agent. Referenced files are read on demand, and only
+inside the skill's directory. Scripts a skill ships are never run. Running one
+needs a tool such as `tools.Shell`. `allowed-tools` is parsed onto `Skill` but
+not enforced; bound tools with `ToolPolicy` and approvals.
 
 ## Typed output
 

@@ -35,27 +35,33 @@ func ReadFile(root string) core.Tool {
 			if p.Path == "" {
 				return "", fmt.Errorf("path is required")
 			}
-			r, err := os.OpenRoot(root)
-			if err != nil {
-				return "", err
-			}
-			defer r.Close()
-
-			f, err := r.Open(p.Path)
-			if err != nil {
-				return "", err
-			}
-			defer f.Close()
-
-			data, err := io.ReadAll(io.LimitReader(f, readMaxBytes+1))
-			if err != nil {
-				return "", err
-			}
-			if len(data) > readMaxBytes {
-				return string(data[:readMaxBytes]) + "\n\n[truncated: file exceeds 256KB]", nil
-			}
-			return string(data), nil
+			return readRootFile(root, p.Path)
 		}), core.ToolEffectPolicy{Kind: core.ToolEffectReadOnly})
+}
+
+// readRootFile reads name strictly inside root, truncating after
+// readMaxBytes with a marker.
+func readRootFile(root, name string) (string, error) {
+	r, err := os.OpenRoot(root)
+	if err != nil {
+		return "", err
+	}
+	defer r.Close()
+
+	f, err := r.Open(name)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	data, err := io.ReadAll(io.LimitReader(f, readMaxBytes+1))
+	if err != nil {
+		return "", err
+	}
+	if len(data) > readMaxBytes {
+		return string(data[:readMaxBytes]) + "\n\n[truncated: file exceeds 256KB]", nil
+	}
+	return string(data), nil
 }
 
 // WriteFile returns a "write_file" tool that writes files strictly inside

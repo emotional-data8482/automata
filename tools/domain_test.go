@@ -25,7 +25,11 @@ func executeDomain(t *testing.T, tool core.Tool, ctx context.Context, args strin
 func TestDomainToolsParentCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	for _, tool := range []core.Tool{HTTPFetch(), ReadFile(t.TempDir()), WriteFile(t.TempDir()), Shell(ShellConfig{}), WebSearch(&fakeSearcher{})} {
+	skills, err := LoadSkills(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tool := range []core.Tool{HTTPFetch(), ReadFile(t.TempDir()), WriteFile(t.TempDir()), Shell(ShellConfig{}), WebSearch(&fakeSearcher{}), skills.Tool()} {
 		_, err := tool.Execute(ctx, json.RawMessage("{}"))
 		if !errors.Is(err, context.Canceled) {
 			t.Errorf("%s error=%v", tool.Definition().Name, err)
