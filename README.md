@@ -29,7 +29,7 @@ It is built for agents inside web servers and job workers, not notebooks.
 | --- | --- |
 | `core` | `Agent` definitions, `Runtime`, tools, child agents, conversations, approvals, streaming, and the storage port |
 | `core/storetest` | Conformance suite for `core.Store` adapters |
-| `tools` (module) | First-party tools: `HTTPFetch`, `ReadFile`/`WriteFile` (sandboxed), `Shell` (allow-listed), `WebSearch` |
+| `tools` (module) | First-party tools: `HTTPFetch`, `ReadFile`/`WriteFile` (sandboxed), `Shell` (allow-listed), `WebSearch`; `LoadAgentsMD` for AGENTS.md instructions |
 | `extensions/sqlite` (module) | The supported persistent store: one exclusive local owner, WAL, `synchronous=FULL` |
 | `extensions/claude` (module) | Anthropic provider; thinking, images, prompt caching, native structured output |
 | `extensions/openai` (module) | OpenAI Chat Completions provider (stdlib-only); any OpenAI-compatible base URL |
@@ -248,6 +248,30 @@ core.AgentConfig{ToolPolicy: core.ToolPolicy{
 Policy timeouts and budget denials are recoverable tool results. Tools and
 limiters must honor context cancellation, because Go cannot stop a function
 that ignores its context.
+
+### AGENTS.md instructions
+
+`tools.LoadAgentsMD` collects the [AGENTS.md](https://agents.md) files on the
+path from a workspace root down to a working directory. The files are read
+through `os.Root`, ordered shallowest first so the closest instructions come
+last, and capped at 32 KiB combined (an error, not a truncation). Append the
+result to the system prompt:
+
+```go
+// Fragment
+instructions, err := tools.LoadAgentsMD(repoRoot, tools.AgentsMDOptions{Dir: "core"})
+if err != nil {
+	return err
+}
+agent, err := core.New(provider, core.AgentConfig{
+	SystemPrompt: basePrompt + "\n\n" + instructions,
+	Tools:        []core.Tool{tools.ReadFile(repoRoot)},
+})
+```
+
+The instructions are frozen with the agent, so a registered revision pins the
+text it ran with. Load again and register a new revision to pick up edits.
+Existing conversations keep the system message they started with.
 
 ## Typed output
 

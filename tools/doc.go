@@ -2,7 +2,8 @@
 // the stdlib: web fetching ([HTTPFetch]), sandboxed file access ([ReadFile],
 // [WriteFile]), an opt-in allow-listed shell ([Shell]), and a vendor-neutral
 // web search adapter ([WebSearch]) whose backends (e.g. the tavily extension)
-// plug in via the [Searcher] interface.
+// plug in via the [Searcher] interface. [LoadAgentsMD] collects a workspace's
+// AGENTS.md instruction files for an agent's system prompt.
 //
 // Everything composes with the existing core.Func schema machinery; the module
 // adds no dependencies beyond core itself.
