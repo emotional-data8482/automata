@@ -10,6 +10,7 @@ use (
 	./examples/openai
 	./extensions/claude
 	./extensions/openai
+	./extensions/openrouter
 	./extensions/tavily
 	./tools
 )

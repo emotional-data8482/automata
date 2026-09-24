@@ -33,6 +33,7 @@ It is built for agents inside web servers and job workers, not notebooks.
 | `extensions/sqlite` (module) | The supported persistent store: one exclusive local owner, WAL, `synchronous=FULL` |
 | `extensions/claude` (module) | Anthropic provider; thinking, images, prompt caching, native structured output |
 | `extensions/openai` (module) | OpenAI Chat Completions provider (stdlib-only); any OpenAI-compatible base URL |
+| `extensions/openrouter` (module) | OpenRouter Chat Completions provider (official SDK); text, reasoning, images, tools, and structured output |
 | `extensions/tavily` (module) | Tavily backend for `tools.WebSearch` |
 | `retry`, `tracing` | Backoff policy and span interfaces used by core |
 | `examples/*` (modules) | Runnable demos (see [Examples](#examples)) |
@@ -43,7 +44,7 @@ so importing `core` never pulls a vendor SDK into your build.
 ### Releases
 
 The root module, `tools`, and every extension are tagged independently
-(Go multi-module tagging: `v0.5.0`, `tools/v0.5.0`, `extensions/openai/v0.5.0`,
+(Go multi-module tagging: `v0.5.0`, `tools/v0.5.0`, `extensions/openrouter/v0.5.0`,
 …). One command does the whole dance:
 
 ```sh

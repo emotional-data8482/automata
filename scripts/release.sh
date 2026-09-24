@@ -33,7 +33,7 @@ TOOLS_MODULE="$MODULE/tools"
 # published module may keep a local automata replace while it depends on
 # unreleased core (so `go mod tidy` and `go get` work in it); the release drops
 # that replace and refuses to tag any other.
-PUBLISHED=(tools extensions/claude extensions/openai extensions/tavily extensions/sqlite)
+PUBLISHED=(tools extensions/claude extensions/openai extensions/openrouter extensions/tavily extensions/sqlite)
 # Modules that ride along but are neither tagged nor tidied.
 RIDEALONG=(examples/claude examples/openai examples/deep_research examples/durable_typed examples/durable_host)
 TOOLS_CONSUMERS=(extensions/tavily examples/deep_research)
