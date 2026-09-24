@@ -3,7 +3,7 @@ module github.com/emotional-data8482/automata/extensions/sqlite
 go 1.26.2
 
 require (
-	github.com/emotional-data8482/automata v0.5.0
+	github.com/emotional-data8482/automata v0.5.1
 	modernc.org/sqlite v1.51.0
 )
 
