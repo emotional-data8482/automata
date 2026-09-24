@@ -8,7 +8,10 @@ agent, err := core.New(provider, core.AgentConfig{
     Tools:        []core.Tool{toolA, toolB},
     MaxTurns:     10,                                   // zero selects core.DefaultMaxTurns
     CallOptions:  core.CallOptions{MaxTokens: 4096},    // sent on every provider turn
-    ToolPolicy:   core.ToolPolicy{MaxCalls: 50, MaxParallel: 4},
+    ToolPolicy: core.ToolPolicy{
+        Timeout: 30 * time.Second, MaxCalls: 50, MaxParallel: 4,
+        PerTool: map[string]core.ToolLimits{"web_search": {MaxCalls: 10, RateLimiter: limiter}},
+    },
     Retry:        &retryCfg,                            // provider retries within one turn
     Logger:       logger,                               // nil selects slog.Default
     Tracer:       tracer,                               // nil selects tracing.Noop
@@ -25,9 +28,10 @@ agent, err := core.New(provider, core.AgentConfig{
 store, err := sqlite.Open(ctx, "automata.db")         // or core.NewMemoryStore()
 rt, err := core.NewRuntime(ctx, core.RuntimeConfig{
     Store:      store,
-    Authorizer: authorizer,                             // required for approval waits
+    Authorizer: core.ApprovalAuthorizerFunc(authorize), // required for approval waits
     Hooks:      []core.CommittedRunHook{auditHook},     // after the result commits
     ProviderRecovery: core.ProviderRecoveryPolicy{MaxFreshAttempts: 0},
+    MaxPayloadBytes:  0,                                // zero selects core.DefaultMaxPayloadBytes
 })
 defer rt.Close()
 
@@ -42,7 +46,9 @@ snapshot, err := rt.Conversation(ctx, core.ConversationRef{Scope: tenant, ID: th
 report, err := rt.Prune(ctx, core.RetentionPolicy{Events: 24 * time.Hour, History: 30 * 24 * time.Hour, Runs: 90 * 24 * time.Hour})
 ```
 
-`core.NewEphemeralRuntime()` is `NewRuntime` on a fresh memory store. Storage failure never falls back to memory.
+`core.NewEphemeralRuntime()` is `NewRuntime` on a fresh memory store. Storage failure never falls back to memory. An oversized durable payload (a turn, a tool batch, or a tool result over `MaxPayloadBytes`) is never truncated: the run needs attention instead.
+
+`ToolPolicy` belongs to the definition: `Timeout` bounds each execution (including the limiter wait, not durable waits), `MaxCalls` and per-tool `MaxCalls` reserve budget in model order and are shared with child runs, and `RateLimiter` accepts anything with `Wait(ctx) error` (such as `*rate.Limiter`). An invalid policy fails `core.New` with `ErrInvalidToolPolicy`.
 
 Submit options: `core.WithIdempotencyKey(scope, key)`, `core.WithDeadline(t)`, `core.WithConversation(ref, expectedHead)`. An exact retry of a keyed submission (same task, definition, deadline, conversation) returns the original run; a changed one returns `core.ErrAdmissionConflict`.
 
@@ -65,7 +71,7 @@ Never discard `result` because `err` is non-nil.
 
 ## RunSnapshot
 
-`State` (`ready`, `running`, `waiting`, `cancel_requested`, `finalizing`, `needs_attention`, `terminal`), `Definition`, `Parent`, `Conversation`, `Result`, `Failure` (`Message`, `Kind`, `StopReason`, `Violations`), `Attention` (`Kind`: `execution`, `provider`, `hooks`, `child`; `Reason`; `BlockingRunID`), `Accounting` (`UnknownAttempts`, `FreshAttempts`, `Tree`), `Hooks`, `ToolBatches` (per-invocation state, effect, `ChildRunID`), `Waits`, `EventSequence`, `HistoryPruned`.
+`State` (`ready`, `running`, `waiting`, `cancel_requested`, `finalizing`, `needs_attention`, `terminal`), `Definition`, `Parent`, `Conversation`, `Result`, `Failure` (`Message`, `Kind`, `StopReason`, `Violations`), `Attention` (`Kind`: `execution`, `provider`, `hooks`, `child`; `Reason`, such as `core.ErrToolEffectUncertain`'s message for an unreconciled call; `BlockingRunID`), `Accounting` (`UnknownAttempts`, `FreshAttempts`, `Tree`), `Hooks`, `ToolBatches` (per-invocation state, effect, `ChildRunID`), `Waits`, `EventSequence`, `HistoryPruned`.
 
 ## Messages and Blocks
 
@@ -98,7 +104,7 @@ Run errors (rebuilt from the persisted failure after `Await`, identically before
 
 A tool's or provider's own error types keep only their message after persistence.
 
-Runtime command errors: `ErrDefinitionNotRegistered`, `ErrDefinitionConflict`, `ErrAdmissionConflict`, `ErrRunNotFound`, `ErrRuntimeClosed`, `ErrRunPruned`, `ErrEventGap`, `ErrConversationBusy`, `ErrConversationConflict`, `ErrConversationBlocked`, `ErrWaitConflict`, `ErrWaitExpired`, `ErrWaitStale`, `ErrApprovalUnauthorized`, `ErrApprovalActionMismatch`, `ErrReconciliationConflict`, `ErrPayloadTooLarge`, `ErrPayloadUnavailable`.
+Runtime command errors: `ErrDefinitionNotRegistered`, `ErrDefinitionConflict`, `ErrAdmissionConflict`, `ErrRunNotFound`, `ErrRuntimeClosed`, `ErrRunPruned`, `ErrEventGap`, `ErrConversationNotFound`, `ErrConversationBusy`, `ErrConversationConflict`, `ErrConversationBlocked`, `ErrWaitNotFound`, `ErrWaitConflict`, `ErrWaitExpired`, `ErrWaitStale`, `ErrApprovalUnauthorized`, `ErrApprovalActionMismatch`, `ErrOperationNotFound`, `ErrReconciliationConflict`, `ErrPayloadTooLarge`, `ErrPayloadUnavailable`.
 
 ```go
 result, err := rt.Run(ctx, ref, task)

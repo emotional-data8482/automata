@@ -45,7 +45,7 @@ provider := openai.
 agent, err := core.New(provider, core.AgentConfig{SystemPrompt: prompt})
 ```
 
-The stdlib-only provider works with OpenAI-compatible Chat Completions endpoints such as Ollama, vLLM, OpenRouter, or a compatible gateway by changing the base URL.
+The stdlib-only provider works with OpenAI-compatible Chat Completions endpoints such as Ollama, vLLM, or a compatible gateway by changing the base URL. For OpenRouter, prefer the dedicated `extensions/openrouter` module (reasoning output and cache-write usage).
 
 Notes:
 
@@ -56,6 +56,35 @@ Notes:
 - Tool result errors are represented with an `error:` content prefix because Chat Completions lacks a native error flag.
 - Rich tool result content is flattened for Chat Completions; non-text blocks degrade to placeholders such as `[non-text tool result block: image/png]` instead of being dropped.
 - Temperature, max tokens, stop sequences, and tool choice are supported.
+- Native structured output sends a `response_format` JSON schema, strict when the schema allows it and best-effort otherwise. Backends that reject `response_format` fail the call; keep typed runs on those backends on the default hidden-tool path (`Native: false`).
+- `WithHTTPClient` replaces the HTTP client (tests, proxies, custom transports).
+
+## OpenRouter
+
+```bash
+go get github.com/emotional-data8482/automata@latest \
+  github.com/emotional-data8482/automata/extensions/openrouter@latest
+```
+
+```go
+provider := openrouter.New("anthropic/claude-sonnet-4.5",
+    openrouter.WithAPIKey(os.Getenv("OPENROUTER_API_KEY")),
+    openrouter.WithAppInfo("https://example.com", "My App"), // optional attribution headers
+)
+agent, err := core.New(provider, core.AgentConfig{SystemPrompt: prompt})
+```
+
+The model string is an OpenRouter model ID. The provider wraps the official OpenRouter Go SDK and implements `core.StreamProvider` and native structured output. Other options: `WithServerURL` (gateways and test servers) and `WithHTTPClient`.
+
+Notes:
+
+- SDK-internal retries are disabled; failures surface as `*openrouter.APIError` (`StatusCode`, `Body`), and 408, 429, and 5xx are retryable through the definition's `Retry` policy.
+- Model reasoning becomes a `core.ThinkingBlock` without a signature. Thinking and provider-raw blocks are dropped when sent.
+- `ThinkingBudget` is ignored (OpenRouter uses reasoning effort levels). Temperature, max tokens, stop sequences, and tool choice are supported.
+- Usage includes cached prompt tokens (`CacheReadTokens`) and cache writes (`CacheCreationTokens`).
+- Images become `image_url` parts; tool-result errors use an `error:` content prefix; non-text tool-result blocks degrade to placeholder text.
+- Native structured output sends a `json_schema` response format without the strict flag, because strict subsets differ across routed models. Core still validates the payload; a model that rejects schema enforcement fails the call, so use `Native: false` for it.
+- Unknown or error finish reasons never map to a successful stop reason.
 
 Do not switch an active provider-native transcript between providers casually: a conversation pins one definition revision. Prefer child agents per provider with typed handoffs.
 

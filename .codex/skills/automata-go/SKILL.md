@@ -2,7 +2,7 @@
 name: automata-go
 description: Build, extend, review, and troubleshoot agentic Go applications with github.com/emotional-data8482/automata. Use when creating tool-using agents, durable runs that survive restarts, typed outputs, child agents, conversations, approvals, live streams, provider integrations, or production-safe agent services in Go.
 license: Apache-2.0
-compatibility: "Automata releases with core.Runtime (after v0.4.x); Go 1.26.2+; provider credentials are needed only for live runs"
+compatibility: "Automata v0.5.0+ (the first release with core.Runtime); Go 1.26.2+; provider credentials are needed only for live runs"
 metadata:
   package: github.com/emotional-data8482/automata
 ---
@@ -11,7 +11,7 @@ metadata:
 
 Automata runs agents through one durable lifecycle. A `core.Agent` is an immutable definition (provider, prompt, tools, limits, output contract). A `core.Runtime` admits each task before running it, commits every step, and recovers after a restart without repeating completed work. Keep business state, authorization, and deterministic verification in application code.
 
-This skill targets the Runtime API. Direct `Agent.Run`, `Session`, `RunTyped`, `AsTool`, and `Approver` no longer exist; if an application uses them, migrate it with the table in the repository README ("Upgrading from v0.4"). Inspect `go.mod` first and keep the separately versioned Automata modules on compatible releases.
+This skill targets the Runtime API, first released in v0.5.0. Direct `Agent.Run`, `Session`, `RunTyped`, `AsTool`, and `Approver` no longer exist; if an application uses them, migrate it with the table in the repository README ("Upgrading from v0.4"). Inspect `go.mod` first and keep the separately versioned Automata modules on compatible releases.
 
 ## Workflow
 
@@ -23,7 +23,7 @@ This skill targets the Runtime API. Direct `Agent.Run`, `Session`, `RunTyped`, `
 2. **Add only the modules in use**
    - Core: `github.com/emotional-data8482/automata/core` (no dependencies)
    - Persistent store: `github.com/emotional-data8482/automata/extensions/sqlite`
-   - Anthropic: `.../extensions/claude`; OpenAI-compatible: `.../extensions/openai`
+   - Anthropic: `.../extensions/claude`; OpenAI-compatible: `.../extensions/openai`; OpenRouter: `.../extensions/openrouter`
    - First-party tools: `.../tools`; Tavily search backend: `.../extensions/tavily`
 
 3. **Design boundaries before prompts**
@@ -135,7 +135,7 @@ Note: `core.Func` treats a returned Go error as fatal to the run. Return `core.E
 
 - Persistent store for anything that must survive a restart; `Recover` after registering every revision on startup.
 - External task IDs mapped with `WithIdempotencyKey`; a retry reuses the same deadline value.
-- Context deadlines on API calls, `MaxTurns`, and `ToolPolicy` caps (`MaxCalls` is shared by the whole run tree).
+- Context deadlines on API calls, `MaxTurns`, and `ToolPolicy` caps (`MaxCalls` is shared by the whole run tree; `PerTool` adds per-tool budgets, timeouts, and rate limiters).
 - Every side-effecting tool declares its effect policy and uses the operation idempotency key.
 - Approvals bind the exact action (`ActionDigest`) and are authorized by `RuntimeConfig.Authorizer` against current policy.
 - Filesystem tools use an isolated root, shell tools exact argv allow-lists, network tools egress policy.
