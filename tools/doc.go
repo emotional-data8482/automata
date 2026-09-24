@@ -2,7 +2,9 @@
 // the stdlib: web fetching ([HTTPFetch]), sandboxed file access ([ReadFile],
 // [WriteFile]), an opt-in allow-listed shell ([Shell]), and a vendor-neutral
 // web search adapter ([WebSearch]) whose backends (e.g. the tavily extension)
-// plug in via the [Searcher] interface.
+// plug in via the [Searcher] interface. [LoadAgentsMD] collects a workspace's
+// AGENTS.md instruction files for an agent's system prompt, and [LoadSkills]
+// loads Agent Skills as a prompt catalog plus a read-only load_skill tool.
 //
 // Everything composes with the existing core.Func schema machinery; the module
 // adds no dependencies beyond core itself.
@@ -15,7 +17,7 @@
 // explicit opt-in and must not wrap non-idempotent work without a destination
 // idempotency strategy.
 //
-// ReadFile declares [core.ToolEffectReadOnly]. WriteFile declares
+// ReadFile and the load_skill tool declare [core.ToolEffectReadOnly]. WriteFile declares
 // [core.ToolEffectMutating], reports an [core.EffectApplied] content-digest
 // receipt after a successful write, and installs a sandbox-root/path semantic
 // guard for durable Runtime execution. A crash after dispatch is still

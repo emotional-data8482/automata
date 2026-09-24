@@ -178,6 +178,29 @@ core.AgentConfig{Tools: []core.Tool{tools.ReadFile(workspaceRoot), tools.WriteFi
 - `WriteFile` exposes `write_file`, uses `os.Root`, creates parent directories, and replaces complete file content. It is a mutating binding: it reports a content-digest receipt, and its semantic guard (scoped to the sandbox root) rejects a later write of a path whose earlier write is applied or unresolved, across every run on the store.
 - Give read and write tools only to roles that need them. An isolated root limits filesystem scope but does not provide per-file authorization, version preconditions, conflict detection, audit persistence, or rollback.
 
+### AGENTS.md Instructions
+
+```go
+instructions, err := tools.LoadAgentsMD(workspaceRoot, tools.AgentsMDOptions{Dir: "pkg/sub"})
+core.AgentConfig{SystemPrompt: basePrompt + "\n\n" + instructions}
+```
+
+- `LoadAgentsMD` is a construction-time loader, not a tool. It reads each `AGENTS.md` from the root down to `Dir` through `os.Root`, shallowest first (closest instructions last), and heads each with its root-relative path.
+- Missing, blank, or non-regular files are skipped, and no files yields `""`. A `Dir` outside the root, a missing `Dir`, a symlink escape, or combined content over `MaxBytes` (default 32 KiB) is an error.
+- The result is frozen with the agent. Reload and register a new revision to pick up edits; existing conversations keep their original system message.
+
+### Agent Skills
+
+```go
+skills, err := tools.LoadSkills(".agents/skills")
+core.AgentConfig{SystemPrompt: basePrompt + "\n\n" + skills.Catalog(), Tools: []core.Tool{skills.Tool()}}
+```
+
+- `LoadSkills` treats each subdirectory with a `SKILL.md` as one skill. Every listed directory must exist. `name` (spec format, matching the directory) and `description` (at most 1024 characters) are required, and a name defined twice across the directories is an error.
+- Frontmatter is a YAML subset: top-level plain, quoted, and `|`/`>` block scalars. Nested maps such as `metadata:` are skipped. `license`, `compatibility`, and `allowed-tools` are exposed on `Skill`; `allowed-tools` is not enforced.
+- `Catalog()` returns names and descriptions for the system prompt (`""` when empty). `Tool()` is the read-only `load_skill` tool: `{name}` returns the `SKILL.md` body frozen at load, and `{name, path}` reads a file inside the skill directory through `os.Root` (256 KiB cap). Unknown names and bad paths are model-visible errors.
+- Skill scripts are never executed; pair with an allow-listed `tools.Shell` if a skill needs them. Referenced files are read at call time, so their content is pinned by the committed tool result, not by the revision.
+
 ### Allow-Listed Shell
 
 ```go
