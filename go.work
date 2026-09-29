@@ -9,6 +9,7 @@ use (
 	./examples/durable_typed
 	./examples/openai
 	./extensions/claude
+	./extensions/mcp
 	./extensions/openai
 	./extensions/openrouter
 	./extensions/tavily

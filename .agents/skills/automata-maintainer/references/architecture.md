@@ -36,9 +36,9 @@ Facts to keep straight:
 
 | Change | Inspect together |
 | --- | --- |
-| Message or block model | `core/blocks.go`, `core/types.go`, JSON round-trip tests, every provider adapter present under `extensions/` |
+| Message or block model | `core/blocks.go`, `core/types.go`, JSON round-trip tests, every provider adapter present under `extensions/`, `extensions/mcp` content conversion |
 | Run loop or errors | `core/loop.go`, `core/loopmachine.go`, `core/runtime.go` (failure persistence and `snapshotError`), `README.md` |
-| Tool execution | `core/tools.go`, `core/runtime_tools.go`, waits, policy, effect policy, rich results, child tools |
+| Tool execution | `core/tools.go`, `core/runtime_tools.go`, waits, policy, effect policy, rich results, child tools, `extensions/mcp` (error mapping; schema lowering follows `core/schemacontract.go`) |
 | Streaming | `core/stream.go`, `core/runtime.go` (`publish`, `attachAncestors`), accumulator, every affected provider stream implementation |
 | Typed output | `core/typed.go`, schema derivation/validation, provider capability mapping |
 | Provider options | `core/provider.go`, request builders of the affected adapters, docs/examples |

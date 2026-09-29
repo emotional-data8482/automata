@@ -35,6 +35,7 @@ It is built for agents inside web servers and job workers, not notebooks.
 | `extensions/openai` (module) | OpenAI Chat Completions provider (stdlib-only); any OpenAI-compatible base URL |
 | `extensions/openrouter` (module) | OpenRouter Chat Completions provider (official SDK); text, reasoning, images, tools, and structured output |
 | `extensions/tavily` (module) | Tavily backend for `tools.WebSearch` |
+| `extensions/mcp` (module) | Model Context Protocol through the official Go SDK: `mcpclient` turns a server's tools into `core.Tool`s, `mcpserver` serves `core.Tool`s |
 | `retry`, `tracing` | Backoff policy and span interfaces used by core |
 | `examples/*` (modules) | Runnable demos (see [Examples](#examples)) |
 
@@ -248,6 +249,33 @@ core.AgentConfig{ToolPolicy: core.ToolPolicy{
 Policy timeouts and budget denials are recoverable tool results. Tools and
 limiters must honor context cancellation, because Go cannot stop a function
 that ignores its context.
+
+### MCP servers
+
+`extensions/mcp` wraps the official MCP Go SDK. `mcpclient` connects over any
+SDK transport and returns the server's tools as ordinary `core.Tool`s:
+
+```go
+// Fragment
+client, err := mcpclient.Connect(ctx,
+	&mcp.CommandTransport{Command: exec.Command("mcp-server-fetch")},
+	mcpclient.Options{})
+defer client.Close()
+remote, err := client.Tools(ctx, mcpclient.ToolOptions{Prefix: "fetch_"})
+agent, err := core.New(provider, core.AgentConfig{Tools: remote})
+```
+
+A result the server marks `isError`, or a JSON-RPC error it returns, is a
+recoverable tool result. A broken connection is fatal to the run. Each input
+schema is rewritten into the subset core validates. Assertions core cannot
+express are dropped, and the server still enforces them. Remote tools are
+unclassified and need no approval by default. Wrap them with
+`WithToolEffectPolicy` or `WithDurableWait` to change that.
+
+`mcpserver.AddTools(server, tools...)` goes the other way and registers core
+tools on an SDK `*mcp.Server`. It validates arguments against each schema
+before `Execute`. Runtime policies (timeouts, budgets, approvals) do not
+apply to those calls.
 
 ### AGENTS.md instructions
 
