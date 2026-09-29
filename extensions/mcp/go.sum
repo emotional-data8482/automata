@@ -1,5 +1,5 @@
-github.com/emotional-data8482/automata v0.5.2 h1:QV2jH9Tu9IQyM7bHmYvRpWPSU3U3nBmJFpEQ0E6RGKk=
-github.com/emotional-data8482/automata v0.5.2/go.mod h1:cdZWiuUvSP4zSH85Md2TE3ASj2SUy4yt29TOfSHE/K8=
+github.com/emotional-data8482/automata v0.5.3 h1:RNfpEnCRCpe9avR7+onplGlzFBlCYy/WgyeY+STx5yo=
+github.com/emotional-data8482/automata v0.5.3/go.mod h1:cdZWiuUvSP4zSH85Md2TE3ASj2SUy4yt29TOfSHE/K8=
 github.com/golang-jwt/jwt/v5 v5.3.1 h1:kYf81DTWFe7t+1VvL7eS+jKFVWaUnK9cB1qbwn63YCY=
 github.com/golang-jwt/jwt/v5 v5.3.1/go.mod h1:fxCRLWMO43lRc8nhHWY6LGqRcf+1gQWArsqaEUEa5bE=
 github.com/google/go-cmp v0.7.0 h1:wk8382ETsv4JYUZwIsn6YpYiWiBsYLSJiTsyBybVuN8=
