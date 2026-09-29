@@ -72,18 +72,20 @@ func TestReportToolProgressOutsideRuntimeIsNoOp(t *testing.T) {
 	}
 }
 
-// TestToolProgressReporterDropsAfterClose pins the ordering guarantee: once a
-// call's reporter closes, no further report is emitted, even from a goroutine
-// the tool leaked.
-func TestToolProgressReporterDropsAfterClose(t *testing.T) {
+// TestWithToolProgressStop pins the ordering guarantee: once stop returns,
+// no receive is running and none follows, even from goroutines a tool leaked.
+func TestWithToolProgressStop(t *testing.T) {
 	var mu sync.Mutex
-	emitted := 0
-	reporter := &toolProgressReporter{emit: func(StreamEvent) {
+	received, active := 0, 0
+	ctx, stop := WithToolProgress(context.Background(), func(ToolProgress) {
 		mu.Lock()
-		emitted++
+		active++
+		received++
 		mu.Unlock()
-	}}
-	ctx := context.WithValue(context.Background(), toolProgressKey{}, reporter)
+		mu.Lock()
+		active--
+		mu.Unlock()
+	})
 	var wg sync.WaitGroup
 	for range 8 {
 		wg.Go(func() {
@@ -92,15 +94,47 @@ func TestToolProgressReporterDropsAfterClose(t *testing.T) {
 			}
 		})
 	}
-	reporter.close()
+	stop()
 	mu.Lock()
-	atClose := emitted
+	atStop, running := received, active
 	mu.Unlock()
 	wg.Wait()
+	stop() // idempotent
 	mu.Lock()
 	defer mu.Unlock()
-	if emitted != atClose {
-		t.Fatalf("%d reports emitted after close", emitted-atClose)
+	if running != 0 {
+		t.Fatalf("%d receives still running after stop returned", running)
+	}
+	if received != atStop {
+		t.Fatalf("%d reports received after stop", received-atStop)
+	}
+}
+
+func TestWithToolProgressNesting(t *testing.T) {
+	var outer, inner []ToolProgress
+	outerCtx, stopOuter := WithToolProgress(context.Background(), func(p ToolProgress) { outer = append(outer, p) })
+	defer stopOuter()
+
+	// The innermost receiver wins; it can pass reports on explicitly.
+	innerCtx, stopInner := WithToolProgress(outerCtx, func(p ToolProgress) {
+		inner = append(inner, p)
+		p.Message = "forwarded " + p.Message
+		ReportToolProgress(outerCtx, p)
+	})
+	ReportToolProgress(innerCtx, ToolProgress{Progress: 1, Message: "step"})
+	stopInner()
+	ReportToolProgress(innerCtx, ToolProgress{Progress: 2})
+
+	// A nil receiver discards reports instead of reaching the outer one.
+	quietCtx, stopQuiet := WithToolProgress(outerCtx, nil)
+	defer stopQuiet()
+	ReportToolProgress(quietCtx, ToolProgress{Progress: 3})
+
+	if len(inner) != 1 || inner[0].Message != "step" {
+		t.Fatalf("inner = %+v", inner)
+	}
+	if len(outer) != 1 || outer[0] != (ToolProgress{Progress: 1, Message: "forwarded step"}) {
+		t.Fatalf("outer = %+v", outer)
 	}
 }
 

@@ -526,7 +526,10 @@ for i, file := range files {
 
 Each report arrives as a `StreamToolProgress` event before the call's result.
 Progress is never persisted, and a report made after `Execute` returns is
-dropped.
+dropped. To execute a tool outside a Runtime and still receive its progress,
+for example in a test or behind another protocol, install a receiver with
+`ctx, stop := core.WithToolProgress(ctx, receive)` and call `stop` before
+using the result.
 
 Committed events are the durable record. Read them in pages from a cursor:
 

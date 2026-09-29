@@ -15,42 +15,60 @@ type ToolProgress struct {
 	Message string
 }
 
-// ReportToolProgress publishes progress for the tool call executing under ctx
-// as a [StreamToolProgress] event on the run's live views, including ancestor
-// views of a child run. It is safe for concurrent use and never waits for an
-// observer. Outside a Runtime tool execution, or once that tool's Execute has
-// returned, it does nothing.
+// ReportToolProgress sends progress to the receiver ctx carries (see
+// [WithToolProgress]) and returns once the receiver has taken it. It is safe
+// for concurrent use. Without a receiver, or once the receiver is stopped, it
+// does nothing.
 //
-// Progress is provisional: it is never persisted, and a bounded view may drop
-// it. Report at a rate a person could follow, not per byte of work.
+// Under a Runtime, the receiver publishes a [StreamToolProgress] event on the
+// run's live views, including ancestor views of a child run, and never waits
+// for a view. Such progress is provisional: it is never persisted, and a
+// bounded view may drop it. Report at a rate a person could follow, not per
+// byte of work.
 func ReportToolProgress(ctx context.Context, progress ToolProgress) {
-	if reporter, ok := ctx.Value(toolProgressKey{}).(*toolProgressReporter); ok {
-		reporter.report(progress)
+	if receiver, ok := ctx.Value(toolProgressKey{}).(*toolProgressReceiver); ok {
+		receiver.report(progress)
 	}
+}
+
+// WithToolProgress returns a copy of ctx whose [ReportToolProgress] calls go
+// to receive, and a stop function. Calls to receive are serialized, so
+// receive must not report on the context it was installed on. After stop
+// returns, receive is running nowhere and is never called again; stop is
+// idempotent. A nil receive discards reports.
+//
+// The receiver replaces any receiver ctx already carries. To pass reports on,
+// call ReportToolProgress on the outer context from receive.
+//
+// Runtime installs a receiver around every tool execution and stops it before
+// publishing the call's result. Install one yourself to execute a tool
+// elsewhere, such as serving it over another protocol or observing its
+// progress in a test, and stop it before reporting the tool's result.
+func WithToolProgress(ctx context.Context, receive func(ToolProgress)) (context.Context, func()) {
+	receiver := &toolProgressReceiver{receive: receive}
+	return context.WithValue(ctx, toolProgressKey{}, receiver), receiver.stop
 }
 
 type toolProgressKey struct{}
 
-// toolProgressReporter publishes one call's progress until the call returns.
-// Holding mu across emit orders every published report before close, and so
-// before the call's result event.
-type toolProgressReporter struct {
-	mu   sync.Mutex
-	emit func(StreamEvent)
-	call ToolUseBlock // ID and Name only
-	done bool
+// toolProgressReceiver delivers one execution's progress until stopped.
+// Holding mu across receive orders every delivered report before stop.
+type toolProgressReceiver struct {
+	mu      sync.Mutex
+	receive func(ToolProgress)
+	stopped bool
 }
 
-func (r *toolProgressReporter) report(progress ToolProgress) {
+func (r *toolProgressReceiver) report(progress ToolProgress) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if !r.done {
-		r.emit(StreamEvent{Kind: StreamToolProgress, ToolCall: r.call, Progress: &progress})
+	if !r.stopped && r.receive != nil {
+		r.receive(progress)
 	}
 }
 
-func (r *toolProgressReporter) close() {
+func (r *toolProgressReceiver) stop() {
 	r.mu.Lock()
-	r.done = true
+	r.stopped = true
 	r.mu.Unlock()
 }

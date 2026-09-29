@@ -304,10 +304,14 @@ func (l *loop) executeTool(
 	if err := dispatch(); err != nil {
 		return ToolResult{}, fmt.Errorf("persist tool dispatch: %w", err)
 	}
-	progress := &toolProgressReporter{emit: l.emit, call: ToolUseBlock{ID: call.ID, Name: call.Name}}
 	result, executeErr := func() (ToolResult, error) {
-		defer progress.close()
-		progressCtx := context.WithValue(execCtx, toolProgressKey{}, progress)
+		// Stopping before return orders all of the call's progress before its
+		// result event, and drops reports from goroutines the tool leaves behind.
+		progressCall := ToolUseBlock{ID: call.ID, Name: call.Name}
+		progressCtx, stopProgress := WithToolProgress(execCtx, func(progress ToolProgress) {
+			l.emit(StreamEvent{Kind: StreamToolProgress, ToolCall: progressCall, Progress: &progress})
+		})
+		defer stopProgress()
 		return tool.executor.Execute(progressCtx, append(json.RawMessage(nil), call.Input...))
 	}()
 	result = normalizeResult(result)
