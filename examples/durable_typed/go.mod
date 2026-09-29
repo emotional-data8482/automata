@@ -4,7 +4,7 @@ go 1.26.2
 
 require (
 	github.com/emotional-data8482/automata v0.5.1
-	github.com/emotional-data8482/automata/extensions/sqlite v0.0.0
+	github.com/emotional-data8482/automata/extensions/sqlite v0.5.1
 )
 
 require (
