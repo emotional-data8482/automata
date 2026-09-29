@@ -28,8 +28,10 @@
 // dropped. That relaxes only core's local pre-check: the server remains the
 // authoritative validator and reports violations as recoverable tool errors.
 //
-// Progress: calls do not request progress notifications yet. Core has no
-// progress stream event for tools to report into; one is planned.
+// Progress: every call requests progress notifications, and each one the
+// server sends is published with [core.ReportToolProgress]. Under a Runtime it
+// reaches live views as a [core.StreamToolProgress] event for that call. A
+// notification that arrives after the call returns is dropped.
 //
 // Content: text and images map to core blocks, and embedded image resources
 // become images. Structured content is rendered as JSON text when the server
@@ -48,6 +50,9 @@ import (
 	"fmt"
 	"runtime/debug"
 	"slices"
+	"strconv"
+	"sync"
+	"sync/atomic"
 
 	"github.com/emotional-data8482/automata/core"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -61,7 +66,9 @@ type Options struct {
 	// "automata" at this module's version.
 	Implementation *mcp.Implementation
 	// ClientOptions configures the SDK client (sampling and elicitation
-	// handlers, capabilities, keepalive, logging).
+	// handlers, capabilities, keepalive, logging). A
+	// ProgressNotificationHandler set here still receives every progress
+	// notification.
 	ClientOptions *mcp.ClientOptions
 }
 
@@ -69,6 +76,10 @@ type Options struct {
 // and so are the tools it returns.
 type Client struct {
 	session *mcp.ClientSession
+
+	mu       sync.Mutex
+	calls    map[string]context.Context // in-flight calls by progress token
+	sequence atomic.Uint64
 }
 
 // Connect starts a session with the server behind transport. Use the SDK's
@@ -83,11 +94,24 @@ func Connect(ctx context.Context, transport mcp.Transport, opts Options) (*Clien
 	if impl == nil {
 		impl = &mcp.Implementation{Name: "automata", Version: moduleVersion()}
 	}
-	session, err := mcp.NewClient(impl, opts.ClientOptions).Connect(ctx, transport, nil)
+	c := &Client{calls: map[string]context.Context{}}
+	var clientOpts mcp.ClientOptions
+	if opts.ClientOptions != nil {
+		clientOpts = *opts.ClientOptions
+	}
+	forward := clientOpts.ProgressNotificationHandler
+	clientOpts.ProgressNotificationHandler = func(ctx context.Context, req *mcp.ProgressNotificationClientRequest) {
+		if forward != nil {
+			forward(ctx, req)
+		}
+		c.reportProgress(req.Params)
+	}
+	session, err := mcp.NewClient(impl, &clientOpts).Connect(ctx, transport, nil)
 	if err != nil {
 		return nil, fmt.Errorf("mcp: connect: %w", err)
 	}
-	return &Client{session: session}, nil
+	c.session = session
+	return c, nil
 }
 
 // Session returns the SDK session, for protocol features this package does
@@ -148,6 +172,35 @@ func (c *Client) Tools(ctx context.Context, opts ToolOptions) ([]core.Tool, erro
 		return nil, fmt.Errorf("mcp: server does not offer tools %q", missing)
 	}
 	return tools, nil
+}
+
+// trackProgress routes progress for a call made under ctx. It returns the
+// call's progress token and a release function to run when the call returns.
+func (c *Client) trackProgress(ctx context.Context) (string, func()) {
+	token := "automata-" + strconv.FormatUint(c.sequence.Add(1), 10)
+	c.mu.Lock()
+	c.calls[token] = ctx
+	c.mu.Unlock()
+	return token, func() {
+		c.mu.Lock()
+		delete(c.calls, token)
+		c.mu.Unlock()
+	}
+}
+
+// reportProgress publishes a notification under its call's context. Core
+// drops a report that races the call's return.
+func (c *Client) reportProgress(params *mcp.ProgressNotificationParams) {
+	if params == nil {
+		return
+	}
+	token, _ := params.ProgressToken.(string)
+	c.mu.Lock()
+	ctx, ok := c.calls[token]
+	c.mu.Unlock()
+	if ok {
+		core.ReportToolProgress(ctx, core.ToolProgress{Progress: params.Progress, Total: params.Total, Message: params.Message})
+	}
 }
 
 func moduleVersion() string {

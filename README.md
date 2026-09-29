@@ -265,7 +265,8 @@ agent, err := core.New(provider, core.AgentConfig{Tools: remote})
 ```
 
 A result the server marks `isError`, or a JSON-RPC error it returns, is a
-recoverable tool result. A broken connection is fatal to the run. Each input
+recoverable tool result. A broken connection is fatal to the run. Progress
+notifications from the server arrive as `StreamToolProgress` events. Each input
 schema is rewritten into the subset core validates. Assertions core cannot
 express are dropped, and the server still enforces them. Remote tools are
 unclassified and need no approval by default. Wrap them with

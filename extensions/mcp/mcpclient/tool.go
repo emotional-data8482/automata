@@ -29,6 +29,9 @@ func (t *remoteTool) Execute(ctx context.Context, args json.RawMessage) (core.To
 	if len(args) > 0 && string(args) != "null" {
 		params.Arguments = args
 	}
+	token, release := t.client.trackProgress(ctx)
+	defer release()
+	params.SetProgressToken(token)
 	result, err := t.client.session.CallTool(ctx, params)
 	if err != nil {
 		if ctx.Err() != nil {
