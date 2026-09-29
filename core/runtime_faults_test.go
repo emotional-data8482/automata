@@ -64,7 +64,7 @@ func enteringState(state RuntimeState) func(string, []byte) bool {
 
 // committingTransition matches the first write that records a loop
 // transition of kind.
-func committingTransition(kind string) func(string, []byte) bool {
+func committingTransition(kind transitionKind) func(string, []byte) bool {
 	return runWrite(func(record storedRuntimeRun) bool { return record.LastTransition == kind })
 }
 

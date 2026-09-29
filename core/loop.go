@@ -149,7 +149,7 @@ type runConfig struct {
 }
 
 type durableLoopTransition struct {
-	Kind           string
+	Kind           transitionKind
 	Result         RunResult
 	EffectiveTools []string
 	// StructuredCorrections is the run's cumulative correction-turn count for

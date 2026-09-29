@@ -432,7 +432,6 @@ func propagateCancellationTx(tx StoreTransaction, runID string, cause error) ([]
 			}
 			switch child.State {
 			case RuntimeReady, RuntimeWaiting, RuntimeNeedsAttention:
-				child.State = RuntimeTerminal
 				child.Result.Status = RunCancelled
 				child.AttentionReason = ""
 				child.AttentionKind = ""
@@ -453,7 +452,12 @@ func propagateCancellationTx(tx StoreTransaction, runID string, cause error) ([]
 				return nil, err
 			}
 			child.Generation++
-			if err := putRuntimeRun(tx, child); err != nil {
+			if child.State == RuntimeCancelRequested {
+				err = putRuntimeRun(tx, child)
+			} else {
+				err = commitTerminalTx(tx, &child)
+			}
+			if err != nil {
 				return nil, err
 			}
 		}
@@ -492,9 +496,7 @@ func markParentChildAttentionTx(tx StoreTransaction, parentRunID, childRunID, re
 	if wait.State != WaitPending || wait.ChildRunID != childRunID {
 		return nil
 	}
-	record.State = RuntimeNeedsAttention
-	record.AttentionKind = AttentionChild
-	record.AttentionReason = fmt.Sprintf("durable child %s requires attention: %s", childRunID, reason)
+	setRunAttention(&record, AttentionChild, fmt.Sprintf("durable child %s requires attention: %s", childRunID, reason))
 	record.Generation++
 	return putRuntimeRun(tx, record)
 }

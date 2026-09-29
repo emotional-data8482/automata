@@ -190,7 +190,14 @@ invocation has an authoritative outcome. A fatal batch outcome commits with
 that history; recovery finalizes the failure rather than continuing the model.
 
 `Recover` pages through an index of non-terminal runs only, so its cost
-follows the active work, not the number of runs ever stored.
+follows the active work, not the number of runs ever stored. Internally, a pure
+recovery transition table classifies persisted state and observed facts before
+executors apply generation-guarded writes. Live workers are left alone;
+suspended work checks deadlines before child outcomes and wait expiries.
+Terminal and attention transitions share disposition helpers, so conversation
+release commits atomically and parent notifications use one path. Typed internal
+transition markers keep their existing JSON strings; this refactor does not
+change encoding 9 or authorize any additional retries.
 
 ### Provider attempts
 

@@ -83,13 +83,9 @@ func (r *Runtime) finishHooks(runID string, results []RunHookResult) error {
 			return fmt.Errorf("run %s cannot finish hooks from %s", runID, record.State)
 		}
 		record.HookResults = append([]RunHookResult(nil), results...)
-		record.State = RuntimeTerminal
 		record.Generation++
 		childOf = record.ParentRunID
-		if err := releaseConversationTx(tx, record); err != nil {
-			return err
-		}
-		return putRuntimeRun(tx, record)
+		return commitTerminalTx(tx, &record)
 	})
 	if err != nil {
 		return err
@@ -100,7 +96,7 @@ func (r *Runtime) finishHooks(runID string, results []RunHookResult) error {
 		// recovery) notifies the parent here. If this wake transaction fails,
 		// the parent stays inspectable as Waiting with its pending child wait
 		// and Recover consumes the terminal child on the next pass.
-		_ = r.wakeParentFromChild(context.Background(), runID)
+		_ = r.afterRunDisposition(context.Background(), storedRuntimeRun{RunID: runID, ParentRunID: childOf, State: RuntimeTerminal})
 	}
 	return nil
 }
@@ -147,15 +143,9 @@ func (h *RunHandle) AcknowledgeHooks(ctx context.Context) error {
 				Name: name, Error: "delivery outcome unknown: interrupted and acknowledged", Unknown: true,
 			})
 		}
-		record.State = RuntimeTerminal
-		record.AttentionReason = ""
-		record.AttentionKind = ""
 		record.Generation++
 		childOf = record.ParentRunID
-		if err := releaseConversationTx(tx, record); err != nil {
-			return err
-		}
-		if err := putRuntimeRun(tx, record); err != nil {
+		if err := commitTerminalTx(tx, &record); err != nil {
 			return err
 		}
 		return putStoredJSON(tx, runtimeReceiptsBucket, hooksAckReceiptKey(h.runID), cancelReceipt{
@@ -163,7 +153,7 @@ func (h *RunHandle) AcknowledgeHooks(ctx context.Context) error {
 		})
 	})
 	if err == nil && childOf != "" {
-		err = h.runtime.wakeParentFromChild(context.WithoutCancel(ctx), h.runID)
+		err = h.runtime.afterRunDisposition(context.WithoutCancel(ctx), storedRuntimeRun{RunID: h.runID, ParentRunID: childOf, State: RuntimeTerminal})
 	}
 	return err
 }

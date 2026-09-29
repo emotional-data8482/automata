@@ -40,34 +40,30 @@ func (r *Runtime) markPayloadAttention(ctx context.Context, runID string, cause 
 		}
 		recordPayloadBlock(&record, cause)
 		if record.State == RuntimeCancelRequested {
-			record.State = RuntimeTerminal
 			record.Result.Status = RunCancelled
 			record.AttentionReason, record.AttentionKind = "", ""
 			setRuntimeError(&record, context.Canceled)
 			record.Result.Diagnostics = append(record.Result.Diagnostics, RunDiagnostic{Kind: "payload_error", Message: cause.Error()})
-			if err := releaseConversationTx(tx, record); err != nil {
-				return err
-			}
 			terminal = true
 		} else {
-			record.State = RuntimeNeedsAttention
-			record.AttentionKind = AttentionExecution
-			record.AttentionReason = cause.Error()
+			setRunAttention(&record, AttentionExecution, cause.Error())
 		}
 		record.Generation++
 		committed = record
+		if terminal {
+			err := commitTerminalTx(tx, &record)
+			committed = record
+			return err
+		}
 		return putRuntimeRun(tx, record)
 	})
 	if err != nil || committed.RunID == "" {
 		return err
 	}
 	if terminal {
-		if committed.ParentRunID != "" {
-			return r.wakeParentFromChild(context.WithoutCancel(ctx), runID)
-		}
-		return nil
+		return r.afterRunDisposition(context.WithoutCancel(ctx), committed)
 	}
-	return r.notifyParentOfAttention(ctx, committed)
+	return r.afterRunDisposition(ctx, committed)
 }
 
 func (r *Runtime) start(runID string) {
@@ -192,7 +188,7 @@ func (r *Runtime) execute(workerCtx context.Context, runID string) {
 	r.attachAncestors(workerCtx, record)
 	result := cloneRunResult(record.Result)
 	var runErr error
-	if record.LastTransition == "batch_committed" && record.Error != "" {
+	if record.LastTransition == transitionBatchCommitted && record.Error != "" {
 		// The batch and its fatal outcome committed before the previous worker
 		// stopped. Only finalization remains; do not ask the provider to continue.
 		runErr = snapshotError(snapshotFromRecord(record))
@@ -241,10 +237,7 @@ func (r *Runtime) completeExecution(runID string, result RunResult, runErr, work
 // waiting parent so required-child attention blocks ordinary parent
 // continuation visibly, not just through a later recovery pass.
 func (r *Runtime) notifyParentOfAttention(ctx context.Context, record storedRuntimeRun) error {
-	if record.ParentRunID == "" {
-		return nil
-	}
-	return r.notifyParentChildAttention(ctx, record.ParentRunID, record.RunID, record.AttentionReason)
+	return r.afterRunDisposition(ctx, record)
 }
 
 func (r *Runtime) persistTransition(ctx context.Context, runID string, transition durableLoopTransition) error {
@@ -259,7 +252,7 @@ func (r *Runtime) persistTransition(ctx context.Context, runID string, transitio
 		if err := appendTranscript(tx, runID, &record, transition.Result.Messages); err != nil {
 			return err
 		}
-		if transition.Kind == "batch_committed" {
+		if transition.Kind == transitionBatchCommitted {
 			if err := commitPendingToolBatch(tx, &record); err != nil {
 				return err
 			}
@@ -268,7 +261,7 @@ func (r *Runtime) persistTransition(ctx context.Context, runID string, transitio
 		record.Result.Messages = nil
 		record.Corrections = transition.StructuredCorrections
 		record.LastTransition = transition.Kind
-		if transition.Kind == "provider_accepted" {
+		if transition.Kind == transitionProviderAccepted {
 			record.EffectiveTools = append([]string(nil), transition.EffectiveTools...)
 		}
 		record.Generation++
@@ -326,9 +319,7 @@ func (r *Runtime) finishExecution(runID string, result RunResult, runErr, worker
 			record.Result.Status = RunCancelled
 			setRuntimeError(&record, context.Canceled)
 		case workerErr != nil:
-			record.State = RuntimeNeedsAttention
-			record.AttentionReason = "worker stopped during execution"
-			record.AttentionKind = AttentionExecution
+			setRunAttention(&record, AttentionExecution, "worker stopped during execution")
 			if record.LastTransition == transitionProviderAttemptStarted {
 				// The stopped attempt may have reached the provider: its outcome
 				// and usage are unknown, exactly as after a crash, and the same
@@ -382,7 +373,7 @@ func (r *Runtime) markAttentionWithResult(ctx context.Context, runID string, res
 				if err := commitPendingToolBatch(tx, &record); err != nil {
 					return err
 				}
-				record.LastTransition = "batch_committed"
+				record.LastTransition = transitionBatchCommitted
 			}
 			record.Result = cloneRunResult(result)
 			record.Result.Messages = nil
@@ -396,9 +387,7 @@ func (r *Runtime) markAttentionWithResult(ctx context.Context, runID string, res
 			record.AttentionReason = ""
 			setRuntimeError(&record, context.Canceled)
 		} else {
-			record.State = RuntimeNeedsAttention
-			record.AttentionReason = reason
-			record.AttentionKind = AttentionExecution
+			setRunAttention(&record, AttentionExecution, reason)
 		}
 		record.Generation++
 		committed = record
@@ -493,9 +482,7 @@ func (r *Runtime) markAttentionKind(ctx context.Context, runID string, generatio
 		if record.Generation != generation {
 			return nil
 		}
-		record.State = RuntimeNeedsAttention
-		record.AttentionReason = reason
-		record.AttentionKind = kind
+		setRunAttention(&record, kind, reason)
 		record.Generation++
 		childOf = record.ParentRunID
 		return putRuntimeRun(tx, record)
@@ -504,7 +491,7 @@ func (r *Runtime) markAttentionKind(ctx context.Context, runID string, generatio
 		// A required child that needs attention blocks ordinary parent
 		// continuation. Surface that on the parent while keeping the child's
 		// own evidence authoritative on the child run.
-		if err := r.notifyParentChildAttention(ctx, childOf, runID, reason); err != nil {
+		if err := r.afterRunDisposition(ctx, storedRuntimeRun{RunID: runID, ParentRunID: childOf, State: RuntimeNeedsAttention, AttentionReason: reason}); err != nil {
 			return err
 		}
 	}

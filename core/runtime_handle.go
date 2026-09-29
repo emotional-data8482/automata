@@ -226,7 +226,7 @@ func resultWithRunID(result RunResult, runID string) RunResult {
 // outcome, even after a lost acknowledgement or later transitions.
 func (h *RunHandle) Cancel(ctx context.Context) error {
 	var cancels []context.CancelFunc
-	var canceledChild string
+	var canceledChild, parentRunID string
 	err := h.runtime.transaction(ctx, true, func(tx StoreTransaction) error {
 		// Resolve an exact retry from the persisted receipt before touching
 		// current state: a lost acknowledgement followed by any later command
@@ -256,22 +256,23 @@ func (h *RunHandle) Cancel(ctx context.Context) error {
 		case RuntimeFinalizing, RuntimeTerminal:
 			return nil
 		case RuntimeReady, RuntimeWaiting, RuntimeNeedsAttention:
-			record.State = RuntimeTerminal
 			record.Result.Status = RunCancelled
 			record.AttentionReason = ""
 			record.AttentionKind = ""
 			setRuntimeError(&record, context.Canceled)
 			if record.ParentRunID != "" {
-				canceledChild = h.runID
-			}
-			if err := releaseConversationTx(tx, record); err != nil {
-				return err
+				canceledChild, parentRunID = h.runID, record.ParentRunID
 			}
 		case RuntimeRunning:
 			record.State = RuntimeCancelRequested
 		}
 		record.Generation++
-		if err := putRuntimeRun(tx, record); err != nil {
+		if receipt.ObservedState == RuntimeReady || receipt.ObservedState == RuntimeWaiting || receipt.ObservedState == RuntimeNeedsAttention {
+			err = commitTerminalTx(tx, &record)
+		} else {
+			err = putRuntimeRun(tx, record)
+		}
+		if err != nil {
 			return err
 		}
 		// Required descendants are canceled in this same commit, before any
@@ -306,7 +307,7 @@ func (h *RunHandle) Cancel(ctx context.Context) error {
 		// Cancellation durably terminalized a suspended child run; notify the
 		// parent through the same central child-completion boundary so the
 		// parent sees the model-visible cancellation outcome.
-		_ = h.runtime.wakeParentFromChild(context.Background(), canceledChild)
+		_ = h.runtime.afterRunDisposition(context.Background(), storedRuntimeRun{RunID: canceledChild, ParentRunID: parentRunID, State: RuntimeTerminal})
 	}
 	return err
 }

@@ -2107,7 +2107,7 @@ func TestRuntimeDurableTreeAccountingCountsEachRunOnce(t *testing.T) {
 
 // seedInterruptedRun commits a running run whose owner stopped right after
 // committing lastTransition.
-func seedInterruptedRun(t *testing.T, store Store, runID, lastTransition string, messages []Message) {
+func seedInterruptedRun(t *testing.T, store Store, runID string, lastTransition transitionKind, messages []Message) {
 	t.Helper()
 	record := storedRuntimeRun{
 		Version: runtimeEncodingVersion, RunID: runID, DefinitionID: "agent", DefinitionRevision: "v1",

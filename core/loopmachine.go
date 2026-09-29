@@ -132,7 +132,7 @@ func (m *loopMachine) drive() (RunResult, error) {
 	return m.result, m.err
 }
 
-func (m *loopMachine) persistTransition(kind string) error {
+func (m *loopMachine) persistTransition(kind transitionKind) error {
 	result := cloneRunResult(m.result)
 	result.RunID = m.cfg.scope.id
 	result.Messages = m.loop.snapshot()
@@ -143,7 +143,7 @@ func (m *loopMachine) persistTransition(kind string) error {
 	result.Usage = m.cfg.scope.usage
 	transition := durableLoopTransition{Kind: kind, Result: result}
 	transition.StructuredCorrections = m.structuredCorrections()
-	if kind == "provider_accepted" {
+	if kind == transitionProviderAccepted {
 		transition.EffectiveTools = make([]string, 0, len(m.loop.toolsByName))
 		for _, definition := range m.request.Tools {
 			if _, ok := m.loop.toolsByName[definition.Name]; ok {
@@ -275,7 +275,7 @@ func (m *loopMachine) structuredProseOutcome(text string) loopState {
 			m.result.StructuredOutput = append(json.RawMessage(nil), cand...)
 			m.result.Output = text
 			m.result.StopReason = StopEndTurn
-			if err := m.persistTransition("response_classified"); err != nil {
+			if err := m.persistTransition(transitionResponseClassified); err != nil {
 				return m.fail(&durableTransitionFailure{cause: err})
 			}
 			span.SetAttributes(tracing.Int("turns", m.cfg.scope.turns))
@@ -300,7 +300,7 @@ func (m *loopMachine) structuredProseOutcome(text string) loopState {
 		l.messages = append(l.messages, UserMessage(prompt))
 		// The correction state and its transcript evidence commit atomically
 		// before the correction turn is dispatched.
-		if err := m.persistTransition("response_classified"); err != nil {
+		if err := m.persistTransition(transitionResponseClassified); err != nil {
 			return m.fail(&durableTransitionFailure{cause: err})
 		}
 		log.InfoContext(ctx, "structured output failed validation; requesting correction",
@@ -313,7 +313,7 @@ func (m *loopMachine) structuredProseOutcome(text string) loopState {
 	}
 	m.result.Output = text
 	m.result.StopReason = StopEndTurn
-	if err := m.persistTransition("response_classified"); err != nil {
+	if err := m.persistTransition(transitionResponseClassified); err != nil {
 		return m.fail(&durableTransitionFailure{cause: err})
 	}
 	span.RecordError(invalid)
@@ -480,7 +480,7 @@ func (m *loopMachine) classifyResponse() loopState {
 	// Runtime persists every accepted provider turn before the loop can
 	// dispatch its requested tools. This is an internal transition of the
 	// existing machine, not a competing execution loop.
-	if err := m.persistTransition("provider_accepted"); err != nil {
+	if err := m.persistTransition(transitionProviderAccepted); err != nil {
 		return m.fail(&durableTransitionFailure{cause: err})
 	}
 	if err := ctx.Err(); err != nil {
@@ -524,7 +524,7 @@ func (m *loopMachine) classifyResponse() loopState {
 		}
 		result.Output = text
 		result.StopReason = StopEndTurn
-		if err := m.persistTransition("response_classified"); err != nil {
+		if err := m.persistTransition(transitionResponseClassified); err != nil {
 			return m.fail(&durableTransitionFailure{cause: err})
 		}
 		span.SetAttributes(tracing.Int("turns", m.cfg.scope.turns))
@@ -534,7 +534,7 @@ func (m *loopMachine) classifyResponse() loopState {
 
 	// This second boundary records that stop reason and message shape were
 	// validated. Recovery never dispatches tools from provider_accepted alone.
-	if err := m.persistTransition("batch_ready"); err != nil {
+	if err := m.persistTransition(transitionBatchReady); err != nil {
 		return m.fail(&durableTransitionFailure{cause: err})
 	}
 	return loopStateExecuteTools
@@ -609,7 +609,7 @@ func (m *loopMachine) executeTools() loopState {
 				})
 			}
 			l.messages = append(l.messages, results...)
-			if err := m.persistTransition("batch_committed"); err != nil {
+			if err := m.persistTransition(transitionBatchCommitted); err != nil {
 				return m.fail(&durableTransitionFailure{cause: err})
 			}
 			if len(violations) == 0 {
@@ -640,7 +640,7 @@ func (m *loopMachine) executeTools() loopState {
 		return m.fail(fatalErr)
 	}
 	l.messages = append(l.messages, results...)
-	if err := m.persistTransition("batch_committed"); err != nil {
+	if err := m.persistTransition(transitionBatchCommitted); err != nil {
 		return m.fail(&durableTransitionFailure{executionErr: fatalErr, cause: err})
 	}
 	if fatalErr != nil {

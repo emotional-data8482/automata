@@ -38,14 +38,22 @@ const (
 	runtimeChildLinksBucket   = "runtime_child_links"
 )
 
+// transitionKind keeps recovery boundaries typed without changing their JSON encoding.
+type transitionKind string
+
 const (
+	transitionNone               transitionKind = ""
+	transitionProviderAccepted   transitionKind = "provider_accepted"
+	transitionResponseClassified transitionKind = "response_classified"
+	transitionBatchReady         transitionKind = "batch_ready"
+	transitionBatchCommitted     transitionKind = "batch_committed"
 	// transitionProviderAttemptStarted commits before every provider call.
 	// A running run whose last transition is still this one was stopped while
 	// the provider may have been processing the request.
-	transitionProviderAttemptStarted = "provider_attempt_started"
+	transitionProviderAttemptStarted transitionKind = "provider_attempt_started"
 	// transitionProviderAttemptRecovered marks a run that recovery made ready
 	// for a policy-authorized fresh attempt: no attempt is in flight.
-	transitionProviderAttemptRecovered = "provider_attempt_recovered"
+	transitionProviderAttemptRecovered transitionKind = "provider_attempt_recovered"
 )
 
 type storedRuntimeRun struct {
@@ -71,7 +79,7 @@ type storedRuntimeRun struct {
 	ErrorStopReason    StopReason       `json:"error_stop_reason,omitempty"`
 	ErrorRawReason     string           `json:"error_raw_reason,omitempty"`
 	ErrorViolations    []string         `json:"error_violations,omitempty"`
-	LastTransition     string           `json:"last_transition,omitempty"`
+	LastTransition     transitionKind   `json:"last_transition,omitempty"`
 	EffectiveTools     []string         `json:"effective_tools,omitempty"`
 	AttentionReason    string           `json:"attention_reason,omitempty"`
 	AttentionKind      AttentionKind    `json:"attention_kind,omitempty"`

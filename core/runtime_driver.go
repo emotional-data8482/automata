@@ -207,35 +207,31 @@ func (r *Runtime) compactRecord(ctx context.Context, runID string) (storedRuntim
 // expiry of its waits. Recover and the driver share it; completeHooks delivers
 // the hooks of a run the deadline finalized.
 func (r *Runtime) maintainSuspended(ctx context.Context, record storedRuntimeRun, completeHooks func(runID string) error) error {
-	finalized, err := r.expireWaitingDeadline(ctx, record.RunID)
-	if err != nil {
-		return err
+	var facts recoveryFacts
+	for {
+		var err error
+		switch classifyRecovery(record, facts) {
+		case recoveryMaintainSuspended:
+			facts.deadlineFinalized, err = r.expireWaitingDeadline(ctx, record.RunID)
+			facts.deadlineChecked = true
+		case recoveryFinishHooks:
+			return completeHooks(record.RunID)
+		case recoveryInspectChildren:
+			facts.childrenReady, err = r.reconcileChildWaits(ctx, record.RunID)
+			facts.childrenChecked = true
+		case recoveryExpireWaits:
+			facts.waitsReady, err = r.expireRunWaits(ctx, record.RunID)
+			facts.waitsChecked = true
+		case recoveryStart:
+			r.start(record.RunID)
+			return nil
+		default:
+			return nil
+		}
+		if err != nil {
+			return err
+		}
 	}
-	if finalized {
-		return completeHooks(record.RunID)
-	}
-	// Child waits are rechecked before generic wait expiry: a linked child may
-	// have terminalized without its wake reaching this run, or be ready to
-	// start after registration.
-	ready, err := r.reconcileChildWaits(ctx, record.RunID)
-	if err != nil {
-		return err
-	}
-	if ready {
-		r.start(record.RunID)
-		return nil
-	}
-	if record.State != RuntimeWaiting {
-		return nil
-	}
-	ready, err = r.expireRunWaits(ctx, record.RunID)
-	if err != nil {
-		return err
-	}
-	if ready {
-		r.start(record.RunID)
-	}
-	return nil
 }
 
 // armSuspended schedules a still-suspended run for its next due time: the

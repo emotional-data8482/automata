@@ -56,12 +56,6 @@ func (r *Runtime) Recover(ctx context.Context) error {
 		return err
 	}
 	for _, record := range records {
-		r.mu.Lock()
-		_, live := r.live[record.RunID]
-		r.mu.Unlock()
-		if live {
-			continue
-		}
 		err := r.recoverRecord(ctx, record)
 		if errors.Is(err, ErrPayloadUnavailable) || errors.Is(err, ErrPayloadTooLarge) {
 			// Report the unreadable or unstorable payload on its run and keep
@@ -75,17 +69,26 @@ func (r *Runtime) Recover(ctx context.Context) error {
 	return nil
 }
 
-// recoverRecord applies the recovery decision for one scanned run that has no
-// live worker in this process.
+// recoverRecord applies the recovery decision for one scanned run.
 func (r *Runtime) recoverRecord(ctx context.Context, record storedRuntimeRun) error {
-	switch record.State {
-	case RuntimeReady:
-		// Without its binding, admitted work stays ready so registration
-		// followed by another recovery pass can make progress.
-		if _, err := r.binding(record.definition()); err == nil {
-			r.start(record.RunID)
+	r.mu.Lock()
+	_, live := r.live[record.RunID]
+	r.mu.Unlock()
+	_, bindingErr := r.binding(record.definition())
+	facts := recoveryFacts{liveWorker: live, bindingRegistered: bindingErr == nil, payloadFits: r.payloadFits(record), maxFreshAttempts: r.providers.MaxFreshAttempts}
+	action := classifyRecovery(record, facts)
+	if action == recoveryLeave {
+		return nil
+	}
+	if record.State == RuntimeRunning || record.State == RuntimeCancelRequested {
+		if err := r.recordInterruptedAttempt(ctx, record); err != nil {
+			return err
 		}
-	case RuntimeWaiting:
+	}
+	switch action {
+	case recoveryStart:
+		r.start(record.RunID)
+	case recoveryMaintainSuspended:
 		// Enforce the deadline, consume children that settled while this
 		// owner was away, expire elapsed waits, and arm the driver for
 		// whatever is still pending.
@@ -93,73 +96,23 @@ func (r *Runtime) recoverRecord(ctx context.Context, record storedRuntimeRun) er
 			return err
 		}
 		return r.armSuspended(ctx, record.RunID)
-	case RuntimeRunning:
-		if err := r.recordInterruptedAttempt(ctx, record); err != nil {
-			return err
-		}
-		if providerAttemptMayBeInFlight(record) {
-			return r.recoverProviderAttempt(ctx, record)
-		}
+	case recoveryProviderFresh, recoveryProviderAttention:
+		return r.recoverProviderAttempt(ctx, record)
+	case recoveryInspectBatch, recoveryResume, recoveryExecutionAttention, recoveryCancel:
 		resumable, err := r.recoverToolBatch(ctx, record)
 		if err != nil {
 			return err
 		}
 		if resumable {
 			r.start(record.RunID)
-		} else if err := r.markAttention(ctx, record.RunID, record.Generation, "previous owner stopped during execution"); err != nil {
-			return err
+		} else if record.State == RuntimeRunning {
+			return r.markAttention(ctx, record.RunID, record.Generation, "previous owner stopped during execution")
 		}
-	case RuntimeCancelRequested:
-		// Classify interrupted dispatches for inspection, but finish the
-		// acknowledged cancellation instead of making it resumable.
-		if err := r.recordInterruptedAttempt(ctx, record); err != nil {
-			return err
-		}
-		if _, err := r.recoverToolBatch(ctx, record); err != nil {
-			return err
-		}
-	case RuntimeNeedsAttention:
-		if record.AttentionKind == AttentionProvider {
-			// A raised ProviderRecovery bound applies on the next pass.
-			return r.recoverProviderAttempt(ctx, record)
-		}
-		if record.AttentionKind == AttentionChild {
-			// A parent blocked on child attention is still suspended: its
-			// logical deadline applies as for a waiting run, and a later
-			// clean child completion can unblock ordinary continuation
-			// instead of leaving a stale attention.
-			if err := r.maintainSuspended(ctx, record, r.completeRunHooks); err != nil {
-				return err
-			}
-			return r.armSuspended(ctx, record.RunID)
-		}
-		if record.AttentionKind != AttentionExecution || !r.payloadFits(record) {
-			return nil
-		}
-		// Execution attention resumes from its last committed transition
-		// when no provider attempt is open: before the first attempt record,
-		// after a recovered attempt, or at a batch or classification boundary.
-		switch record.LastTransition {
-		case "", transitionProviderAttemptRecovered, "batch_ready", "response_classified", "batch_committed":
-		default:
-			if record.PendingBatchID == "" {
-				return nil
-			}
-		}
-		resumable, err := r.recoverToolBatch(ctx, record)
-		if err != nil {
-			return err
-		}
-		if resumable {
-			r.start(record.RunID)
-		}
-	case RuntimeFinalizing:
-		if len(record.HookDelivery) == 0 {
-			// No hook was invoked for this committed result, so finishing
-			// it cannot repeat a delivery; the terminal commit wakes a
-			// parent or advances a conversation as usual.
-			return r.completeRunHooks(record.RunID)
-		}
+	case recoveryFinishHooks:
+		// No hook was invoked for this committed result, so finishing
+		// it cannot repeat a delivery.
+		return r.completeRunHooks(record.RunID)
+	case recoveryHookAttention:
 		return r.markAttentionKind(ctx, record.RunID, record.Generation, AttentionHooks, "previous owner stopped while delivering committed-run hooks; delivery outcome is unknown")
 	}
 	return nil
@@ -195,13 +148,6 @@ func (r *Runtime) recordInterruptedAttempt(ctx context.Context, scanned storedRu
 	})
 }
 
-// providerAttemptMayBeInFlight reports whether the last committed transition
-// is an attempt record without an outcome: the provider may have received the
-// request.
-func providerAttemptMayBeInFlight(record storedRuntimeRun) bool {
-	return record.PendingBatchID == "" && record.LastTransition == transitionProviderAttemptStarted
-}
-
 // recoverProviderAttempt resolves a run whose provider attempt was
 // interrupted. Within the ProviderRecovery bound it starts a fresh attempt,
 // recorded as such; otherwise the run needs attention. The scanned generation
@@ -217,17 +163,16 @@ func (r *Runtime) recoverProviderAttempt(ctx context.Context, scanned storedRunt
 		if record.Generation != scanned.Generation {
 			return nil
 		}
-		if record.FreshAttempts < r.providers.MaxFreshAttempts {
+		switch classifyRecovery(record, recoveryFacts{maxFreshAttempts: r.providers.MaxFreshAttempts}) {
+		case recoveryProviderFresh:
 			record.FreshAttempts++
 			record.State = RuntimeReady
 			record.AttentionReason, record.AttentionKind = "", ""
 			record.LastTransition = transitionProviderAttemptRecovered
 			ready = true
-		} else if record.State == RuntimeRunning {
-			record.State = RuntimeNeedsAttention
-			record.AttentionKind = AttentionProvider
-			record.AttentionReason = "previous owner stopped during execution: a provider attempt may have been sent and its outcome and usage are unknown"
-		} else {
+		case recoveryProviderAttention:
+			setRunAttention(&record, AttentionProvider, "previous owner stopped during execution: a provider attempt may have been sent and its outcome and usage are unknown")
+		default:
 			return nil
 		}
 		record.Generation++
@@ -254,14 +199,15 @@ func (r *Runtime) recoverProviderAttempt(ctx context.Context, scanned storedRunt
 
 func (r *Runtime) recoverToolBatch(ctx context.Context, record storedRuntimeRun) (bool, error) {
 	if record.PendingBatchID == "" {
-		if record.State == RuntimeCancelRequested {
+		if classifyRecovery(record, recoveryFacts{}) == recoveryCancel {
 			full, err := r.load(ctx, record.RunID)
 			if err != nil {
 				return false, err
 			}
 			return false, r.completeExecution(record.RunID, full.Result, context.Canceled, nil)
 		}
-		if record.LastTransition == "provider_accepted" {
+		facts := recoveryFacts{payloadFits: r.payloadFits(record)}
+		if record.State == RuntimeRunning && record.LastTransition == transitionProviderAccepted {
 			full, err := r.load(ctx, record.RunID)
 			if err != nil {
 				return false, err
@@ -269,13 +215,10 @@ func (r *Runtime) recoverToolBatch(ctx context.Context, record storedRuntimeRun)
 			messages := full.Result.Messages
 			if len(messages) > 0 {
 				last := messages[len(messages)-1]
-				if last.Role == "assistant" && len(last.ToolUses()) == 0 {
-					return true, r.makeRunReady(ctx, record.RunID, record.Generation)
-				}
+				facts.acceptedFinal = last.Role == "assistant" && len(last.ToolUses()) == 0
 			}
 		}
-		switch record.LastTransition {
-		case "", "batch_ready", "response_classified", "batch_committed", transitionProviderAttemptRecovered:
+		if classifyRecovery(record, facts) == recoveryResume {
 			// No provider attempt is in flight: every attempt commits its record
 			// before sending, and none is open. A run with no transition yet
 			// stopped before its first attempt record.
@@ -315,21 +258,23 @@ func (r *Runtime) recoverToolBatch(ctx context.Context, record storedRuntimeRun)
 				hasUncertain = true
 			}
 		}
-		cancelled = current.State == RuntimeCancelRequested
-		if cancelled {
+		action := classifyRecovery(current, recoveryFacts{payloadFits: r.payloadFits(current), batchInspected: true, batchUncertain: hasUncertain})
+		cancelled = action == recoveryCancel
+		switch action {
+		case recoveryCancel:
 			current.State = RuntimeFinalizing
 			current.Result.Status = RunCancelled
 			current.AttentionReason = ""
 			current.AttentionKind = ""
 			setRuntimeError(&current, context.Canceled)
-		} else if hasUncertain {
-			current.State = RuntimeNeedsAttention
-			current.AttentionReason = ErrToolEffectUncertain.Error()
-			current.AttentionKind = AttentionExecution
-		} else {
+		case recoveryExecutionAttention:
+			setRunAttention(&current, AttentionExecution, ErrToolEffectUncertain.Error())
+		case recoveryResume:
 			current.State = RuntimeReady
 			current.AttentionReason = ""
 			current.AttentionKind = ""
+		default:
+			return nil
 		}
 		current.Generation++
 		committed = current
@@ -341,5 +286,5 @@ func (r *Runtime) recoverToolBatch(ctx context.Context, record storedRuntimeRun)
 	if err == nil && hasUncertain {
 		err = r.notifyParentOfAttention(ctx, committed)
 	}
-	return !hasUncertain && !cancelled, err
+	return committed.RunID != "" && committed.State == RuntimeReady, err
 }
