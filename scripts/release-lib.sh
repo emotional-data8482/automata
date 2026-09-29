@@ -111,7 +111,7 @@ release_notes() {
 # Used only after the workflow's read-only validation and environment approval.
 # Tests call this definition with mocked git/gh; they never run release.sh.
 publish_release() (
-  local path="$1" version="$2" commit="$3" repo plan tag refs status remote_sha notes protected
+  local path="$1" version="$2" commit="$3" repo plan tag refs status remote_sha notes protected root_latest latest=false
   [ "${GITHUB_ACTIONS:-}" = true ] && [ "${AUTOMATA_RELEASE_APPROVED:-}" = true ] ||
     { fail "publication is only allowed in the approved GitHub Actions job"; return 1; }
   [ "${GITHUB_REF:-}" = "refs/heads/${RELEASE_DEFAULT_BRANCH:-main}" ] ||
@@ -145,8 +145,16 @@ publish_release() (
   if gh release view "$tag" --repo "$repo" >/dev/null 2>&1; then
     printf '==> GitHub Release %s already exists\n' "$tag"
   else
+    # Only the newest root release owns the repository-wide Latest label.
+    # Completing an older partial release must not displace a newer root tag.
+    if [ "$path" = . ]; then
+      root_latest="$(latest_tag .)" || return 1
+      if [ "$root_latest" = "$tag" ] || [ "$root_latest" = "$(jq -r .previous_tag <<<"$plan")" ]; then
+        latest=true
+      fi
+    fi
     gh release create "$tag" --repo "$repo" --verify-tag --target "$commit" \
-      --title "$tag" --notes-file "$notes" --latest=false || return 1
+      --title "$tag" --notes-file "$notes" --latest="$latest" || return 1
   fi
   printf '==> published %s at %s; consumer verification follows in the workflow\n' "$tag" "$commit"
 )

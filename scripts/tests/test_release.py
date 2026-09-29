@@ -307,6 +307,19 @@ class ReleaseToolsTest(unittest.TestCase):
         self.assertIn(f"go get {BASE}/tools@v0.5.3", create[0]["notes"])
         self.assertEqual(before, {p: p.read_bytes() for p in self.root.rglob("*") if p.is_file()})
 
+    def test_latest_label_is_reserved_for_root_releases(self):
+        self.assert_success(self.definition("publish_release", ".", "v0.5.3", SHA))
+        create = next(e for e in self.commands("gh") if e["args"][:2] == ["release", "create"])
+        self.assertIn("--latest=true", create["args"])
+
+    def test_older_root_partial_release_does_not_become_latest(self):
+        self.state["tags"].update({"v0.5.3": SHA, "v0.5.4": OLDER})
+        self.state["remote_sha"] = SHA
+        self.save()
+        self.assert_success(self.definition("publish_release", ".", "v0.5.3", SHA))
+        create = next(e for e in self.commands("gh") if e["args"][:2] == ["release", "create"])
+        self.assertIn("--latest=false", create["args"])
+
     def test_partial_publication_can_be_completed_without_repushing(self):
         self.state["create_error"] = True
         self.save()

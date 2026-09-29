@@ -90,8 +90,9 @@ configured. Dependency and checksum files must already be final.
 
 Review the candidate SHA/tag in the workflow summary and approve the **release**
 environment. The publication job pushes only the selected tag, without force,
-and creates module-filtered GitHub release notes. Module releases are not marked
-as the repository-wide "latest": that label is ambiguous in a multi-module repo.
+and creates module-filtered GitHub release notes. New root releases are marked
+as the repository-wide **Latest**; `tools` and extension releases are not.
+Completing an older partial root release does not displace a newer root version.
 
 **The tag publishes the Go module.** GitHub Release creation is accompanying
 metadata, not a way to keep a tagged version private. The consumer job therefore
