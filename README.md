@@ -44,27 +44,26 @@ so importing `core` never pulls a vendor SDK into your build.
 
 ### Releases
 
-The root module, `tools`, and every extension are tagged independently
-(Go multi-module tagging: `v0.5.0`, `tools/v0.5.0`, `extensions/openrouter/v0.5.0`,
-…). One command does the whole dance:
+The root module, `tools`, and every extension release independently, with tags
+such as `v0.5.3`, `tools/v0.5.3`, and `extensions/openai/v0.5.3`. Internal
+requirements retain their minimum compatible versions: installing the latest
+adapter does not necessarily install the latest core.
 
-```sh
-scripts/release.sh minor --push # or: an explicit version / patch / major
-```
+Use the **Release module** GitHub Actions workflow to select one module, an exact
+version, and optionally a commit on `main`. It validates the exact commit against
+both the workspace and published dependencies, waits for approval in the protected
+`release` environment, then creates only that module's immutable tag and GitHub
+Release. A fresh external consumer verifies installation after publication.
+There are no automatic dependency bumps, release commits, or checksum follow-ups.
 
-It bumps every submodule's `automata` require line, builds and tests the full
-workspace, commits, tags root + all published modules, and pushes. Because
-`go mod tidy` in a submodule can only resolve the new core version after its
-tag is on the remote, the script then refreshes the submodules' `go.sum` files
-in a small follow-up commit and verifies each module still builds against the
-published pins (`GOWORK=off`). Run it without `--push` to stop after tagging
-for review. Published modules must require real tagged versions and carry
-no `replace` directives when tagged: a dependency's `replace` is ignored
-downstream. In-repo development uses `go.work`; a published module may
-carry a temporary local core replacement while depending on unreleased core,
-but the release script drops it before tagging. The script also bumps Tavily's
-`tools` dependency to the new tag. `examples/*` keep `replace` directives
-as dev conveniences and are never tagged.
+Dependency changes and finalized `go.mod`/`go.sum` files belong in ordinary PRs.
+Release dependencies first when an adapter needs a new core or tools API.
+Published modules must contain no replacements or exclusions; the release gate
+rejects them rather than editing them. `examples/*` retain development
+replacements and are never tagged.
+
+See [release setup, validation, and recovery](scripts/README.md). Local publication
+through the old `scripts/release.sh ... --push` interface is disabled.
 
 ## Quickstart
 

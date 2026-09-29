@@ -1,0 +1,18 @@
+{
+  "module": "github.com/emotional-data8482/automata",
+  "modules": [
+    {"path": ".", "kind": "published", "race": true, "smoke": "core"},
+    {"path": "tools", "kind": "published", "race": false, "smoke": "."},
+    {"path": "extensions/claude", "kind": "published", "race": false, "smoke": "."},
+    {"path": "extensions/mcp", "kind": "published", "race": true, "smoke": "mcpclient"},
+    {"path": "extensions/openai", "kind": "published", "race": false, "smoke": "."},
+    {"path": "extensions/openrouter", "kind": "published", "race": false, "smoke": "."},
+    {"path": "extensions/tavily", "kind": "published", "race": false, "smoke": "."},
+    {"path": "extensions/sqlite", "kind": "published", "race": true, "smoke": "."},
+    {"path": "examples/claude", "kind": "example", "race": false, "smoke": "."},
+    {"path": "examples/openai", "kind": "example", "race": false, "smoke": "."},
+    {"path": "examples/deep_research", "kind": "example", "race": false, "smoke": "."},
+    {"path": "examples/durable_typed", "kind": "example", "race": false, "smoke": "."},
+    {"path": "examples/durable_host", "kind": "example", "race": false, "smoke": "."}
+  ]
+}

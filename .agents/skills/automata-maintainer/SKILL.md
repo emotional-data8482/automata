@@ -79,7 +79,7 @@ override the generic ladder below. Then:
 
 1. Discover affected modules from `go.mod` files and `go.work`; classify each
    as published (`core`, `tools`, `extensions/*` — tagged independently;
-   release automation removes any temporary local Automata `replace`), example
+   release validation rejects replacements and exclusions), example
    (`examples/*` — `replace` directives, never tagged), or private fixture
    (`internal/durabletest`, local-only and absent from `go.work`).
 2. Run the narrowest useful checks first: targeted package tests, then

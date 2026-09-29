@@ -1,0 +1,156 @@
+name: Release module
+
+on:
+  workflow_dispatch:
+    inputs:
+      module:
+        description: 'Module path from scripts/modules.json (root: .)'
+        required: true
+        type: string
+      version:
+        description: Exact stable version, e.g. v0.5.3
+        required: true
+        type: string
+      commit:
+        description: 'Full main commit SHA (empty: dispatch commit)'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+# Do not interrupt publication if another release is requested.
+concurrency:
+  group: automata-publication
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    if: >-
+      github.ref == format('refs/heads/{0}',
+      github.event.repository.default_branch)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    outputs:
+      module: ${{ steps.plan.outputs.module }}
+      version: ${{ steps.plan.outputs.version }}
+      tag: ${{ steps.plan.outputs.tag }}
+      commit: ${{ steps.target.outputs.commit }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - id: target
+        name: Freeze and check the requested commit
+        env:
+          REQUESTED_COMMIT: ${{ inputs.commit }}
+          DISPATCH_COMMIT: ${{ github.sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          commit="${REQUESTED_COMMIT:-$DISPATCH_COMMIT}"
+          [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || {
+            echo 'Use a full lowercase commit SHA.' >&2
+            exit 1
+          }
+          git cat-file -e "$commit^{commit}"
+          git merge-base --is-ancestor "$commit" "origin/$DEFAULT_BRANCH"
+          git checkout --detach "$commit"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00 # v6.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            **/go.sum
+            go.work.sum
+      - id: plan
+        name: Resolve the module release
+        env:
+          MODULE: ${{ inputs.module }}
+          VERSION: ${{ inputs.version }}
+          COMMIT: ${{ steps.target.outputs.commit }}
+          RELEASE_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          scripts/check-modules.sh inventory
+          plan=$(scripts/check-modules.sh plan "$MODULE" "$VERSION" "$COMMIT")
+          echo "$plan"
+          for key in module version tag; do
+            value=$(jq -r --arg key "$key" '.[$key]' <<< "$plan")
+            echo "$key=$value" >> "$GITHUB_OUTPUT"
+          done
+          {
+            printf '## Release candidate\n\n'
+            printf -- '- Module: `%s`\n' "$MODULE"
+            printf -- '- Tag: `%s`\n' "$(jq -r .tag <<< "$plan")"
+            printf -- '- Tested commit: `%s`\n' "$COMMIT"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Check formatting and release tooling
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          scripts/check-modules.sh format
+          for script in scripts/*.sh; do bash -n "$script"; done
+          python3 -m unittest discover -s scripts/tests -v
+          git diff --check
+      - name: Validate workspace integration and examples
+        run: scripts/check-modules.sh workspace
+      - name: Validate the candidate against published dependencies
+        env:
+          MODULE: ${{ steps.plan.outputs.module }}
+        run: scripts/check-modules.sh release "$MODULE"
+
+  publish:
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: release
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+          fetch-depth: 0
+          # Only this approved job needs credentials for a tag push.
+          persist-credentials: true
+      - uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00 # v6.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Publish the tested commit without editing source
+        env:
+          MODULE: ${{ needs.validate.outputs.module }}
+          VERSION: ${{ needs.validate.outputs.version }}
+          COMMIT: ${{ needs.validate.outputs.commit }}
+          RELEASE_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          AUTOMATA_RELEASE_APPROVED: "true"
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/release.sh "$MODULE" "$VERSION" "$COMMIT"
+
+  consumer:
+    needs: [validate, publish]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+          persist-credentials: false
+      - uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00 # v6.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Install through the public proxy into a fresh consumer
+        env:
+          MODULE: ${{ needs.validate.outputs.module }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: scripts/check-modules.sh consumer "$MODULE" "$VERSION"
+      - name: Record the verified release
+        env:
+          TAG: ${{ needs.validate.outputs.tag }}
+          COMMIT: ${{ needs.validate.outputs.commit }}
+        run: |
+          printf 'Verified `%s` at `%s`.\n' "$TAG" "$COMMIT" \
+            >> "$GITHUB_STEP_SUMMARY"

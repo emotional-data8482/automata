@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tooling:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      matrix: ${{ steps.modules.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00 # v6.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            **/go.sum
+            go.work.sum
+      - name: Check module inventory and formatting
+        run: |
+          scripts/check-modules.sh inventory
+          scripts/check-modules.sh format
+          for script in scripts/*.sh; do bash -n "$script"; done
+          git diff --check
+      - name: Test release tooling without publishing
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python3 -m unittest discover -s scripts/tests -v
+      - id: modules
+        name: Build module matrix
+        run: |
+          echo "matrix=$(scripts/check-modules.sh matrix)" >> "$GITHUB_OUTPUT"
+
+  workspace:
+    needs: tooling
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.tooling.outputs.matrix) }}
+    name: Workspace (${{ matrix.path }})
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00 # v6.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            **/go.sum
+            go.work.sum
+      - name: Test library or build example
+        env:
+          MODULE: ${{ matrix.path }}
+        run: scripts/check-modules.sh workspace "$MODULE"
+      - name: Race tests
+        if: matrix.race
+        env:
+          MODULE: ${{ matrix.path }}
+        run: scripts/check-modules.sh race "$MODULE"
+
+  result:
+    name: CI result
+    if: always()
+    needs: [tooling, workspace]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every check to succeed
+        env:
+          TOOLING_RESULT: ${{ needs.tooling.result }}
+          WORKSPACE_RESULT: ${{ needs.workspace.result }}
+        run: |
+          [[ "$TOOLING_RESULT" == success && "$WORKSPACE_RESULT" == success ]]

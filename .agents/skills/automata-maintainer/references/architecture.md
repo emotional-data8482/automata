@@ -60,12 +60,13 @@ ladder. Then discover, classify, and test.
 
 | Class | Members | Properties |
 | --- | --- | --- |
-| Published | root (`core`), `tools`, `extensions/claude`, `extensions/openai`, `extensions/tavily`, `extensions/sqlite` | tagged independently; release automation removes any temporary local Automata `replace` before tagging |
+| Published | root (`core`), `tools`, and extensions listed in `scripts/modules.json` | tagged independently; release validation rejects replacements and exclusions |
 | Example | `examples/*` | `replace` directives as dev conveniences, never tagged, never released |
 | Private fixture | `internal/durabletest` | local-only test fixture, gitignored and absent from `go.work`, never published |
 
-Discover manifests directly, then use `go.work` and `scripts/release.sh` to
-classify workspace and release membership; do not infer either from memory.
+Discover manifests directly, then use `go.work` and `scripts/modules.json` to
+classify workspace and release membership; see `scripts/README.md` for the
+CI-only publication workflow. Do not infer membership from memory.
 
 ### Checks, narrowest first
 
@@ -82,9 +83,9 @@ go build ./...                     # affected example modules, without credentia
 - A workspace (`go.work`) pass and a `GOWORK=off` pass are separate claims;
   report them separately. `GOWORK=off` still resolves against the versions
   currently pinned in each module's `go.mod` — it does not by itself prove
-  compatibility with previously tagged published releases. Verifying that
-  requires the module's require lines to point at real tags (e.g. after a
-  release refresh), which is release work and stays out of ordinary changes.
+  compatibility with every previously tagged release. Release readiness requires
+  finalized requirements on published dependency versions and no replacements;
+  update those files in ordinary PRs before tagging.
 - Run race tests for changes to the runtime, streams, tool batches, children,
   accumulators, hooks, or other concurrent state.
 - Live provider calls are opt-in integration checks; never require them for
