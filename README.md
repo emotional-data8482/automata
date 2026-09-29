@@ -507,11 +507,25 @@ host's JSON answer the tool result.
 ## Observing runs
 
 `Runtime.RunStream` and `RunHandle.Observe` deliver provisional live events:
-text and thinking deltas, tool calls, tool results, and usage. Child-run
-events are included, tagged with `StreamEvent.Agent` (the child tool's name)
-and `InvocationID` (the call that started it). `core.StreamAccumulator` folds
-them into per-agent views for rendering. Live views are bounded and drop
-events rather than slow the run.
+text and thinking deltas, tool calls, tool progress, tool results, and usage.
+Child-run events are included, tagged with `StreamEvent.Agent` (the child
+tool's name) and `InvocationID` (the call that started it).
+`core.StreamAccumulator` folds them into per-agent views for rendering. Live
+views are bounded and drop events rather than slow the run.
+
+A long-running tool can report progress from inside `Execute`:
+
+```go
+// Fragment
+for i, file := range files {
+	core.ReportToolProgress(ctx, core.ToolProgress{Progress: float64(i), Total: float64(len(files)), Message: file})
+	// … index file …
+}
+```
+
+Each report arrives as a `StreamToolProgress` event before the call's result.
+Progress is never persisted, and a report made after `Execute` returns is
+dropped.
 
 Committed events are the durable record. Read them in pages from a cursor:
 

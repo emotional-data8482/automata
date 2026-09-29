@@ -304,7 +304,12 @@ func (l *loop) executeTool(
 	if err := dispatch(); err != nil {
 		return ToolResult{}, fmt.Errorf("persist tool dispatch: %w", err)
 	}
-	result, executeErr := tool.executor.Execute(execCtx, append(json.RawMessage(nil), call.Input...))
+	progress := &toolProgressReporter{emit: l.emit, call: ToolUseBlock{ID: call.ID, Name: call.Name}}
+	result, executeErr := func() (ToolResult, error) {
+		defer progress.close()
+		progressCtx := context.WithValue(execCtx, toolProgressKey{}, progress)
+		return tool.executor.Execute(progressCtx, append(json.RawMessage(nil), call.Input...))
+	}()
 	result = normalizeResult(result)
 	result.Blocks = cloneBlocks(result.Blocks)
 	if executeErr == nil {

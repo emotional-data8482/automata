@@ -68,5 +68,9 @@ func cloneStreamEvent(e StreamEvent) StreamEvent {
 		v := *e.Usage
 		e.Usage = &v
 	}
+	if e.Progress != nil {
+		v := *e.Progress
+		e.Progress = &v
+	}
 	return e
 }

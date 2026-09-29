@@ -3,7 +3,8 @@ package core
 import "sync"
 
 // ToolCallView is the accumulator's record of one tool call: the call as the
-// model requested it, and — once the StreamToolResult arrives — its outcome.
+// model requested it, its latest progress report while it runs, and — once
+// the StreamToolResult arrives — its outcome.
 // Result is the text-only view fed back to the model (compatibility field);
 // ResultBlocks carries the rich result blocks behind it (see [ToolResult]) and
 // is empty only if the consumer attached before any result event.
@@ -14,6 +15,9 @@ type ToolCallView struct {
 	IsError      bool   // true if the tool failed
 	Err          error  // non-nil if the tool returned an error
 	Done         bool   // true once the result has arrived
+	// Progress is the latest [StreamToolProgress] report, or nil if the tool
+	// has reported none. Later reports replace it; snapshots keep their own.
+	Progress *ToolProgress
 }
 
 // AgentView is a per-invocation snapshot of an in-progress (or finished)
@@ -88,8 +92,8 @@ type StreamAccumulator struct {
 // Add folds one stream event into the accumulator. Events are grouped by
 // (StreamEvent.Agent, StreamEvent.InvocationID); per lane, text and thinking
 // deltas concatenate in arrival order, tool results are paired to their calls
-// by ToolUseBlock.ID, and StreamUsage events are summed (per lane and into
-// Totals).
+// by ToolUseBlock.ID, each call keeps its latest StreamToolProgress report,
+// and StreamUsage events are summed (per lane and into Totals).
 func (a *StreamAccumulator) Add(ev StreamEvent) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -103,28 +107,51 @@ func (a *StreamAccumulator) Add(ev StreamEvent) {
 	case StreamToolCall:
 		st.toolCalls = append(st.toolCalls, ToolCallView{Call: ev.ToolCall})
 	case StreamToolResult:
-		// Pair with the announced call. Search backwards so the most recent
-		// matching pending call wins if IDs ever repeat.
-		for i := len(st.toolCalls) - 1; i >= 0; i-- {
-			tc := &st.toolCalls[i]
-			if !tc.Done && tc.Call.ID == ev.ToolCall.ID {
-				tc.Result = ev.Result
-				tc.ResultBlocks = ev.ResultBlocks
-				tc.IsError = ev.IsError
-				tc.Err = ev.Err
-				tc.Done = true
-				return
+		// Pair with the announced call.
+		if tc := st.pendingCall(ev.ToolCall.ID); tc != nil {
+			if len(tc.Call.Input) == 0 {
+				// Announced only by progress, which omits Input.
+				tc.Call = ev.ToolCall
 			}
+			tc.Result = ev.Result
+			tc.ResultBlocks = ev.ResultBlocks
+			tc.IsError = ev.IsError
+			tc.Err = ev.Err
+			tc.Done = true
+			return
 		}
 		// No announced call (e.g. the consumer attached mid-run): record the
 		// result as an already-done call rather than dropping it.
 		st.toolCalls = append(st.toolCalls, ToolCallView{
 			Call: ev.ToolCall, Result: ev.Result, ResultBlocks: ev.ResultBlocks, IsError: ev.IsError, Err: ev.Err, Done: true,
 		})
+	case StreamToolProgress:
+		if ev.Progress == nil {
+			return
+		}
+		progress := *ev.Progress
+		if tc := st.pendingCall(ev.ToolCall.ID); tc != nil {
+			tc.Progress = &progress
+			return
+		}
+		// No announced call (the consumer attached mid-call): record it as
+		// pending so its result still pairs with it.
+		st.toolCalls = append(st.toolCalls, ToolCallView{Call: ev.ToolCall, Progress: &progress})
 	case StreamUsage:
 		st.usage.Add(ev.Usage)
 		a.totals.Add(ev.Usage)
 	}
+}
+
+// pendingCall returns the most recent unfinished call with id, searching
+// backwards so the latest matching call wins if IDs ever repeat.
+func (st *agentState) pendingCall(id string) *ToolCallView {
+	for i := len(st.toolCalls) - 1; i >= 0; i-- {
+		if tc := &st.toolCalls[i]; !tc.Done && tc.Call.ID == id {
+			return tc
+		}
+	}
+	return nil
 }
 
 // agent returns the state record for the (name, invocationID) lane, creating it

@@ -88,6 +88,7 @@ renderFinal(result, acc.Views(), acc.Totals())
 | `core.StreamText` / `StreamThinking` | `Text` delta |
 | `core.StreamUsage` | per-turn `Usage` |
 | `core.StreamToolCall` | assembled `ToolCall` before execution |
+| `core.StreamToolProgress` | `ToolCall` (ID and Name), `Progress` from `core.ReportToolProgress` |
 | `core.StreamToolResult` | `ToolCall`, `Result`, `ResultBlocks`, `IsError`, `Err` |
 
 Child-run events carry `Agent` (the child tool name) and `InvocationID` (the call that started the child); nested children keep the innermost tags. `StreamAccumulator.Views()` lists the observed run first, then child invocations in first-seen order. Live views are bounded and provisional: they drop events rather than slow the run. For reliable delivery (webhooks, queues, another process), read committed events:

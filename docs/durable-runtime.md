@@ -81,7 +81,9 @@ A run has two kinds of observation:
 
 - **Provisional deltas.** `RunHandle.Observe` and the `RunStream` callback
   deliver live `StreamEvent`s from the worker (text and thinking deltas, tool
-  calls, tool results, usage). A child run's events also reach every
+  calls, tool progress, tool results, usage). Tool progress comes from
+  `ReportToolProgress`; a call's reports precede its result, and none are
+  persisted. A child run's events also reach every
   ancestor's views, tagged with `StreamEvent.Agent` (the child tool name) and
   `InvocationID` (the parent's tool call ID); a nested child keeps the
   innermost tags. Each view has a bounded queue; a slow view misses deltas and

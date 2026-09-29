@@ -372,13 +372,19 @@ const (
 	// holds the assembled per-turn counts; it fires once per turn, after that
 	// turn's text deltas and before its tool calls.
 	StreamUsage
+	// StreamToolProgress reports progress an executing tool published with
+	// [ReportToolProgress]. ToolCall identifies the call by ID and Name (Input
+	// is omitted); Progress holds the report. A call's progress events precede
+	// its StreamToolResult.
+	StreamToolProgress
 )
 
 // StreamEvent is a provisional, run-level observation delivered to a live
 // view ([Runtime.RunStream] or [RunHandle.Observe]): a content or thinking
-// delta, a requested tool call, a tool result, or usage. Unlike StreamChunk
-// (the provider-facing wire fragment) it is fully assembled. Views are
-// bounded and may drop events; committed facts are in [RunHandle.Events].
+// delta, a requested tool call, tool progress, a tool result, or usage.
+// Unlike StreamChunk (the provider-facing wire fragment) it is fully
+// assembled. Views are bounded and may drop events; committed facts are in
+// [RunHandle.Events].
 type StreamEvent struct {
 	Kind StreamEventKind
 	// Agent names the child run the event originated from: the name of the
@@ -393,7 +399,7 @@ type StreamEvent struct {
 	// value for nested children.
 	InvocationID string
 	Text         string       // StreamText / StreamThinking: the content delta
-	ToolCall     ToolUseBlock // StreamToolCall / StreamToolResult: the call
+	ToolCall     ToolUseBlock // StreamToolCall / StreamToolProgress / StreamToolResult: the call
 	Result       string       // StreamToolResult: the string returned to the model
 	// ResultBlocks holds the rich result blocks behind Result for a
 	// StreamToolResult. For string tools it is a single
@@ -404,4 +410,6 @@ type StreamEvent struct {
 	IsError      bool   // StreamToolResult: true if the tool failed
 	Usage        *Usage // StreamUsage: the completed turn's token usage
 	Err          error  // StreamToolResult: execution/policy error, when present
+	// Progress is the tool's report for a StreamToolProgress event.
+	Progress *ToolProgress
 }
