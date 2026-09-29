@@ -40,6 +40,27 @@ tool, example, and downstream application.
 - For concurrency changes, assert transcript completeness and ordering, then run
   `go test -race ./core` from the repository root.
 
+## Layout
+
+`Runtime` is split by role; put new code in the file that owns its role.
+
+- `runtime.go`: construction, configuration, definition registration, `Close`.
+- `runtime_submit.go`: admission, submit options, `Run`, and `RunStream`.
+- `runtime_execute.go`: claiming and executing runs, finalization, and
+  failure and attention transitions.
+- `runtime_recover.go`: every `Recover` decision.
+- `runtime_hooks.go`: committed-run hook delivery and acknowledgement.
+- `runtime_handle.go`: `RunHandle` host controls.
+- `runtime_live.go`: provisional live-stream fan-out.
+- `runtime_observe.go`: commit capture, committed events, and cursors.
+- `runtime_record.go`: the stored run record, buckets, transition markers, and
+  transcript chunks.
+- `runtime_snapshot.go`: `RunSnapshot` and its value types.
+- `runtime_{tools,children,waits,conversations,retention,driver}.go`: durable
+  tool batches, child runs, waits, conversations, retention, and the background
+  driver.
+- `loop.go` and `loopmachine.go`: the per-run turn engine the runtime drives.
+
 Use `core_explorer` to trace a lifecycle path and `core_expert` to review any
 change involving `runtime*.go`, `loop.go`, `loopmachine.go`, `stream.go`, or
 `typed.go`.

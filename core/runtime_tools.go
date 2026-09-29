@@ -121,9 +121,11 @@ type reconcileReceipt struct {
 }
 
 func batchStorageKey(runID, batchID string) string { return runID + "/" + batchID }
+
 func invocationStorageKey(runID, batchID string, ordinal int) string {
 	return fmt.Sprintf("%s/%s/%016x", runID, batchID, ordinal)
 }
+
 func reconcileReceiptKey(runID, operationID string) string {
 	return "reconcile\x00" + runID + "\x00" + operationID
 }
@@ -963,98 +965,6 @@ func resolveReservedInvocations(tx StoreTransaction, record storedRuntimeRun) er
 		}
 	}
 	return nil
-}
-
-func (r *Runtime) recoverToolBatch(ctx context.Context, record storedRuntimeRun) (bool, error) {
-	if record.PendingBatchID == "" {
-		if record.State == RuntimeCancelRequested {
-			full, err := r.load(ctx, record.RunID)
-			if err != nil {
-				return false, err
-			}
-			return false, r.completeExecution(record.RunID, full.Result, context.Canceled, nil)
-		}
-		if record.LastTransition == "provider_accepted" {
-			full, err := r.load(ctx, record.RunID)
-			if err != nil {
-				return false, err
-			}
-			messages := full.Result.Messages
-			if len(messages) > 0 {
-				last := messages[len(messages)-1]
-				if last.Role == "assistant" && len(last.ToolUses()) == 0 {
-					return true, r.makeRunReady(ctx, record.RunID, record.Generation)
-				}
-			}
-		}
-		switch record.LastTransition {
-		case "", "batch_ready", "response_classified", "batch_committed", transitionProviderAttemptRecovered:
-			// No provider attempt is in flight: every attempt commits its record
-			// before sending, and none is open. A run with no transition yet
-			// stopped before its first attempt record.
-			return true, r.makeRunReady(ctx, record.RunID, record.Generation)
-		}
-		return false, nil
-	}
-	var hasUncertain, cancelled bool
-	var committed storedRuntimeRun
-	err := r.transaction(ctx, true, func(tx StoreTransaction) error {
-		hasUncertain = false
-		current, err := getRuntimeRun(tx, record.RunID)
-		if err != nil {
-			return err
-		}
-		if current.Generation != record.Generation {
-			return nil
-		}
-		if current.State == RuntimeCancelRequested {
-			if err := resolveReservedInvocations(tx, current); err != nil {
-				return err
-			}
-		}
-		invocations, err := loadStoredInvocations(tx, record.RunID, record.PendingBatchID)
-		if err != nil {
-			return err
-		}
-		for i := range invocations {
-			if invocations[i].State == ToolInvocationDispatched {
-				invocations[i].State = ToolInvocationUncertain
-				invocations[i].Effect = EffectReport{Status: EffectUnknown}
-				if err := putStoredJSON(tx, runtimeInvocationsBucket, invocationStorageKey(record.RunID, record.PendingBatchID, invocations[i].Ordinal), invocations[i]); err != nil {
-					return err
-				}
-			}
-			if invocations[i].State == ToolInvocationUncertain {
-				hasUncertain = true
-			}
-		}
-		cancelled = current.State == RuntimeCancelRequested
-		if cancelled {
-			current.State = RuntimeFinalizing
-			current.Result.Status = RunCancelled
-			current.AttentionReason = ""
-			current.AttentionKind = ""
-			setRuntimeError(&current, context.Canceled)
-		} else if hasUncertain {
-			current.State = RuntimeNeedsAttention
-			current.AttentionReason = ErrToolEffectUncertain.Error()
-			current.AttentionKind = AttentionExecution
-		} else {
-			current.State = RuntimeReady
-			current.AttentionReason = ""
-			current.AttentionKind = ""
-		}
-		current.Generation++
-		committed = current
-		return putRuntimeRun(tx, current)
-	})
-	if err == nil && cancelled {
-		return false, r.completeRunHooks(record.RunID)
-	}
-	if err == nil && hasUncertain {
-		err = r.notifyParentOfAttention(ctx, committed)
-	}
-	return !hasUncertain && !cancelled, err
 }
 
 func (r *Runtime) makeRunReady(ctx context.Context, runID string, generation uint64) error {
