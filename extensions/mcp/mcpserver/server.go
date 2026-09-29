@@ -15,6 +15,10 @@
 // only tools that are safe to call that way, and authenticate the transport
 // (for example, in the HTTP handler in front of the streamable handler).
 //
+// Progress: when the client supplies a progress token, each
+// [core.ReportToolProgress] the tool makes is sent as a progress notification
+// for that request. Notifications stop when the tool returns.
+//
 // Results: an [core.ErrorResult] becomes isError content. A Go error becomes
 // a JSON-RPC internal error, and cancellation is returned unchanged. Text and
 // inline images map to MCP content, and URL images become resource links.
@@ -109,7 +113,18 @@ func handler(tool core.Tool, schema *jsonschema.Resolved) mcp.ToolHandler {
 		if err := schema.Validate(instance); err != nil {
 			return errorResult("invalid arguments: " + err.Error()), nil
 		}
-		result, err := tool.Execute(ctx, args)
+		execCtx := ctx
+		if token := req.Params.GetProgressToken(); token != nil {
+			var stop func()
+			execCtx, stop = core.WithToolProgress(ctx, func(progress core.ToolProgress) {
+				_ = req.Session.NotifyProgress(ctx, &mcp.ProgressNotificationParams{
+					ProgressToken: token, Progress: progress.Progress, Total: progress.Total, Message: progress.Message,
+				})
+			})
+			// Stopping before return keeps notifications ahead of the response.
+			defer stop()
+		}
+		result, err := tool.Execute(execCtx, args)
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil, ctx.Err()

@@ -254,3 +254,56 @@ func TestCallToolCancellation(t *testing.T) {
 		t.Fatal("tool context was not cancelled")
 	}
 }
+
+func TestCallToolForwardsProgress(t *testing.T) {
+	steps := []core.ToolProgress{{Progress: 1, Total: 2, Message: "half"}, {Progress: 2, Total: 2}}
+	work := stub("work", `{"type":"object"}`, func(ctx context.Context, _ json.RawMessage) (core.ToolResult, error) {
+		for _, step := range steps {
+			core.ReportToolProgress(ctx, step)
+		}
+		return core.TextResult("done"), nil
+	})
+	server := newServer()
+	if err := mcpserver.AddTools(server, work); err != nil {
+		t.Fatal(err)
+	}
+	notifications := make(chan *mcp.ProgressNotificationParams, 8)
+	ctx := context.Background()
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	serverSession, err := server.Connect(ctx, serverTransport, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serverSession.Close()
+	session, err := mcp.NewClient(&mcp.Implementation{Name: "client", Version: "v1"}, &mcp.ClientOptions{
+		ProgressNotificationHandler: func(_ context.Context, req *mcp.ProgressNotificationClientRequest) {
+			notifications <- req.Params
+		},
+	}).Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+
+	// Without a token the tool's reports go nowhere.
+	if _, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "work"}); err != nil {
+		t.Fatal(err)
+	}
+	params := &mcp.CallToolParams{Name: "work"}
+	params.SetProgressToken("t2")
+	if _, err := session.CallTool(ctx, params); err != nil {
+		t.Fatal(err)
+	}
+	// Notifications are handled in wire order, so the first call's would
+	// arrive before these.
+	for i, step := range steps {
+		select {
+		case got := <-notifications:
+			if got.ProgressToken != "t2" || got.Progress != step.Progress || got.Total != step.Total || got.Message != step.Message {
+				t.Fatalf("notification %d = %+v, want %+v for token t2", i, got, step)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("notification %d did not arrive", i)
+		}
+	}
+}

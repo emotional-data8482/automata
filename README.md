@@ -274,7 +274,8 @@ unclassified and need no approval by default. Wrap them with
 
 `mcpserver.AddTools(server, tools...)` goes the other way and registers core
 tools on an SDK `*mcp.Server`. It validates arguments against each schema
-before `Execute`. Runtime policies (timeouts, budgets, approvals) do not
+before `Execute`, and sends the tool's progress reports to clients that
+request progress. Runtime policies (timeouts, budgets, approvals) do not
 apply to those calls.
 
 ### AGENTS.md instructions

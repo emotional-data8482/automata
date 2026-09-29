@@ -25,6 +25,11 @@ server.
   `Execute`, mirroring Runtime. They bypass Runtime policy (timeouts,
   budgets, approvals, effect guards); keep that documented in the package
   docs.
+- Progress bridges both ways through core: the client reports server
+  notifications with `core.ReportToolProgress` under the call's context, and
+  the server installs `core.WithToolProgress` only when the request carries a
+  progress token, stopping it before the handler returns so no notification
+  follows the response.
 - Unsupported content degrades to a bracketed placeholder line, never
   silently.
 
