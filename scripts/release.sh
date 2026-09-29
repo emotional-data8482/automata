@@ -28,7 +28,6 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 MODULE="github.com/emotional-data8482/automata"
-TOOLS_MODULE="$MODULE/tools"
 # Published modules: bumped, tested, tidied, and tagged on every release. A
 # published module may keep a local automata replace while it depends on
 # unreleased core (so `go mod tidy` and `go get` work in it); the release drops
@@ -36,7 +35,6 @@ TOOLS_MODULE="$MODULE/tools"
 PUBLISHED=(tools extensions/claude extensions/openai extensions/openrouter extensions/tavily extensions/sqlite)
 # Modules that ride along but are neither tagged nor tidied.
 RIDEALONG=(examples/claude examples/openai examples/deep_research examples/durable_typed examples/durable_host)
-TOOLS_CONSUMERS=(extensions/tavily examples/deep_research)
 
 usage() {
   sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
@@ -117,14 +115,16 @@ for m in "${PUBLISHED[@]}" "${RIDEALONG[@]}"; do
     echo "    bumped $m"
   fi
 done
-# Tavily is published against tools, and deep_research uses it directly.
-# Bump those pins together with the tools tag for this release.
-for m in "${TOOLS_CONSUMERS[@]}"; do
-  if grep -qE "$TOOLS_MODULE v[0-9]+\.[0-9]+\.[0-9]+" "$ROOT/$m/go.mod"; then
-    sed -i.bak -E "s|$TOOLS_MODULE v[0-9]+\.[0-9]+\.[0-9]+|$TOOLS_MODULE $NEW|" "$ROOT/$m/go.mod"
-    rm -f "$ROOT/$m/go.mod.bak"
-    echo "    bumped tools in $m"
-  fi
+# Sibling pins move with this release's tags: Tavily is published against
+# tools, and examples require the extensions they demonstrate.
+for m in "${PUBLISHED[@]}" "${RIDEALONG[@]}"; do
+  for p in "${PUBLISHED[@]}"; do
+    if grep -qE "$MODULE/$p v[0-9]+\.[0-9]+\.[0-9]+" "$ROOT/$m/go.mod"; then
+      sed -i.bak -E "s|$MODULE/$p v[0-9]+\.[0-9]+\.[0-9]+|$MODULE/$p $NEW|" "$ROOT/$m/go.mod"
+      rm -f "$ROOT/$m/go.mod.bak"
+      echo "    bumped $p in $m"
+    fi
+  done
 done
 
 # Consumers ignore replace directives in a dependency, and the GOWORK=off
