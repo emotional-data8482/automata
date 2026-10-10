@@ -129,6 +129,7 @@ func consumeStream(ctx context.Context, sp StreamProvider, req Request, onDelta 
 					resp.StopReason = StopIncomplete
 					return resp, ErrIncompleteResponse
 				}
+				defaultEmptyToolInputs(resp.Message.Blocks)
 				return resp, nil
 			}
 
@@ -243,6 +244,20 @@ func buildAssistantMessage(partials []partialBlock, usage *Usage) Message {
 		}
 	}
 	return Message{Role: "assistant", Blocks: blocks, Usage: usage}
+}
+
+// defaultEmptyToolInputs gives a completed stream's argument-less tool calls
+// the {} the non-streaming path receives: a call with no arguments streams no
+// input fragments (Claude sends its empty object only at block start). An
+// interrupted stream keeps empty input, since its arguments may never have
+// arrived.
+func defaultEmptyToolInputs(blocks Blocks) {
+	for i, block := range blocks {
+		if call, ok := block.(ToolUseBlock); ok && strings.TrimSpace(string(call.Input)) == "" {
+			call.Input = json.RawMessage("{}")
+			blocks[i] = call
+		}
+	}
 }
 
 // terminalStreamError marks an error from consumeStream as non-retryable because

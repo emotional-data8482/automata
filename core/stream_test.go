@@ -569,3 +569,35 @@ func TestChildRunNestedTagsAndUsage(t *testing.T) {
 		}
 	}
 }
+
+// A streamed call to a tool with no arguments arrives with no input
+// fragments; it must run like the non-streaming call does (bug review E1/P1).
+func TestStreamToolCallWithoutArgumentsRuns(t *testing.T) {
+	p := &scriptedStreamProvider{turns: [][]StreamChunk{
+		{
+			{Deltas: []BlockDelta{{Index: 0, Type: "tool_use", ID: "now-id", Name: "now"}}},
+			{StopReason: StopToolUse},
+		},
+		{
+			{Deltas: []BlockDelta{{Index: 0, Type: "text", Text: "done"}}},
+			{StopReason: StopEndTurn},
+		},
+	}}
+	var calls int
+	a := newTestAgent(t, p, AgentConfig{Tools: []Tool{Func("now", "current time", func(context.Context, struct{}) (string, error) {
+		calls++
+		return "noon", nil
+	})}})
+	runtime := newTestRuntime(t)
+	ref, err := runtime.Register("agent", "v1", a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := runtime.RunStream(context.Background(), ref, "what time is it", func(StreamEvent) {})
+	if err != nil || result.Output != "done" || calls != 1 {
+		t.Fatalf("result = %+v, err = %v, calls = %d", result, err, calls)
+	}
+	if input := string(result.Messages[1].ToolUses()[0].Input); input != "{}" {
+		t.Fatalf("committed input = %q, want {}", input)
+	}
+}
