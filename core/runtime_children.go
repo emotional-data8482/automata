@@ -145,9 +145,10 @@ func (r *Runtime) admitChildRun(tx StoreTransaction, parent storedRuntimeRun, in
 		// Pin the child definition's own subtree and PerTool caps on the child
 		// record at admission; the child charges its ancestors from their
 		// persisted records, not from any context.
-		ToolBudget: pinnedToolCaps(binding.agent.toolPolicy),
-		Labels:     cloneLabels(parent.Labels),
-		CreatedAt:  now,
+		ToolBudget:     pinnedToolCaps(binding.agent.toolPolicy),
+		Labels:         cloneLabels(parent.Labels),
+		AdmissionScope: parent.AdmissionScope,
+		CreatedAt:      now,
 	}
 	if err := putRuntimeRun(tx, record); err != nil {
 		return receipt, err

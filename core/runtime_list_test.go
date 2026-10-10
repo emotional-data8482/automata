@@ -69,7 +69,7 @@ func TestRuntimeLabelsPersistOutsideAdmissionIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if child.Labels["schedule"] != "nightly" {
+	if child.Labels["schedule"] != "nightly" || child.Scope != "tenant" || child.Key != "" || snapshot.Key != "k1" {
 		t.Fatalf("child labels = %v", child.Labels)
 	}
 }

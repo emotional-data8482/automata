@@ -134,8 +134,9 @@ type storedRuntimeRun struct {
 	FreshAttempts            int      `json:"fresh_attempts,omitempty"`
 	// AdmissionScope and AdmissionKey are the idempotency identity the run
 	// was admitted under, empty without one. Labels are the host's bounded
-	// annotations from admission (see [WithLabels]); child runs inherit
-	// their parent's. None of them is part of the admission identity.
+	// annotations from admission (see [WithLabels]). Child runs inherit their
+	// parent's scope and labels, never its key. None of them is part of the
+	// admission identity.
 	AdmissionScope string            `json:"admission_scope,omitempty"`
 	AdmissionKey   string            `json:"admission_key,omitempty"`
 	Labels         map[string]string `json:"labels,omitempty"`

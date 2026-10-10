@@ -126,7 +126,8 @@ func backfillRunListIndex(tx StoreTransaction) error {
 type RunFilter struct {
 	// Definition matches the run's definition ID and, when set, revision.
 	Definition DefinitionRef
-	// Scope matches the idempotency scope the run was admitted under.
+	// Scope matches the idempotency scope the run was admitted under; child
+	// runs carry their root's scope.
 	Scope string
 	// States matches any of the listed states. A ready run whose definition
 	// is not registered in this Runtime is reported, and matched, as
@@ -159,7 +160,8 @@ type RunSummary struct {
 	Failure      *RunFailure
 	Parent       *ParentRef
 	Conversation *ConversationRef
-	// Scope and Key are the run's idempotency identity, empty without one.
+	// Scope and Key are the run's idempotency identity, empty without one;
+	// a child run carries its root's scope and no key.
 	Scope     string
 	Key       string
 	Labels    map[string]string
