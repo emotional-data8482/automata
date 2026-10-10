@@ -14,5 +14,6 @@ use (
 	./extensions/openrouter
 	./extensions/sqlite
 	./extensions/tavily
+	./host
 	./tools
 )

@@ -37,6 +37,8 @@ It is built for agents inside web servers and job workers, not notebooks.
 | `extensions/openrouter` (module) | OpenRouter Chat Completions provider (official SDK); text, reasoning, images, tools, and structured output |
 | `extensions/tavily` (module) | Tavily backend for `tools.WebSearch` |
 | `extensions/mcp` (module) | Model Context Protocol through the official Go SDK: `mcpclient` turns a server's tools into `core.Tool`s, `mcpserver` serves `core.Tool`s |
+| `extensions/httpserver` (module) | `net/http` and SSE API over a `Runtime`: admission, listing, status, resumable event and change streams, cancellation, wait answers, manifests |
+| `host` (module) | `host.Main`: opens the store, registers definitions, recovers, applies retention, and serves the HTTP API |
 | `retry`, `tracing` | Backoff policy and span interfaces used by core |
 | `examples/*` (modules) | Runnable demos (see [Examples](#examples)) |
 
