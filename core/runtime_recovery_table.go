@@ -87,7 +87,9 @@ func classifyRecovery(record storedRuntimeRun, facts recoveryFacts) recoveryActi
 			if !facts.payloadFits {
 				return recoveryLeave
 			}
-			if record.PendingBatchID == "" && !recoverySafeBoundary(record.LastTransition) {
+			// An accepted final answer is checked below like a crash at the
+			// same point: finishing it repeats no provider call or tool.
+			if record.PendingBatchID == "" && !recoverySafeBoundary(record.LastTransition) && record.LastTransition != transitionProviderAccepted {
 				return recoveryLeave
 			}
 		default:

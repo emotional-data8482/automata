@@ -72,3 +72,51 @@ func TestRecoverDoesNotRewriteRunFinishedAfterScan(t *testing.T) {
 		t.Fatalf("finished run became %s gen %d (active=%v); want terminal gen 7", current.State, current.Generation, active)
 	}
 }
+
+// A graceful Close after the provider answered leaves the run in execution
+// attention at provider_accepted. Recovery must finish it from the saved
+// answer, as it does after a hard crash at the same point (bug review L3).
+func TestRecoverFinishesAcceptedAnswerAfterGracefulClose(t *testing.T) {
+	base := NewMemoryStore().(*memoryStore)
+	initializer, err := NewRuntime(context.Background(), RuntimeConfig{Store: noCloseStore{Store: base}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = initializer.Close()
+	messages := []Message{UserMessage("work"), asstText("the answer")}
+	record := storedRuntimeRun{
+		Version: runtimeEncodingVersion, RunID: "closed-after-answer", DefinitionID: "agent", DefinitionRevision: "v1",
+		Task: "work", State: RuntimeRunning, Generation: 3,
+		Result:         RunResult{RunID: "closed-after-answer", Turns: 1, ProviderAttempts: 1, FinalMessage: messages[1]},
+		LastTransition: transitionProviderAccepted,
+	}
+	setRunAttention(&record, AttentionExecution, "worker stopped during execution")
+	if err := base.Transaction(context.Background(), true, func(tx StoreTransaction) error {
+		if err := appendTranscript(tx, record.RunID, &record, messages); err != nil {
+			return err
+		}
+		return putRuntimeRun(tx, record)
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	provider := &scriptedProvider{}
+	runtime, err := NewRuntime(context.Background(), RuntimeConfig{Store: noCloseStore{Store: base}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+	if _, err := runtime.Register("agent", "v1", testAgent(provider)); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	result, err := runtime.Handle(record.RunID).Await(context.Background())
+	if err != nil || result.Output != "the answer" || result.Status != RunCompleted {
+		t.Fatalf("recovered result = %#v, %v", result, err)
+	}
+	if provider.calls != 0 {
+		t.Fatalf("provider called %d times; the accepted answer must not be requested again", provider.calls)
+	}
+}

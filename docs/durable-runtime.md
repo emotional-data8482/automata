@@ -66,7 +66,9 @@ later run transitions.
   finish before closing storage. Hook contexts retain their per-hook timeout;
   closing the Runtime does not shorten it. An interrupted whole-loop segment is conservatively
   marked `RuntimeNeedsAttention` (`AttentionProvider` when a provider call was
-  in flight); it is never automatically replayed.
+  in flight); it is never automatically replayed. `Recover` finishes one whose
+  final provider answer was already committed, exactly as after a crash at the
+  same point, because finishing it repeats no provider call or tool.
 - `RunHandle.Cancel` is the logical cancellation command. A persisted deadline
   (`WithDeadline`) has the same logical ownership. Both reach every required
   durable child (see [Durable children](#durable-children)).

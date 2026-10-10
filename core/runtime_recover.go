@@ -207,7 +207,7 @@ func (r *Runtime) recoverToolBatch(ctx context.Context, record storedRuntimeRun)
 			return false, r.completeExecutionAt(record.RunID, record.Generation, full.Result, context.Canceled, nil)
 		}
 		facts := recoveryFacts{payloadFits: r.payloadFits(record)}
-		if record.State == RuntimeRunning && record.LastTransition == transitionProviderAccepted {
+		if (record.State == RuntimeRunning || record.State == RuntimeNeedsAttention) && record.LastTransition == transitionProviderAccepted {
 			full, err := r.load(ctx, record.RunID)
 			if err != nil {
 				return false, err
