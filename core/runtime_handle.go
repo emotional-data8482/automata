@@ -354,3 +354,33 @@ func (h *RunHandle) Cancel(ctx context.Context) error {
 	}
 	return nil
 }
+
+// Child returns a handle to the durable child run admitted for the model tool
+// call with ID callID, so a host can await or decode a child's result without
+// walking the parent's tool batches. It returns [ErrOperationNotFound] when
+// the run has no such call, or the call did not admit a child run.
+func (h *RunHandle) Child(ctx context.Context, callID string) (*RunHandle, error) {
+	childRunID := ""
+	err := h.runtime.transaction(ctx, false, func(tx StoreTransaction) error {
+		if _, err := getRuntimeRun(tx, h.runID); err != nil {
+			return err
+		}
+		return tx.Scan(runtimeInvocationsBucket, h.runID+"/", func(_ string, raw []byte) error {
+			var invocation storedToolInvocation
+			if err := json.Unmarshal(raw, &invocation); err != nil {
+				return err
+			}
+			if invocation.Call.ID == callID && invocation.ChildRunID != "" {
+				childRunID = invocation.ChildRunID
+			}
+			return nil
+		})
+	})
+	if err != nil {
+		return nil, err
+	}
+	if childRunID == "" {
+		return nil, fmt.Errorf("%w: no child run for tool call %q", ErrOperationNotFound, callID)
+	}
+	return h.runtime.Handle(childRunID), nil
+}

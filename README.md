@@ -192,9 +192,11 @@ and the operations runbook.
 ## Tools
 
 `core.Func` derives a tool's JSON schema from a Go struct. Exported fields
-are properties, fields without `omitempty` are required, and a `desc` tag
-describes a field. `core.FuncResult` returns a `core.ToolResult` for rich
-content (text and image blocks):
+are properties, fields without `omitempty` are required, a `desc` tag
+describes a field, and an `enum:"approve,reject"` tag limits its values
+(each element's, for a slice). `core.FuncResult` returns a `core.ToolResult`
+for rich content (text and image blocks); `core.JSONResult(v)` returns `v`
+encoded as JSON text:
 
 ```go
 // Fragment
@@ -379,7 +381,7 @@ the run fails with an error that matches `core.ErrInvalidStructuredOutput`;
 `*core.InvalidStructuredOutputError`. Set `StructuredOutputConfig.Native` to
 use provider-native schema enforcement when the provider supports it (Claude
 `output_config`, OpenAI `response_format`). Other providers fall back to a
-hidden `automata_structured_output` tool. Schemas share one supported subset.
+hidden `automata_structured_output` tool (`core.StructuredOutputToolName`). Schemas share one supported subset.
 Unsupported assertion keywords such as `$ref`, `oneOf`, and `const` are
 rejected at `core.New`.
 
@@ -423,8 +425,10 @@ parent's call caps, deadline, and cancellation, are never retried
 implicitly, and keep their own transcripts, effects, and receipts. The
 child's task is the model's validated arguments as JSON, and the parent
 receives the child's structured output or final message. Read a child's
-typed output with `core.Decode` on the child run's snapshot
-(`ToolInvocationSnapshot.ChildRunID` links down).
+typed output from its run: `handle.Child(ctx, callID)` returns the child
+run's handle for a tool call, and `core.Decode` reads its awaited result.
+`RunSnapshot.ToolCall(callID)` returns any call's invocation, and
+`RunSnapshot.AppliedEffects(tool)` returns the receipts a tool reported.
 
 ### Typed child agents
 
@@ -622,6 +626,11 @@ within a token budget. It keeps the system prompt and recent turns intact,
 never separates a tool call from its result, and only changes what is sent,
 never the committed transcript. The Claude provider's
 `WithConversationCache()` caches the message prefix.
+
+A model has no clock. `core.CurrentTime(nil)` is a pre-send hook that
+prefixes the latest user message with the current time. Each message keeps
+the time it was first sent, so a run's tool turns reuse the same prefix and
+prompt caches stay warm.
 
 ## Examples
 

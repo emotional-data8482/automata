@@ -16,7 +16,13 @@ import (
 // namespaced under the automata_ prefix so a user tool called
 // "structured_output" cannot collide with it; a user tool that occupies the
 // namespaced name is rejected by [New].
-const structuredOutputToolName = "automata_structured_output"
+// StructuredOutputToolName is the hidden tool a run uses to submit declared
+// structured output when the provider does not enforce the schema natively.
+// It appears in transcripts, tool batches, and stream events, and it is
+// reserved: a definition cannot register a tool with this name.
+const StructuredOutputToolName = "automata_structured_output"
+
+const structuredOutputToolName = StructuredOutputToolName
 
 // ErrInvalidStructuredOutput is matched (via errors.Is) by the
 // [InvalidStructuredOutputError] returned when a run cannot produce a payload

@@ -275,6 +275,16 @@ func TextResult(text string) ToolResult {
 	return ToolResult{Blocks: Blocks{TextBlock{Text: text}}}
 }
 
+// JSONResult builds a plain-text [ToolResult] holding v encoded as JSON, the
+// usual way to return structured data to the model.
+func JSONResult(v any) (ToolResult, error) {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return ToolResult{}, fmt.Errorf("encode tool result: %w", err)
+	}
+	return TextResult(string(data)), nil
+}
+
 // BlockResult builds a [ToolResult] from the given blocks, preserving order.
 // If no blocks are supplied, the result is normalized to a single empty
 // [TextBlock].

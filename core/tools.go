@@ -156,6 +156,16 @@ func objectSchema(t reflect.Type, visiting map[reflect.Type]bool) map[string]any
 			if desc := field.Tag.Get("desc"); desc != "" {
 				prop["description"] = desc
 			}
+			if values, nullable, ok := enumTag(field); ok {
+				target := prop
+				if items, ok := prop["items"].(map[string]any); ok {
+					target, nullable = items, enumNullable(field.Type.Elem())
+				}
+				if nullable {
+					values = append(values, nil)
+				}
+				target["enum"] = values
+			}
 			props[jsonName] = prop
 
 			if !optional {
@@ -169,6 +179,46 @@ func objectSchema(t reflect.Type, visiting map[reflect.Type]bool) map[string]any
 		"properties": props,
 		"required":   required,
 	}
+}
+
+// enumTag reads a field's `enum:"a,b,c"` tag: the comma-separated values the
+// field (or, for a slice or array, each element) may take. Values are parsed
+// as the field's scalar kind: strings verbatim, numbers as JSON numbers, and
+// booleans as true or false. nullable reports that the field also admits
+// null, which the schema's enum must then list.
+func enumTag(field reflect.StructField) (values []any, nullable bool, ok bool) {
+	tag, ok := field.Tag.Lookup("enum")
+	if !ok {
+		return nil, false, false
+	}
+	t := field.Type
+	nullable = enumNullable(t)
+	for t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	if (t.Kind() == reflect.Slice || t.Kind() == reflect.Array) && t.Elem().Kind() != reflect.Uint8 {
+		t = t.Elem()
+		for t.Kind() == reflect.Pointer {
+			t = t.Elem()
+		}
+	}
+	for value := range strings.SplitSeq(tag, ",") {
+		switch t.Kind() {
+		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+			reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
+			reflect.Float32, reflect.Float64:
+			values = append(values, json.Number(strings.TrimSpace(value)))
+		case reflect.Bool:
+			values = append(values, strings.TrimSpace(value) == "true")
+		default:
+			values = append(values, value)
+		}
+	}
+	return values, nullable, true
+}
+
+func enumNullable(t reflect.Type) bool {
+	return t.Kind() == reflect.Pointer
 }
 
 var (

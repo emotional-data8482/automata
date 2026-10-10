@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"reflect"
+	"slices"
 	"strings"
 )
 
@@ -135,9 +136,26 @@ func structContract(t reflect.Type, visiting map[reflect.Type]bool) schemaContra
 			}
 			required = !strings.Contains(tag, "omitempty")
 		}
+		contract := typeContract(field.Type, visiting)
+		if values, _, ok := enumTag(field); ok {
+			// The enum constrains values; null stays governed by nullable.
+			withNull := func(c schemaContract) []any {
+				if c.nullable {
+					return append(slices.Clone(values), nil)
+				}
+				return values
+			}
+			if contract.items != nil {
+				items := *contract.items
+				items.enum = withNull(items)
+				contract.items = &items
+			} else {
+				contract.enum = withNull(contract)
+			}
+		}
 		c.properties = append(c.properties, contractProperty{
 			name:     jsonName,
-			contract: typeContract(field.Type, visiting),
+			contract: contract,
 			required: required,
 		})
 	}

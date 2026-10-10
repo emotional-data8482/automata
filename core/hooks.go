@@ -3,7 +3,9 @@ package core
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -64,4 +66,43 @@ func validateCommittedRunHooks(hooks []CommittedRunHook) ([]CommittedRunHook, er
 		seen[hook.Name] = struct{}{}
 	}
 	return frozen, nil
+}
+
+// CurrentTime returns a [PreSendHook] that tells the model the time, which it
+// otherwise does not know. It prefixes the latest user message in the view
+// sent to the provider with "Current time: <RFC 3339 time>". Each distinct
+// message keeps the time the hook first saw it, so the request prefix stays
+// stable across a run's tool turns and provider prompt caches stay warm. The
+// canonical transcript is unchanged. A nil now selects [time.Now].
+func CurrentTime(now func() time.Time) PreSendHook {
+	if now == nil {
+		now = time.Now
+	}
+	var mu sync.Mutex
+	stamps := map[string]time.Time{}
+	return func(_ context.Context, req Request) (Request, error) {
+		for i := len(req.Messages) - 1; i >= 0; i-- {
+			message := req.Messages[i]
+			if message.Role != "user" {
+				continue
+			}
+			key := hashMessages([]Message{message})
+			mu.Lock()
+			at, ok := stamps[key]
+			if !ok {
+				if len(stamps) >= 1024 {
+					clear(stamps)
+				}
+				at = now()
+				stamps[key] = at
+			}
+			mu.Unlock()
+			stamp := TextBlock{Text: "Current time: " + at.Format(time.RFC3339) + "\n\n"}
+			message.Blocks = append(Blocks{stamp}, message.Blocks...)
+			req.Messages = slices.Clone(req.Messages)
+			req.Messages[i] = message
+			break
+		}
+		return req, nil
+	}
 }

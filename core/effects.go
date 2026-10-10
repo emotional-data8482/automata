@@ -193,6 +193,34 @@ type ToolBatchSnapshot struct {
 	Invocations []ToolInvocationSnapshot
 }
 
+// ToolCall returns the invocation of the model tool call with ID callID, from
+// the latest batch that holds it.
+func (s RunSnapshot) ToolCall(callID string) (ToolInvocationSnapshot, bool) {
+	for i := len(s.ToolBatches) - 1; i >= 0; i-- {
+		for _, invocation := range s.ToolBatches[i].Invocations {
+			if invocation.Call.ID == callID {
+				return invocation, true
+			}
+		}
+	}
+	return ToolInvocationSnapshot{}, false
+}
+
+// AppliedEffects returns the effect reports of the invocations that applied
+// an external effect, in batch and model order. A non-empty tool limits them
+// to that tool's calls. Each report carries the tool's receipt.
+func (s RunSnapshot) AppliedEffects(tool string) []EffectReport {
+	var out []EffectReport
+	for _, batch := range s.ToolBatches {
+		for _, invocation := range batch.Invocations {
+			if invocation.Effect.Status == EffectApplied && (tool == "" || invocation.Call.Name == tool) {
+				out = append(out, invocation.Effect)
+			}
+		}
+	}
+	return out
+}
+
 // EffectResolution is an authoritative reconciliation of an uncertain
 // invocation. Result is the content to commit to canonical model history;
 // Effect must be None, Applied, or NotApplied (never Unknown or Unreported).
