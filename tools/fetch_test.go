@@ -113,8 +113,8 @@ func TestHTTPFetchRejects(t *testing.T) {
 }
 
 func TestExtractTextCaseFoldingDoesNotShiftOffsets(t *testing.T) {
-	// U+0130 lowercases to three bytes, so a lowercased copy of the document
-	// is longer than the original and byte offsets into it no longer line up.
+	// U+0130 lowercases from two bytes to one, so a lowercased copy of the
+	// document is shorter and byte offsets into it no longer line up.
 	doc := strings.Repeat("İ", 20) + "<p>hello</p><script>secret()</script>world"
 	got := extractText(doc)
 	if strings.Contains(got, "secret") {

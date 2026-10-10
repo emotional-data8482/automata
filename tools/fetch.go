@@ -177,11 +177,11 @@ func extractText(doc string) string {
 	return normalizeText(html.UnescapeString(b.String()))
 }
 
-// asciiLower lowercases ASCII letters in place, leaving every other byte
+// asciiLower lowercases ASCII letters, leaving every other byte
 // untouched. Unlike strings.ToLower it never changes the string's byte length,
 // so offsets computed against the result stay valid in the original document
-// (strings.ToLower can, for example, expand U+0130 'İ' from two bytes to
-// three, which would drift any byte offsets taken from it).
+// (strings.ToLower can, for example, shrink U+0130 'İ' from two bytes to
+// one, which would drift any byte offsets taken from it).
 func asciiLower(s string) string {
 	// Fast path: nothing to fold.
 	needsFold := false
