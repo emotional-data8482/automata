@@ -13,7 +13,7 @@ import (
 )
 
 // SubmitOption configures one admission. See [WithIdempotencyKey],
-// [WithDeadline], and [WithConversation].
+// [WithDeadline], [WithConversation], and [WithLabels].
 type SubmitOption func(*submitOptions)
 
 type submitOptions struct {
@@ -21,6 +21,7 @@ type submitOptions struct {
 	Key          string
 	Deadline     time.Time
 	Conversation conversationOptions
+	Labels       map[string]string
 	err          error
 }
 
@@ -127,6 +128,9 @@ func (r *Runtime) submit(ctx context.Context, definition DefinitionRef, task str
 	if err := validateConversationOptions(options.Conversation); err != nil {
 		return nil, err
 	}
+	if err := validateLabels(options.Labels); err != nil {
+		return nil, err
+	}
 	binding, err := r.binding(definition)
 	if err != nil {
 		return nil, err
@@ -173,7 +177,9 @@ func (r *Runtime) submit(ctx context.Context, definition DefinitionRef, task str
 			Version: runtimeEncodingVersion, RunID: runID, DefinitionID: definitionID,
 			DefinitionRevision: revision, Task: task, Deadline: options.Deadline,
 			State: RuntimeReady, Generation: 1, Result: RunResult{RunID: runID},
-			ToolBudget: caps,
+			ToolBudget:     caps,
+			AdmissionScope: options.Scope, AdmissionKey: options.Key,
+			Labels: cloneLabels(options.Labels), CreatedAt: time.Now().UTC(),
 		}
 		if options.Conversation.ID != "" {
 			// Reserve the conversation's active slot and, atomically with the
@@ -194,6 +200,9 @@ func (r *Runtime) submit(ctx context.Context, definition DefinitionRef, task str
 			}
 		}
 		if err := putRuntimeRun(tx, record); err != nil {
+			return err
+		}
+		if err := putRunListIndex(tx, record); err != nil {
 			return err
 		}
 		if options.Key != "" {

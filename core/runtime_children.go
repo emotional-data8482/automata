@@ -146,8 +146,13 @@ func (r *Runtime) admitChildRun(tx StoreTransaction, parent storedRuntimeRun, in
 		// record at admission; the child charges its ancestors from their
 		// persisted records, not from any context.
 		ToolBudget: pinnedToolCaps(binding.agent.toolPolicy),
+		Labels:     cloneLabels(parent.Labels),
+		CreatedAt:  now,
 	}
 	if err := putRuntimeRun(tx, record); err != nil {
+		return receipt, err
+	}
+	if err := putRunListIndex(tx, record); err != nil {
 		return receipt, err
 	}
 	link := storedChildLink{

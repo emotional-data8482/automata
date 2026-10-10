@@ -283,6 +283,13 @@ type storedPrunedRun struct {
 // semantic duplicates rejected and resolve an exact admission retry to the
 // pruned identity instead of new work.
 func deleteRun(tx StoreTransaction, runID string, now time.Time) error {
+	record, err := getRuntimeRun(tx, runID)
+	if err != nil {
+		return err
+	}
+	if err := tx.Delete(runtimeRunListBucket, runListKey(record)); err != nil {
+		return err
+	}
 	for _, prefix := range []struct{ bucket, prefix string }{
 		{runtimeFactsBucket, runID + "/"},
 		{runtimeEventsBucket, runID + "/"},

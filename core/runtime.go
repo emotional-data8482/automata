@@ -207,7 +207,10 @@ func (r *Runtime) initialize(ctx context.Context) error {
 		raw, err := tx.Get(runtimeMetaBucket, "encoding")
 		if errors.Is(err, ErrStoreKeyNotFound) {
 			data, _ := json.Marshal(runtimeEncodingVersion)
-			return tx.Put(runtimeMetaBucket, "encoding", data)
+			if err := tx.Put(runtimeMetaBucket, "encoding", data); err != nil {
+				return err
+			}
+			return tx.Put(runtimeMetaBucket, runListIndexedMeta, nil)
 		}
 		if err != nil {
 			return err
@@ -219,7 +222,7 @@ func (r *Runtime) initialize(ctx context.Context) error {
 		if version != runtimeEncodingVersion {
 			return fmt.Errorf("unsupported runtime storage version %d", version)
 		}
-		return nil
+		return backfillRunListIndex(tx)
 	})
 }
 

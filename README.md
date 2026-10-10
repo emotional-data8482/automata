@@ -167,6 +167,11 @@ fmt.Println(retry.ID() == handle.ID())
   ID to exactly one run. An exact retry, even after a lost response or a
   restart, returns the original run. A changed task, definition, deadline, or
   conversation returns `ErrAdmissionConflict`.
+- **Labels and listing.** `WithLabels` attaches bounded host annotations
+  (schedule, actor, request IDs) that are not part of admission identity and
+  are inherited by child runs. `Runtime.Runs` pages through runs in admission
+  order, filtered by definition, idempotency scope, state, attention kind,
+  labels, and admission time.
 - **Restart.** A new process opens the same store, registers the same
   definition revisions, and calls `Recover`. Admitted work starts, accepted
   turns and completed tool calls are not repeated, suspended runs keep
