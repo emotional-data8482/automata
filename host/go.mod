@@ -3,9 +3,9 @@ module github.com/emotional-data8482/automata/host
 go 1.26.2
 
 require (
-	github.com/emotional-data8482/automata v0.5.3
-	github.com/emotional-data8482/automata/extensions/httpserver v0.0.0
-	github.com/emotional-data8482/automata/extensions/sqlite v0.5.2
+	github.com/emotional-data8482/automata v0.6.0
+	github.com/emotional-data8482/automata/extensions/httpserver v0.6.0
+	github.com/emotional-data8482/automata/extensions/sqlite v0.5.3
 )
 
 require (
@@ -20,9 +20,3 @@ require (
 	modernc.org/memory v1.11.0 // indirect
 	modernc.org/sqlite v1.51.0 // indirect
 )
-
-
-// httpserver is not tagged yet: the go command reads a required version's
-// go.mod even for workspace modules. Tag it, require the tag, and drop this
-// replace before releasing host.
-replace github.com/emotional-data8482/automata/extensions/httpserver => ../extensions/httpserver
