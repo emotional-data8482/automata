@@ -2,16 +2,17 @@ go 1.26.2
 
 use (
 	.
-	./extensions/sqlite
 	./examples/claude
 	./examples/deep_research
 	./examples/durable_host
 	./examples/durable_typed
 	./examples/openai
 	./extensions/claude
+	./extensions/httpserver
 	./extensions/mcp
 	./extensions/openai
 	./extensions/openrouter
+	./extensions/sqlite
 	./extensions/tavily
 	./tools
 )
