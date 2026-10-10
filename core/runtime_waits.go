@@ -118,7 +118,7 @@ func completeWaitInvocation(tx StoreTransaction, wait storedWait, result ToolRes
 	invocation.Effect = EffectReport{Status: EffectNotApplied}
 	invocation.Result.Effect = EffectReport{}
 	if invocation.GuardKey != "" {
-		if err := putStoredJSON(tx, runtimeEffectGuardsBucket, invocation.GuardKey, storedEffectGuard{OperationID: invocation.OperationID, Status: EffectNotApplied}); err != nil {
+		if err := putOwnedEffectGuard(tx, invocation.GuardKey, invocation.OperationID, EffectNotApplied); err != nil {
 			return err
 		}
 	}
