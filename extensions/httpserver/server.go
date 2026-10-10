@@ -155,6 +155,7 @@ func New(config Config) (*Server, error) {
 	s.mux.HandleFunc("POST /v1/runs/{id}/hooks/acknowledge", s.acknowledgeHooks)
 	s.mux.HandleFunc("GET /v1/changes", s.changes)
 	s.mux.HandleFunc("GET /v1/definitions/{id}/{revision}", s.describe)
+	s.mux.HandleFunc("GET /v1/openapi.json", s.openAPI)
 	return s, nil
 }
 

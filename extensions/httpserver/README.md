@@ -27,6 +27,7 @@ http.Handle("/", server)
 | `POST /v1/runs/{id}/hooks/acknowledge` | Acknowledge interrupted committed-run hook delivery; the hooks never run again |
 | `GET /v1/changes` | Runtime-wide change feed (single-tenant servers only), JSON or SSE; `events=true` attaches events |
 | `GET /v1/definitions/{id}/{revision}` | Definition manifest |
+| `GET /v1/openapi.json` | This API's OpenAPI 3.1 document (also `httpserver.OpenAPI()`); served without authorization because it carries no run data |
 
 Streams resume from `Last-Event-ID` (or `after`), send a heartbeat comment
 when idle, and a run stream ends with an `end` event after the run's terminal
