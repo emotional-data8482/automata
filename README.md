@@ -604,6 +604,14 @@ for {
 transcript, tool batches and effects, waits, attention, failure, and
 accounting across child runs.
 
+A host that indexes or exports every run follows one runtime-wide cursor
+instead of one per run. `Runtime.WaitChanges(ctx, cursor, limit)` returns
+`RunChange` entries in commit order, each naming the run and the range of its
+committed events that commit appended; `core.WithChangeEvents()` attaches
+those events with their transcript messages. Set
+`RetentionPolicy.HoldUnsynced` and `SyncedThrough` to the cursor you have
+durably stored, and `Prune` never removes history you have not exported.
+
 ## Long conversations
 
 `core.Compactor` is a pre-send hook that summarizes older turns to stay

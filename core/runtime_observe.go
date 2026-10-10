@@ -270,6 +270,9 @@ type runCommit struct {
 	waitExpiry time.Time
 	// pruned reports that retention deleted the run record.
 	pruned bool
+	// firstEvent is the first event sequence this commit appended; with head,
+	// it bounds the run change recorded in the runtime-wide feed.
+	firstEvent uint64
 }
 
 // runEventView decodes only the run-record fields event derivation reads.
@@ -452,6 +455,7 @@ func (tx *commitTx) flush(now time.Time) ([]runCommit, error) {
 		if err != nil {
 			return nil, err
 		}
+		p.commit.firstEvent = head.Head + 1
 		for _, event := range events {
 			head.Head++
 			event.Version = runtimeEncodingVersion
@@ -466,6 +470,9 @@ func (tx *commitTx) flush(now time.Time) ([]runCommit, error) {
 		}
 		p.commit.head = head.Head
 		commits = append(commits, p.commit)
+	}
+	if err := appendRunChanges(tx.StoreTransaction, commits, now); err != nil {
+		return nil, err
 	}
 	return commits, nil
 }
@@ -516,6 +523,9 @@ type commitHub struct {
 	mu      sync.Mutex
 	closed  bool
 	signals map[string]*commitSignal
+	// any is closed and replaced by every notification, for waiters on the
+	// runtime-wide change feed.
+	any chan struct{}
 }
 
 type commitSignal struct {
@@ -544,7 +554,18 @@ var closedSignal = func() chan struct{} {
 }()
 
 func newCommitHub() *commitHub {
-	return &commitHub{signals: make(map[string]*commitSignal)}
+	return &commitHub{signals: make(map[string]*commitSignal), any: make(chan struct{})}
+}
+
+// anyChange returns a channel closed by the next commit on any run, and
+// whether the hub is closed. Take it before reading so no commit is missed.
+func (h *commitHub) anyChange() (<-chan struct{}, bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed {
+		return closedSignal, true
+	}
+	return h.any, false
 }
 
 // commitSubscription is one waiter's continuous registration on a run.
@@ -623,6 +644,10 @@ func (h *commitHub) notify(commits []runCommit, confirmed bool) {
 	if h.closed {
 		return
 	}
+	if len(commits) > 0 {
+		close(h.any)
+		h.any = make(chan struct{})
+	}
 	for _, commit := range commits {
 		signal := h.signals[commit.runID]
 		if signal == nil {
@@ -670,6 +695,7 @@ func (h *commitHub) close() {
 		return
 	}
 	h.closed = true
+	close(h.any)
 	for _, signal := range h.signals {
 		close(signal.ch)
 	}
