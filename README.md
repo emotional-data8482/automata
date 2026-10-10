@@ -30,6 +30,7 @@ It is built for agents inside web servers and job workers, not notebooks.
 | `core` | `Agent` definitions, `Runtime`, tools, child agents, conversations, approvals, streaming, and the storage port |
 | `agents` | Typed shorthand over `core`: `Define[I, O]` builds and registers a definition, then runs it or exposes it as a child tool |
 | `core/storetest` | Conformance suite for `core.Store` adapters |
+| `core/coretest` | Test kit: a scripted provider (`NewProvider`, `NewStreamProvider`) that replays turns and records requests, plus `Runtime` fixtures |
 | `tools` (module) | First-party tools: `HTTPFetch`, `ReadFile`/`WriteFile` (sandboxed), `Shell` (allow-listed), `WebSearch`; `LoadAgentsMD` and `LoadSkills` for AGENTS.md instructions and Agent Skills |
 | `extensions/sqlite` (module) | The supported persistent store: one exclusive local owner, WAL, `synchronous=FULL` |
 | `extensions/claude` (module) | Anthropic provider; thinking, images, prompt caching, native structured output |
