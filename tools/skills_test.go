@@ -235,7 +235,8 @@ func TestLoadSkillsRepositorySkills(t *testing.T) {
 		t.Fatal(err)
 	}
 	s, ok := skills.Lookup("automata-go")
-	if !ok || s.License != "Apache-2.0" || !strings.HasPrefix(s.Compatibility, "Automata v0.5.0+") || !strings.HasPrefix(s.Body, "# ") {
+	// Check metadata loading without pinning this test to a release version.
+	if !ok || s.License != "Apache-2.0" || !strings.HasPrefix(s.Compatibility, "Automata core v") || !strings.HasPrefix(s.Body, "# ") {
 		t.Errorf("automata-go = %+v, %v", s, ok)
 	}
 }
