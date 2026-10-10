@@ -340,8 +340,9 @@ func TestRuntimeCancelReceiptSurvivesLaterCommits(t *testing.T) {
 	if err := handle.Cancel(context.Background()); err != nil {
 		t.Fatalf("cancel retry did not resolve its receipt: %v", err)
 	}
+	// Generation 2 is the cancellation, 3 the terminal commit after hooks.
 	record := getRecord(t, base, runID)
-	if record.State != RuntimeRunning || record.Result.Status != RunCancelled || record.Generation != 2 {
+	if record.State != RuntimeRunning || record.Result.Status != RunCancelled || record.Generation != 3 {
 		t.Fatalf("retry re-derived state instead of resolving its receipt: %#v", record)
 	}
 }

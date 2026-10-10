@@ -245,13 +245,16 @@ func resultWithRunID(result RunResult, runID string) RunResult {
 }
 
 // Cancel durably cancels the run and every non-terminal descendant in one
-// commit. A suspended run becomes terminal at once; a running one stops
-// dispatching and finishes as canceled. An exact retry returns the original
-// outcome, even after a lost acknowledgement or later transitions.
+// commit. A suspended run finishes as canceled before Cancel returns, after
+// its committed-run hooks (and those of its suspended descendants) run; a
+// running one stops dispatching and finishes as canceled. An exact retry
+// returns the original outcome, even after a lost acknowledgement or later
+// transitions.
 func (h *RunHandle) Cancel(ctx context.Context) error {
 	var cancels []context.CancelFunc
-	var canceledChild, parentRunID string
+	var finalizing []string
 	err := h.runtime.transaction(ctx, true, func(tx StoreTransaction) error {
+		finalizing = finalizing[:0]
 		// Resolve an exact retry from the persisted receipt before touching
 		// current state: a lost acknowledgement followed by any later command
 		// still resolves the original outcome without re-deriving state.
@@ -280,31 +283,28 @@ func (h *RunHandle) Cancel(ctx context.Context) error {
 		case RuntimeFinalizing, RuntimeTerminal:
 			return nil
 		case RuntimeReady, RuntimeWaiting, RuntimeNeedsAttention:
-			record.Result.Status = RunCancelled
-			record.AttentionReason = ""
-			record.AttentionKind = ""
 			setRuntimeError(&record, context.Canceled)
-			if record.ParentRunID != "" {
-				canceledChild, parentRunID = h.runID, record.ParentRunID
+			hooks, err := finalizeCanceledTx(tx, &record)
+			if err != nil {
+				return err
+			}
+			if hooks {
+				finalizing = append(finalizing, h.runID)
 			}
 		case RuntimeRunning:
 			record.State = RuntimeCancelRequested
-		}
-		record.Generation++
-		if receipt.ObservedState == RuntimeReady || receipt.ObservedState == RuntimeWaiting || receipt.ObservedState == RuntimeNeedsAttention {
-			err = commitTerminalTx(tx, &record)
-		} else {
-			err = putRuntimeRun(tx, record)
-		}
-		if err != nil {
-			return err
+			record.Generation++
+			if err := putRuntimeRun(tx, record); err != nil {
+				return err
+			}
 		}
 		// Required descendants are canceled in this same commit, before any
 		// local worker is signaled.
-		running, err := propagateCancellationTx(tx, h.runID, context.Canceled)
+		running, descendants, err := propagateCancellationTx(tx, h.runID, context.Canceled)
 		if err != nil {
 			return err
 		}
+		finalizing = append(finalizing, descendants...)
 		data, err := json.Marshal(receipt)
 		if err != nil {
 			return err
@@ -322,16 +322,19 @@ func (h *RunHandle) Cancel(ctx context.Context) error {
 		h.runtime.mu.Unlock()
 		return nil
 	})
-	if err == nil {
-		for _, cancel := range cancels {
-			cancel()
-		}
+	if err != nil {
+		return err
 	}
-	if err == nil && canceledChild != "" {
-		// Cancellation durably terminalized a suspended child run; notify the
-		// parent through the same central child-completion boundary so the
-		// parent sees the model-visible cancellation outcome.
-		_ = h.runtime.afterRunDisposition(context.Background(), storedRuntimeRun{RunID: canceledChild, ParentRunID: parentRunID, State: RuntimeTerminal})
+	for _, cancel := range cancels {
+		cancel()
 	}
-	return err
+	// Deliver hooks deepest first, so each descendant is terminal before its
+	// ancestor. Finishing hooks commits the terminal state and notifies a
+	// waiting parent through the central child-completion boundary. A failed
+	// delivery leaves the run finalizing for the driver or Recover; the
+	// cancellation itself has committed.
+	for i := len(finalizing) - 1; i >= 0; i-- {
+		_ = h.runtime.completeRunHooks(finalizing[i])
+	}
+	return nil
 }

@@ -233,15 +233,19 @@ func suspendedForDeadline(record storedRuntimeRun) bool {
 	return record.State == RuntimeWaiting || (record.State == RuntimeNeedsAttention && record.AttentionKind == AttentionChild)
 }
 
-func finalizeWaitingDeadline(tx StoreTransaction, record *storedRuntimeRun, now time.Time) error {
+// finalizeWaitingDeadline moves a suspended run past its deadline to
+// finalizing and cancels its descendants. It returns the descendants that
+// also moved to finalizing; the caller delivers their hooks after commit,
+// before the run's own.
+func finalizeWaitingDeadline(tx StoreTransaction, record *storedRuntimeRun, now time.Time) ([]string, error) {
 	if !suspendedForDeadline(*record) || record.Deadline.IsZero() || now.Before(record.Deadline) {
-		return nil
+		return nil, nil
 	}
 	if err := resolveReservedInvocations(tx, *record); err != nil {
-		return err
+		return nil, err
 	}
 	if err := cancelRunWaits(tx, record.RunID); err != nil {
-		return err
+		return nil, err
 	}
 	record.State = RuntimeFinalizing
 	record.Result.Status = RunCancelled
@@ -250,17 +254,20 @@ func finalizeWaitingDeadline(tx StoreTransaction, record *storedRuntimeRun, now 
 	setRuntimeError(record, context.DeadlineExceeded)
 	record.Generation++
 	if err := putRuntimeRun(tx, *record); err != nil {
-		return err
+		return nil, err
 	}
-	_, err := propagateCancellationTx(tx, record.RunID, context.DeadlineExceeded)
-	return err
+	_, finalizing, err := propagateCancellationTx(tx, record.RunID, context.DeadlineExceeded)
+	return finalizing, err
 }
 
 // expireWaitingDeadline finalizes a suspended run whose logical deadline has
-// passed. The caller delivers the finalized run's committed-run hooks.
-func (r *Runtime) expireWaitingDeadline(ctx context.Context, runID string) (bool, error) {
+// passed. The caller delivers the committed-run hooks of the returned
+// descendants, deepest last, and then of the finalized run.
+func (r *Runtime) expireWaitingDeadline(ctx context.Context, runID string) (bool, []string, error) {
 	finalized := false
+	var descendants []string
 	err := r.transaction(ctx, true, func(tx StoreTransaction) error {
+		finalized, descendants = false, nil
 		record, err := getRuntimeRun(tx, runID)
 		if err != nil {
 			return err
@@ -268,13 +275,13 @@ func (r *Runtime) expireWaitingDeadline(ctx context.Context, runID string) (bool
 		if !suspendedForDeadline(record) || record.Deadline.IsZero() || time.Now().UTC().Before(record.Deadline) {
 			return nil
 		}
-		if err := finalizeWaitingDeadline(tx, &record, time.Now().UTC()); err != nil {
+		if descendants, err = finalizeWaitingDeadline(tx, &record, time.Now().UTC()); err != nil {
 			return err
 		}
 		finalized = true
 		return nil
 	})
-	return finalized, err
+	return finalized, descendants, err
 }
 
 // ResolveWait durably answers a question or approval. Repeating the same
@@ -348,7 +355,9 @@ func (h *RunHandle) ResolveWait(ctx context.Context, waitID string, resolution W
 	ready := false
 	expired := false
 	deadline := false
+	var descendants []string
 	err := h.runtime.transaction(ctx, true, func(tx StoreTransaction) error {
+		descendants = nil
 		wait, err := getStoredWait(tx, h.runID, waitID)
 		if err != nil {
 			return err
@@ -377,7 +386,7 @@ func (h *RunHandle) ResolveWait(ctx context.Context, waitID string, resolution W
 			return err
 		}
 		if !record.Deadline.IsZero() && !now.Before(record.Deadline) {
-			if err := finalizeWaitingDeadline(tx, &record, now); err != nil {
+			if descendants, err = finalizeWaitingDeadline(tx, &record, now); err != nil {
 				return err
 			}
 			deadline = true
@@ -422,6 +431,9 @@ func (h *RunHandle) ResolveWait(ctx context.Context, waitID string, resolution W
 		return err
 	})
 	if err == nil && deadline {
+		for i := len(descendants) - 1; i >= 0; i-- {
+			_ = h.runtime.completeRunHooks(descendants[i])
+		}
 		if hookErr := h.runtime.completeRunHooks(h.runID); hookErr != nil {
 			return hookErr
 		}

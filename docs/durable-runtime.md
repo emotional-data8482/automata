@@ -161,6 +161,13 @@ because an external effect may have happened without its outcome being stored.
 If it stops before the marker, no hook ran, so recovery invokes the currently
 configured hooks once and commits the terminal state.
 
+Hooks cover every terminal path except an acknowledged hook-attention run.
+Canceling a ready, waiting, or needs-attention run, a waiting deadline, and
+cancellation propagated to suspended descendants all pass through
+`RuntimeFinalizing` like an executed run. `Cancel` delivers the hooks of the
+runs it finalized, deepest descendant first, before it returns; a delivery that
+never starts is finished by the background driver or `Recover`.
+
 A run in hook attention (`RunSnapshot.Attention.Kind == AttentionHooks`) also keeps a waiting
 durable parent blocked or its conversation busy. After checking whatever the
 interrupted hooks might have done, the host calls `handle.AcknowledgeHooks(ctx)`.
