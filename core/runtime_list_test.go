@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -223,8 +224,12 @@ func TestRuntimeRunsBackfillsAndPrunesIndex(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(page.Runs) != 2 {
-		t.Fatalf("backfilled listing has %d runs", len(page.Runs))
+	got := make([]string, len(page.Runs))
+	for i, run := range page.Runs {
+		got[i] = run.RunID
+	}
+	if !slices.Equal(got, ids) {
+		t.Fatalf("backfilled listing = %v, want %v", got, ids)
 	}
 	time.Sleep(2 * time.Millisecond)
 	if _, err := reopened.Prune(context.Background(), RetentionPolicy{Runs: time.Nanosecond}); err != nil {
