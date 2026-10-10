@@ -6,6 +6,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/emotional-data8482/automata/agents"
 	"github.com/emotional-data8482/automata/core"
 	"github.com/emotional-data8482/automata/extensions/claude"
 	"github.com/emotional-data8482/automata/extensions/tavily"
@@ -61,47 +62,42 @@ func discardLogger() *slog.Logger {
 // to them is admitted as its own run, linked to the call, and its streamed
 // events reach the orchestrator's live view tagged with the tool name.
 func registerAgents(runtime *core.Runtime, cfg appConfig, store *todoStore, sink func(tea.Msg)) (core.DefinitionRef, error) {
-	researcher, err := core.New(claude.New(cfg.researchModel, cfg.apiKey), core.AgentConfig{
-		Logger: discardLogger(), SystemPrompt: researcherPrompt, MaxTurns: 10,
-		Tools: []core.Tool{tools.WebSearch(tavily.New(cfg.tavilyKey))},
-	})
-	if err != nil {
-		return core.DefinitionRef{}, err
-	}
-	researcherRef, err := runtime.Register("researcher", "v1", researcher)
-	if err != nil {
-		return core.DefinitionRef{}, err
-	}
-
-	writer, err := core.New(claude.New(cfg.writerModel, cfg.apiKey), core.AgentConfig{
-		Logger: discardLogger(), SystemPrompt: writerPrompt, MaxTurns: 5,
-		Tools: []core.Tool{saveDocumentTool(cfg.topic, cfg.outPath, sink)},
-	})
-	if err != nil {
-		return core.DefinitionRef{}, err
-	}
-	writerRef, err := runtime.Register("writer", "v1", writer)
-	if err != nil {
-		return core.DefinitionRef{}, err
-	}
-
-	orchestrator, err := core.New(claude.New(cfg.orchestratorModel, cfg.apiKey), core.AgentConfig{
-		Logger: discardLogger(), SystemPrompt: orchestratorPrompt, MaxTurns: 30,
-		// The call cap is a subtree cap: it bounds the orchestrator's calls
-		// and every call its children make.
-		ToolPolicy: core.ToolPolicy{MaxCalls: 80},
-		Tools: []core.Tool{
-			todoTool(store, sink),
-			core.ChildTool[researchParams]("researcher",
-				"Delegate a focused research assignment. Provide a topic and optional specific questions; returns concise notes with source URLs.",
-				researcherRef),
-			core.ChildTool[writeParams]("writer",
-				"Delegate writing the final report. Provide a title, an outline, and the combined research notes; it composes the Markdown, saves the file, and returns the saved path.",
-				writerRef),
+	researcher, err := agents.Define[researchParams, string](runtime, agents.Spec{
+		ID: "researcher", Revision: "v1", Provider: claude.New(cfg.researchModel, cfg.apiKey),
+		Config: core.AgentConfig{
+			Logger: discardLogger(), SystemPrompt: researcherPrompt, MaxTurns: 10,
+			Tools: []core.Tool{tools.WebSearch(tavily.New(cfg.tavilyKey))},
 		},
 	})
 	if err != nil {
 		return core.DefinitionRef{}, err
 	}
-	return runtime.Register("orchestrator", "v1", orchestrator)
+
+	writer, err := agents.Define[writeParams, string](runtime, agents.Spec{
+		ID: "writer", Revision: "v1", Provider: claude.New(cfg.writerModel, cfg.apiKey),
+		Config: core.AgentConfig{
+			Logger: discardLogger(), SystemPrompt: writerPrompt, MaxTurns: 5,
+			Tools: []core.Tool{saveDocumentTool(cfg.topic, cfg.outPath, sink)},
+		},
+	})
+	if err != nil {
+		return core.DefinitionRef{}, err
+	}
+
+	return agents.Register(runtime, agents.Spec{
+		ID: "orchestrator", Revision: "v1", Provider: claude.New(cfg.orchestratorModel, cfg.apiKey),
+		Config: core.AgentConfig{
+			Logger: discardLogger(), SystemPrompt: orchestratorPrompt, MaxTurns: 30,
+			// The call cap is a subtree cap: it bounds the orchestrator's calls
+			// and every call its children make.
+			ToolPolicy: core.ToolPolicy{MaxCalls: 80},
+			Tools: []core.Tool{
+				todoTool(store, sink),
+				researcher.Tool("researcher",
+					"Delegate a focused research assignment. Provide a topic and optional specific questions; returns concise notes with source URLs."),
+				writer.Tool("writer",
+					"Delegate writing the final report. Provide a title, an outline, and the combined research notes; it composes the Markdown, saves the file, and returns the saved path."),
+			},
+		},
+	})
 }

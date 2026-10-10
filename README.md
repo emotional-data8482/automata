@@ -28,6 +28,7 @@ It is built for agents inside web servers and job workers, not notebooks.
 | Module / package | What it is |
 | --- | --- |
 | `core` | `Agent` definitions, `Runtime`, tools, child agents, conversations, approvals, streaming, and the storage port |
+| `agents` | Typed shorthand over `core`: `Define[I, O]` builds and registers a definition, then runs it or exposes it as a child tool |
 | `core/storetest` | Conformance suite for `core.Store` adapters |
 | `tools` (module) | First-party tools: `HTTPFetch`, `ReadFile`/`WriteFile` (sandboxed), `Shell` (allow-listed), `WebSearch`; `LoadAgentsMD` and `LoadSkills` for AGENTS.md instructions and Agent Skills |
 | `extensions/sqlite` (module) | The supported persistent store: one exclusive local owner, WAL, `synchronous=FULL` |
@@ -417,6 +418,37 @@ receives the child's structured output or final message. Read a child's
 typed output with `core.Decode` on the child run's snapshot
 (`ToolInvocationSnapshot.ChildRunID` links down).
 
+### Typed child agents
+
+The `agents` package states a definition's input and output types once.
+`agents.Define[I, O]` derives the output contract from `O` (or none when `O`
+is `string`), builds the agent, and registers it. The returned value exposes
+the definition as a child tool with an input schema from `I`, runs it directly,
+and decodes its results:
+
+```go
+// Fragment
+reviewer, err := agents.Define[ReviewRequest, ReviewVerdict](runtime, agents.Spec{
+	ID: "reviewer", Revision: "v1", Provider: provider,
+	Config: core.AgentConfig{SystemPrompt: "Review the named artifact."},
+})
+lead, err := agents.Register(runtime, agents.Spec{
+	ID: "lead", Revision: "v1", Provider: provider,
+	Config: core.AgentConfig{Tools: []core.Tool{
+		reviewer.Tool("review", "Ask the reviewer for a verdict on one artifact."),
+	}},
+})
+
+// Direct run: the task is the input as JSON, exactly as a child call sends it.
+verdict, result, err := reviewer.Run(ctx, runtime, ReviewRequest{Artifact: "report.md"})
+// A child run's result from its snapshot decodes the same way.
+verdict, err = reviewer.Output(childSnapshot.Result)
+```
+
+A derived contract allows `agents.DefaultMaxCorrections` correction turns;
+set `Config.StructuredOutput` without a `Schema` to choose `Native` or another
+budget.
+
 ## Conversations
 
 ```go
@@ -620,7 +652,7 @@ points, which were process-local and lost on restart, are removed:
 | `agent.RunBackground(...)` | `rt.Submit(...)`, then `handle.Await(ctx)` |
 | `agent.NewSession()`, `ResumeSession`, `Session.Run` | `rt.Run(ctx, ref, task, core.WithConversation(thread, head))` |
 | `core.RunTyped[T]`, `RunSessionTyped[T]` | `AgentConfig.StructuredOutput{Schema: core.OutputSchema[T]()}`, then `core.Decode[T](result)` |
-| `core.AsTool[P]`, `AsToolFunc[P]` | `core.ChildTool[P](name, description, childRef)` (the child receives JSON) |
+| `core.AsTool[P]`, `AsToolFunc[P]` | `core.ChildTool[P](name, description, childRef)`, or `agents.Define[P, O](...)` then `.Tool(name, description)` (the child receives JSON) |
 | `core.DurableChildTool(def, DurableChildPolicy{...})` | `core.NewChildTool(def, ref)` |
 | `WithCallOptions`, `WithMaxTurns`, `WithToolPolicy`, `WithTools`, `WithMaxCorrectionTurns`, `WithNativeStructuredOutput` | Set them on `AgentConfig` and register a new revision. |
 | `AgentConfig.DefaultCallOptions` | `AgentConfig.CallOptions` |
