@@ -30,6 +30,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -119,11 +120,22 @@ func Run(ctx context.Context, opts Options) error {
 	if err != nil {
 		return fmt.Errorf("host: open store: %w", err)
 	}
+	if store == nil {
+		return errors.New("host: open store returned nil")
+	}
+	// NewRuntime may fail before taking ownership, or close the store on
+	// initialization failure. Ensure either path closes it exactly once.
+	owned := &ownedStore{Store: store}
+	defer func() {
+		if err := owned.Close(); err != nil {
+			log.Error("close store", "error", err)
+		}
+	}()
 	config := core.RuntimeConfig{}
 	if opts.Runtime != nil {
 		opts.Runtime(&config)
 	}
-	config.Store = store
+	config.Store = owned
 	runtime, err := core.NewRuntime(ctx, config)
 	if err != nil {
 		return fmt.Errorf("host: open runtime: %w", err)
@@ -204,6 +216,17 @@ func Run(ctx context.Context, opts Options) error {
 		return fmt.Errorf("host: drain: %w", shutdownErr)
 	}
 	return nil
+}
+
+type ownedStore struct {
+	core.Store
+	once sync.Once
+	err  error
+}
+
+func (s *ownedStore) Close() error {
+	s.once.Do(func() { s.err = s.Store.Close() })
+	return s.err
 }
 
 func openStore(ctx context.Context, opts Options) (core.Store, error) {

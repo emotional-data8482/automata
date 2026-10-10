@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"sync"
+	"time"
 
 	"github.com/emotional-data8482/automata/core"
 )
@@ -53,12 +55,18 @@ func (s *Server) events(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, view)
 		return
 	}
+	// Validate the cursor before committing the SSE response headers.
+	if _, err := handle.Events(r.Context(), after, 1); err != nil {
+		writeRuntimeError(w, err)
+		return
+	}
 	stream, ok := s.openStream(w, r)
 	if !ok {
 		return
 	}
 	defer stream.close()
-	if snapshot.State == core.RuntimeTerminal && after >= snapshot.EventSequence {
+	terminal := snapshot.State == core.RuntimeTerminal
+	if terminal && after == snapshot.EventSequence {
 		stream.send("end", "", map[string]any{"run_id": runID, "state": snapshot.State})
 		return
 	}
@@ -74,12 +82,11 @@ func (s *Server) events(w http.ResponseWriter, r *http.Request) {
 			continue // heartbeat
 		}
 		events := page.(core.EventPage)
-		terminal := false
 		for _, event := range events.Events {
 			if !stream.send(string(event.Kind), strconv.FormatUint(event.Sequence, 10), s.eventView(event)) {
 				return
 			}
-			terminal = event.Kind == core.CommittedRunState && event.State == core.RuntimeTerminal
+			terminal = terminal || (event.Kind == core.CommittedRunState && event.State == core.RuntimeTerminal)
 		}
 		after = events.Next
 		if terminal && after >= events.Head {
@@ -157,23 +164,22 @@ func (s *Server) changes(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// sseStream writes server-sent events. Writes block on a slow client:
-// events are read from committed storage on demand, so a slow consumer
-// only falls behind and never buffers in the server or delays runs.
+// Each write, including the initial flush, is bounded even when the overall
+// stream has no duration limit. Slow clients reconnect from their cursor.
+const streamWriteTimeout = 30 * time.Second
+
 type sseStream struct {
-	server  *Server
-	w       http.ResponseWriter
-	flusher http.Flusher
-	ctx     context.Context
-	cancel  context.CancelFunc
+	server     *Server
+	w          http.ResponseWriter
+	controller *http.ResponseController
+	ctx        context.Context
+	cancel     context.CancelFunc
+	deadlineMu sync.Mutex
+	stopWrites func() bool
+	writesDone chan struct{}
 }
 
 func (s *Server) openStream(w http.ResponseWriter, r *http.Request) (*sseStream, bool) {
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		writeError(w, http.StatusNotImplemented, "streaming_unsupported", "the response writer cannot stream")
-		return nil, false
-	}
 	select {
 	case s.streams <- struct{}{}:
 	default:
@@ -188,16 +194,60 @@ func (s *Server) openStream(w http.ResponseWriter, r *http.Request) (*sseStream,
 	} else {
 		ctx, cancel = context.WithCancel(r.Context())
 	}
+	st := &sseStream{
+		server: s, w: w, controller: http.NewResponseController(w),
+		ctx: ctx, cancel: cancel, writesDone: make(chan struct{}),
+	}
+	// Context cancellation alone cannot interrupt a blocked socket write.
+	// Serialize deadline updates so cancellation cannot be overwritten by a
+	// writer that just started, and join this callback before returning.
+	st.stopWrites = context.AfterFunc(ctx, func() {
+		st.deadlineMu.Lock()
+		_ = st.controller.SetWriteDeadline(time.Now())
+		st.deadlineMu.Unlock()
+		close(st.writesDone)
+	})
+	if err := st.prepareWrite(); err != nil {
+		st.close()
+		if !isContextError(err) {
+			writeError(w, http.StatusNotImplemented, "streaming_unsupported", "the response writer must support write deadlines")
+		}
+		return nil, false
+	}
 	header := w.Header()
 	header.Set("Content-Type", "text/event-stream")
 	header.Set("Cache-Control", "no-cache")
 	header.Set("X-Accel-Buffering", "no")
 	w.WriteHeader(http.StatusOK)
-	flusher.Flush()
-	return &sseStream{server: s, w: w, flusher: flusher, ctx: ctx, cancel: cancel}, true
+	if err := st.controller.Flush(); err != nil {
+		st.close()
+		return nil, false
+	}
+	return st, true
+}
+
+func (st *sseStream) prepareWrite() error {
+	st.deadlineMu.Lock()
+	defer st.deadlineMu.Unlock()
+	if err := st.ctx.Err(); err != nil {
+		return err
+	}
+	deadline := time.Now().Add(streamWriteTimeout)
+	if end, ok := st.ctx.Deadline(); ok && end.Before(deadline) {
+		deadline = end
+	}
+	return st.controller.SetWriteDeadline(deadline)
 }
 
 func (st *sseStream) close() {
+	if !st.stopWrites() {
+		<-st.writesDone
+	}
+	if st.ctx.Err() == nil {
+		// Do not leave a cleanly completed stream's deadline on a keep-alive
+		// connection. A canceled stream keeps its expired deadline.
+		_ = st.controller.SetWriteDeadline(time.Time{})
+	}
 	st.cancel()
 	<-st.server.streams
 }
@@ -215,11 +265,13 @@ func (st *sseStream) wait(read func(context.Context) (any, error)) (any, error) 
 		return nil, st.ctx.Err()
 	}
 	if errors.Is(err, context.DeadlineExceeded) && ctx.Err() != nil {
+		if err := st.prepareWrite(); err != nil {
+			return nil, err
+		}
 		if _, werr := fmt.Fprint(st.w, ": heartbeat\n\n"); werr != nil {
 			return nil, werr
 		}
-		st.flusher.Flush()
-		return nil, nil
+		return nil, st.controller.Flush()
 	}
 	return nil, err
 }
@@ -227,6 +279,9 @@ func (st *sseStream) wait(read func(context.Context) (any, error)) (any, error) 
 func (st *sseStream) send(event, id string, data any) bool {
 	payload, err := json.Marshal(data)
 	if err != nil {
+		return false
+	}
+	if err := st.prepareWrite(); err != nil {
 		return false
 	}
 	if id != "" {
@@ -237,8 +292,7 @@ func (st *sseStream) send(event, id string, data any) bool {
 	if _, err := fmt.Fprintf(st.w, "event: %s\ndata: %s\n\n", event, payload); err != nil {
 		return false
 	}
-	st.flusher.Flush()
-	return true
+	return st.controller.Flush() == nil
 }
 
 // fail ends a stream with an error event, unless the client left or the

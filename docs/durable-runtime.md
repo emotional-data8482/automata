@@ -62,7 +62,9 @@ later run transitions.
   `RunStream` bounds only that API operation or view. Once admission commits,
   disconnecting it does not cancel the logical run.
 - `Runtime.Close` cancels its worker context and waits for execution to yield
-  before closing storage. An interrupted whole-loop segment is conservatively
+  and in-flight committed-run hooks (including host-command deliveries) to
+  finish before closing storage. Hook contexts retain their per-hook timeout;
+  closing the Runtime does not shorten it. An interrupted whole-loop segment is conservatively
   marked `RuntimeNeedsAttention` (`AttentionProvider` when a provider call was
   in flight); it is never automatically replayed.
 - `RunHandle.Cancel` is the logical cancellation command. A persisted deadline
@@ -114,7 +116,7 @@ for {
     for _, event := range page.Events {
         apply(event)
         if event.Kind == core.CommittedRunState && event.State == core.RuntimeTerminal {
-            return nil // no later commits follow a terminal state
+            return nil // execution finished; late reconciliation may append evidence
         }
     }
     cursor = page.Next
@@ -140,7 +142,10 @@ full result once, when the run is terminal or needs attention. After
 `Runtime.Close`, waiters stop waiting and return `ErrRuntimeClosed`; a run
 pruned by retention returns `ErrRunPruned`. `Snapshot`
 remains the authoritative full view, and its cost grows with the run's
-history.
+history. `RunHandle.Summary` reads only the compact record (the same view as
+`Runtime.Runs`), so a host can verify ownership and inspect status even when
+history is unavailable. It does not load transcripts, waits, tool payloads,
+or descendant accounting.
 
 ## Committed hooks
 
@@ -161,12 +166,19 @@ because an external effect may have happened without its outcome being stored.
 If it stops before the marker, no hook ran, so recovery invokes the currently
 configured hooks once and commits the terminal state.
 
-Hooks cover every terminal path except an acknowledged hook-attention run.
+Hooks cover every terminal path except an acknowledged hook-attention run
+or a cancellation whose committed history is unavailable. That cancellation
+finishes from the compact record without exposing fabricated history to hooks.
 Canceling a ready, waiting, or needs-attention run, a waiting deadline, and
 cancellation propagated to suspended descendants all pass through
 `RuntimeFinalizing` like an executed run. `Cancel` delivers the hooks of the
 runs it finalized, deepest descendant first, before it returns; a delivery that
-never starts is finished by the background driver or `Recover`.
+never starts is finished by the background driver or `Recover`. Repair waits
+for finalizing descendants before delivering ancestor hooks, including when
+a descendant hook outlasts the repair interval. If cancellation commits but
+its finalization wait is interrupted by the caller context or Runtime closure,
+`Cancel` may return an error without undoing the cancellation; an exact retry
+still resolves the persisted cancel receipt.
 
 A run in hook attention (`RunSnapshot.Attention.Kind == AttentionHooks`) also keeps a waiting
 durable parent blocked or its conversation busy. After checking whatever the
@@ -537,7 +549,8 @@ or billing ledger.
 
 Children are required: there is no detached mode. Canceling a run cancels every
 non-terminal descendant in the same commit, before any local worker is
-signaled. Suspended descendants become terminal at once. Running descendants
+signaled. Suspended descendants pass through finalizing and their committed-run
+hooks before becoming terminal. Running descendants
 move to `RuntimeCancelRequested` and cannot admit children or dispatch reserved
 tools; after a crash, recovery finishes their cancellation without dispatching
 anything. A child inherits its parent's deadline at admission. When a waiting

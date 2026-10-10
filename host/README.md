@@ -24,3 +24,5 @@ Unset options come from the environment: `AUTOMATA_ADDR` (default `:8080`),
 every request must present when `Options.Server.Authorize` is not set. The
 host refuses to start with neither. `GET /healthz` answers 204 once the host
 serves. Use `host.Run` to embed the same lifecycle under your own context.
+Failed startup closes the opened store exactly once, including invalid Runtime
+configuration, so an embedded host can retry without leaking SQLite ownership.

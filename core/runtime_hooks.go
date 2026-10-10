@@ -8,9 +8,41 @@ import (
 )
 
 func (r *Runtime) completeRunHooks(runID string) error {
+	// Host commands can deliver hooks without owning a worker goroutine.
+	// Close must still wait for those callbacks and their committed outcomes.
+	r.mu.Lock()
+	if r.closing || r.closed {
+		r.mu.Unlock()
+		return ErrRuntimeClosed
+	}
+	r.wg.Add(1)
+	r.mu.Unlock()
+	defer r.wg.Done()
+	// Repair and deadline finalizers may run concurrently with Cancel. Do
+	// not overtake a suspended descendant's outstanding hook delivery.
+	ready := false
+	err := r.transaction(context.Background(), false, func(tx StoreTransaction) error {
+		record, err := getRuntimeRun(tx, runID)
+		if err != nil || record.State != RuntimeFinalizing || len(record.HookDelivery) > 0 {
+			return err
+		}
+		pending, err := descendantHooksPending(tx, runID)
+		ready = !pending
+		if pending {
+			r.driver.schedule(runID, time.Now().Add(runtimeRepairDelay))
+		}
+		return err
+	})
+	if err != nil || !ready {
+		return err
+	}
 	// Committed-run hooks observe the record as committed, including its
-	// reassembled transcript.
+	// reassembled transcript. Cancellation remains an exit when that history
+	// is unavailable: terminalize from the compact record without hooks.
 	full, err := r.loadSnapshotRecord(context.Background(), runID)
+	if errors.Is(err, ErrPayloadUnavailable) {
+		return r.markPayloadAttention(context.Background(), runID, err)
+	}
 	if err != nil {
 		return err
 	}
@@ -21,6 +53,54 @@ func (r *Runtime) completeRunHooks(runID string) error {
 		}
 	}
 	return r.finishHooks(runID, r.invokeCommittedRunHooks(full))
+}
+
+// descendantHooksPending checks only compact records. Running descendants
+// may still settle after a canceled ancestor; suspended descendants already
+// in finalizing must finish their hooks first.
+func descendantHooksPending(tx StoreTransaction, runID string) (bool, error) {
+	queue := []string{runID}
+	for len(queue) > 0 {
+		children, err := linkedChildRunIDs(tx, queue[0])
+		if err != nil {
+			return false, err
+		}
+		queue = queue[1:]
+		for _, childID := range children {
+			child, err := getRuntimeRun(tx, childID)
+			if err != nil {
+				return false, err
+			}
+			if child.State == RuntimeFinalizing {
+				return true, nil
+			}
+			queue = append(queue, childID)
+		}
+	}
+	return false, nil
+}
+
+// waitRunFinalization waits for a delivery another finalizer may own, without
+// assembling history that may be unavailable. Cancellation itself is already
+// committed; ctx bounds only this wait.
+func (r *Runtime) waitRunFinalization(ctx context.Context, runID string) error {
+	sub := r.hub.subscribe(runID)
+	defer sub.close()
+	for {
+		view := sub.next()
+		record, err := r.compactRecord(ctx, runID)
+		if err != nil || record.State != RuntimeFinalizing {
+			return err
+		}
+		if view.closed {
+			return ErrRuntimeClosed
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-view.changed:
+		}
+	}
 }
 
 // startHookDelivery commits HookDelivery before any hook runs. Exactly one

@@ -37,4 +37,15 @@ removed answers `410 cursor_not_retained`; resynchronize from the run status.
 Content is redacted by default: status, events, and manifests carry only
 lifecycle facts until `ExposeContent` is set. Request bodies, concurrent
 streams, and stream duration are bounded by `MaxBodyBytes`, `MaxStreams`, and
-`MaxStreamDuration`.
+`MaxStreamDuration`. Every stream write (including the initial flush) has a
+30-second deadline, shortened to the remaining stream duration; cancellation
+interrupts blocked writes and releases the stream slot. Middleware wrapping a
+response writer must preserve write-deadline support, for example through an
+`Unwrap() http.ResponseWriter` method; otherwise streaming answers 501.
+
+Operator commands check tenant ownership from the compact run record, not its
+transcript, so damaged history cannot prevent cancellation, reconciliation,
+wait answers, or hook acknowledgement. A successful command whose full status
+cannot be read returns compact status with `history_unavailable: true`.
+Full status and event reads report `500 payload_unavailable` for damaged
+history. Neither path weakens tenant isolation.

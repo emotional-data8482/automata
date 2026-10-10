@@ -53,6 +53,17 @@ func (h *RunHandle) Snapshot(ctx context.Context) (RunSnapshot, error) {
 	return snapshot, nil
 }
 
+// Summary returns the compact committed view used by Runtime.Runs, without
+// reading transcripts, tool payloads, waits, or descendants. It remains usable
+// for ownership checks and operator commands when history is unavailable.
+func (h *RunHandle) Summary(ctx context.Context) (RunSummary, error) {
+	record, err := h.runtime.compactRecord(ctx, h.runID)
+	if err != nil {
+		return RunSummary{}, err
+	}
+	return h.runtime.runSummary(record), nil
+}
+
 // loadSnapshotRecord reads everything a host-facing snapshot shows in one read
 // transaction: the full record, tree accounting, and the event head. Execution
 // paths use loadRuntimeRun, which skips the tree walk.
@@ -334,7 +345,12 @@ func (h *RunHandle) Cancel(ctx context.Context) error {
 	// delivery leaves the run finalizing for the driver or Recover; the
 	// cancellation itself has committed.
 	for i := len(finalizing) - 1; i >= 0; i-- {
-		_ = h.runtime.completeRunHooks(finalizing[i])
+		if err := h.runtime.completeRunHooks(finalizing[i]); err != nil {
+			return err
+		}
+		if err := h.runtime.waitRunFinalization(ctx, finalizing[i]); err != nil {
+			return err
+		}
 	}
 	return nil
 }

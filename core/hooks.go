@@ -17,10 +17,11 @@ import (
 type PreSendHook func(context.Context, Request) (Request, error)
 
 // CommittedRunHook observes an execution result after Runtime has durably
-// committed it and before the run becomes terminal. Every terminal run reaches
-// hooks, including suspended runs and descendants finalized by cancellation or
-// a waiting deadline. Name identifies the hook
-// in persisted results. Timeout supplies each attempt's context deadline; zero
+// committed it and before the run becomes terminal, including suspended runs
+// and descendants finalized by cancellation or a waiting deadline. Cancellation
+// with unavailable history skips hooks rather than fabricating a snapshot, and
+// acknowledged interrupted deliveries are never repeated. Name identifies the
+// hook in persisted results. Timeout supplies each attempt's context deadline; zero
 // selects 30 seconds. Hook implementations must honor context cancellation.
 //
 // A hook error is recorded in RunSnapshot.Hooks. It never changes the

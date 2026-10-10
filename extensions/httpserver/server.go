@@ -187,16 +187,24 @@ func (s *Server) authorize(w http.ResponseWriter, r *http.Request, req Request) 
 	return scope, true
 }
 
-// runSnapshot loads a run the request's scope may see.
-func (s *Server) runSnapshot(ctx context.Context, scope, runID string) (core.RunSnapshot, error) {
-	snapshot, err := s.config.Runtime.Handle(runID).Snapshot(ctx)
+// runSummary verifies ownership without depending on readable history.
+func (s *Server) runSummary(ctx context.Context, scope, runID string) (core.RunSummary, error) {
+	summary, err := s.config.Runtime.Handle(runID).Summary(ctx)
 	if err != nil {
-		return snapshot, err
+		return summary, err
 	}
-	if s.config.Scope != nil && snapshot.Scope != scope {
-		return core.RunSnapshot{}, core.ErrRunNotFound
+	if s.config.Scope != nil && summary.Scope != scope {
+		return core.RunSummary{}, core.ErrRunNotFound
 	}
-	return snapshot, nil
+	return summary, nil
+}
+
+// runSnapshot checks ownership before assembling model and tool content.
+func (s *Server) runSnapshot(ctx context.Context, scope, runID string) (core.RunSnapshot, error) {
+	if _, err := s.runSummary(ctx, scope, runID); err != nil {
+		return core.RunSnapshot{}, err
+	}
+	return s.config.Runtime.Handle(runID).Snapshot(ctx)
 }
 
 func randomKey() string {
@@ -233,6 +241,8 @@ func writeRuntimeError(w http.ResponseWriter, err error) {
 		status, code = http.StatusConflict, "wait_conflict"
 	case errors.Is(err, core.ErrApprovalUnauthorized):
 		status, code = http.StatusForbidden, "approval_unauthorized"
+	case errors.Is(err, core.ErrPayloadUnavailable):
+		code = "payload_unavailable"
 	case errors.Is(err, core.ErrRuntimeClosed):
 		status, code = http.StatusServiceUnavailable, "unavailable"
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
@@ -241,6 +251,9 @@ func writeRuntimeError(w http.ResponseWriter, err error) {
 	message := err.Error()
 	if status == http.StatusInternalServerError {
 		message = "internal error"
+		if code == "payload_unavailable" {
+			message = core.ErrPayloadUnavailable.Error()
+		}
 	}
 	writeError(w, status, code, message)
 }

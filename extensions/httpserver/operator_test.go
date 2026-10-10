@@ -144,80 +144,93 @@ func (s *faultStore) Close() error { return nil }
 // acknowledging it over HTTP finishes the run without invoking the hook
 // again.
 func TestAcknowledgeInterruptedHooks(t *testing.T) {
-	store := &faultStore{Store: core.NewMemoryStore()}
-	var deliveries atomic.Int32
-	hooks := []core.CommittedRunHook{{Name: "audit", Handle: func(context.Context, core.RunSnapshot) error {
-		// The first delivery's process "stops" after the hook ran but before
-		// its outcome committed.
-		if deliveries.Add(1) == 1 {
-			store.armed.Store(true)
+	for _, damaged := range []bool{false, true} {
+		name := "readable"
+		if damaged {
+			name = "unavailable_history"
 		}
-		return nil
-	}}}
-	register := func(runtime *core.Runtime) {
-		agent, err := core.New(fakeProvider{}, core.AgentConfig{})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err := runtime.Register("agent", "v1", agent); err != nil {
-			t.Fatal(err)
-		}
-	}
-	first, err := core.NewRuntime(context.Background(), core.RuntimeConfig{Store: store, Hooks: hooks})
-	if err != nil {
-		t.Fatal(err)
-	}
-	register(first)
-	handle, err := first.Submit(context.Background(), core.DefinitionRef{ID: "agent", Revision: "v1"}, "hello")
-	if err != nil {
-		t.Fatal(err)
-	}
-	deadline := time.Now().Add(5 * time.Second)
-	for deliveries.Load() == 0 && time.Now().Before(deadline) {
-		time.Sleep(5 * time.Millisecond)
-	}
-	_ = first.Close()
-	store.armed.Store(false)
+		t.Run(name, func(t *testing.T) {
+			store := &faultStore{Store: core.NewMemoryStore()}
+			var deliveries atomic.Int32
+			hooks := []core.CommittedRunHook{{Name: "audit", Handle: func(context.Context, core.RunSnapshot) error {
+				// The first delivery's process "stops" after the hook ran but before
+				// its outcome committed.
+				if deliveries.Add(1) == 1 {
+					store.armed.Store(true)
+				}
+				return nil
+			}}}
+			register := func(runtime *core.Runtime) {
+				agent, err := core.New(fakeProvider{}, core.AgentConfig{})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := runtime.Register("agent", "v1", agent); err != nil {
+					t.Fatal(err)
+				}
+			}
+			first, err := core.NewRuntime(context.Background(), core.RuntimeConfig{Store: store, Hooks: hooks})
+			if err != nil {
+				t.Fatal(err)
+			}
+			register(first)
+			handle, err := first.Submit(context.Background(), core.DefinitionRef{ID: "agent", Revision: "v1"}, "hello")
+			if err != nil {
+				t.Fatal(err)
+			}
+			deadline := time.Now().Add(5 * time.Second)
+			for deliveries.Load() == 0 && time.Now().Before(deadline) {
+				time.Sleep(5 * time.Millisecond)
+			}
+			_ = first.Close()
+			store.armed.Store(false)
 
-	runtime, err := core.NewRuntime(context.Background(), core.RuntimeConfig{Store: store, Hooks: hooks})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = runtime.Close() })
-	register(runtime)
-	if err := runtime.Recover(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	server, err := New(Config{Runtime: runtime, Authorize: AllowAll})
-	if err != nil {
-		t.Fatal(err)
-	}
-	h := &harness{runtime: runtime, server: httptest.NewServer(server)}
-	t.Cleanup(h.server.Close)
+			runtime, err := core.NewRuntime(context.Background(), core.RuntimeConfig{Store: store, Hooks: hooks})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = runtime.Close() })
+			register(runtime)
+			if err := runtime.Recover(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			server, err := New(Config{Runtime: runtime, Authorize: AllowAll})
+			if err != nil {
+				t.Fatal(err)
+			}
+			h := &harness{runtime: runtime, server: httptest.NewServer(server)}
+			t.Cleanup(h.server.Close)
 
-	_, data := h.do(t, http.MethodGet, "/v1/runs/"+handle.ID(), nil, nil)
-	if status := decodeInto[RunView](t, data); status.Attention == nil || status.Attention.Kind != core.AttentionHooks {
-		t.Fatalf("status before acknowledgement = %s", data)
-	}
-	path := "/v1/runs/" + handle.ID() + "/hooks/acknowledge"
-	resp, data := h.do(t, http.MethodPost, path, nil, nil)
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("acknowledge = %d %s", resp.StatusCode, data)
-	}
-	status := decodeInto[RunView](t, data)
-	if status.State != core.RuntimeTerminal || len(status.Hooks) != 1 || !status.Hooks[0].Unknown {
-		t.Fatalf("acknowledged = %s", data)
-	}
-	if resp, _ := h.do(t, http.MethodPost, path, nil, nil); resp.StatusCode != http.StatusOK {
-		t.Fatalf("exact retry = %d", resp.StatusCode)
-	}
-	other := h.submitTo(t, "agent")
-	waitForState(t, runtime, other, core.RuntimeTerminal)
-	if resp, data := h.do(t, http.MethodPost, "/v1/runs/"+other+"/hooks/acknowledge", nil, nil); resp.StatusCode != http.StatusConflict || !strings.Contains(string(data), "not_awaiting_acknowledgement") {
-		t.Fatalf("acknowledge of a finished run = %d %s", resp.StatusCode, data)
-	}
-	if deliveries.Load() != 2 {
-		t.Fatalf("hook delivered %d times, want once per run", deliveries.Load())
+			_, data := h.do(t, http.MethodGet, "/v1/runs/"+handle.ID(), nil, nil)
+			if status := decodeInto[RunView](t, data); status.Attention == nil || status.Attention.Kind != core.AttentionHooks {
+				t.Fatalf("status before acknowledgement = %s", data)
+			}
+			if damaged {
+				removeHistory(t, store, handle.ID())
+			}
+			path := "/v1/runs/" + handle.ID() + "/hooks/acknowledge"
+			resp, data := h.do(t, http.MethodPost, path, nil, nil)
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("acknowledge = %d %s", resp.StatusCode, data)
+			}
+			status := decodeInto[RunView](t, data)
+			if status.State != core.RuntimeTerminal ||
+				(damaged && !status.HistoryUnavailable) ||
+				(!damaged && (len(status.Hooks) != 1 || !status.Hooks[0].Unknown)) {
+				t.Fatalf("acknowledged = %s", data)
+			}
+			if resp, _ := h.do(t, http.MethodPost, path, nil, nil); resp.StatusCode != http.StatusOK {
+				t.Fatalf("exact retry = %d", resp.StatusCode)
+			}
+			other := h.submitTo(t, "agent")
+			waitForState(t, runtime, other, core.RuntimeTerminal)
+			if resp, data := h.do(t, http.MethodPost, "/v1/runs/"+other+"/hooks/acknowledge", nil, nil); resp.StatusCode != http.StatusConflict || !strings.Contains(string(data), "not_awaiting_acknowledgement") {
+				t.Fatalf("acknowledge of a finished run = %d %s", resp.StatusCode, data)
+			}
+			if deliveries.Load() != 2 {
+				t.Fatalf("hook delivered %d times, want once per run", deliveries.Load())
+			}
+		})
 	}
 }
 

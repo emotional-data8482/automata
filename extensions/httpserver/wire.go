@@ -118,6 +118,9 @@ type RunView struct {
 	Uncertain     []OperationView      `json:"uncertain_operations,omitempty"`
 	Hooks         []core.RunHookResult `json:"hooks,omitempty"`
 	HistoryPruned bool                 `json:"history_pruned,omitempty"`
+	// HistoryUnavailable marks a successful operator response containing
+	// only compact status because history could not be read.
+	HistoryUnavailable bool `json:"history_unavailable,omitempty"`
 
 	Output           string          `json:"output,omitempty"`
 	StructuredOutput json.RawMessage `json:"structured_output,omitempty"`

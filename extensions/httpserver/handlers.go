@@ -41,6 +41,11 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ref := core.DefinitionRef{ID: body.Definition.ID, Revision: body.Definition.Revision}
+	scope, ok := s.authorize(w, r, Request{Action: ActionSubmit, Definition: ref})
+	if !ok {
+		return
+	}
+	requested := ref
 	if s.config.Resolve != nil {
 		resolved, err := s.config.Resolve(r.Context(), ref)
 		if err != nil {
@@ -57,9 +62,13 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 		badRequest(w, "task is required")
 		return
 	}
-	scope, ok := s.authorize(w, r, Request{Action: ActionSubmit, Definition: ref})
-	if !ok {
-		return
+	if ref != requested {
+		// A resolver may select another revision or definition. Authorize
+		// that binding too, rather than trusting the client's original name.
+		scope, ok = s.authorize(w, r, Request{Action: ActionSubmit, Definition: ref})
+		if !ok {
+			return
+		}
 	}
 	labels := maps.Clone(body.Labels)
 	if s.config.Labels != nil {
@@ -114,7 +123,7 @@ func isValidation(err error) bool {
 	for _, known := range []error{
 		core.ErrDefinitionNotRegistered, core.ErrAdmissionConflict, core.ErrConversationBusy,
 		core.ErrConversationConflict, core.ErrConversationBlocked, core.ErrConversationNotFound,
-		core.ErrRuntimeClosed, core.ErrRunPruned,
+		core.ErrRuntimeClosed, core.ErrRunPruned, core.ErrPayloadUnavailable,
 	} {
 		if errors.Is(err, known) {
 			return false
@@ -206,7 +215,7 @@ func (s *Server) cancel(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if _, err := s.runSnapshot(r.Context(), scope, runID); err != nil {
+	if _, err := s.runSummary(r.Context(), scope, runID); err != nil {
 		writeRuntimeError(w, err)
 		return
 	}
@@ -215,12 +224,7 @@ func (s *Server) cancel(w http.ResponseWriter, r *http.Request) {
 		writeRuntimeError(w, err)
 		return
 	}
-	snapshot, err := handle.Snapshot(r.Context())
-	if err != nil {
-		writeRuntimeError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, s.snapshotView(snapshot))
+	s.writeRun(w, r, handle)
 }
 
 func (s *Server) resolveWait(w http.ResponseWriter, r *http.Request) {
@@ -233,7 +237,7 @@ func (s *Server) resolveWait(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if _, err := s.runSnapshot(r.Context(), scope, runID); err != nil {
+	if _, err := s.runSummary(r.Context(), scope, runID); err != nil {
 		writeRuntimeError(w, err)
 		return
 	}
@@ -252,12 +256,7 @@ func (s *Server) resolveWait(w http.ResponseWriter, r *http.Request) {
 		writeRuntimeError(w, err)
 		return
 	}
-	snapshot, err := handle.Snapshot(r.Context())
-	if err != nil {
-		writeRuntimeError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, s.snapshotView(snapshot))
+	s.writeRun(w, r, handle)
 }
 
 func isWaitError(err error) bool {
@@ -337,7 +336,7 @@ func (s *Server) reconcile(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if _, err := s.runSnapshot(r.Context(), scope, runID); err != nil {
+	if _, err := s.runSummary(r.Context(), scope, runID); err != nil {
 		writeRuntimeError(w, err)
 		return
 	}
@@ -371,7 +370,7 @@ func (s *Server) acknowledgeHooks(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	snapshot, err := s.runSnapshot(r.Context(), scope, runID)
+	summary, err := s.runSummary(r.Context(), scope, runID)
 	if err != nil {
 		writeRuntimeError(w, err)
 		return
@@ -383,7 +382,7 @@ func (s *Server) acknowledgeHooks(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeError(w, http.StatusConflict, "not_awaiting_acknowledgement",
-			fmt.Sprintf("run is %s, not awaiting hook acknowledgement", snapshot.State))
+			fmt.Sprintf("run is %s, not awaiting hook acknowledgement", summary.State))
 		return
 	}
 	s.writeRun(w, r, handle)
@@ -391,6 +390,17 @@ func (s *Server) acknowledgeHooks(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) writeRun(w http.ResponseWriter, r *http.Request, handle *core.RunHandle) {
 	snapshot, err := handle.Snapshot(r.Context())
+	if errors.Is(err, core.ErrPayloadUnavailable) {
+		summary, readErr := handle.Summary(r.Context())
+		if readErr != nil {
+			writeRuntimeError(w, readErr)
+			return
+		}
+		view := s.summaryView(summary)
+		view.HistoryUnavailable = true
+		writeJSON(w, http.StatusOK, view)
+		return
+	}
 	if err != nil {
 		writeRuntimeError(w, err)
 		return

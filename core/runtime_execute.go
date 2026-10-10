@@ -39,10 +39,13 @@ func (r *Runtime) markPayloadAttention(ctx context.Context, runID string, cause 
 			return err
 		}
 		recordPayloadBlock(&record, cause)
-		if record.State == RuntimeCancelRequested {
+		if record.State == RuntimeCancelRequested ||
+			(record.State == RuntimeFinalizing && record.Result.Status == RunCancelled && len(record.HookDelivery) == 0) {
+			if record.State == RuntimeCancelRequested {
+				setRuntimeError(&record, context.Canceled)
+			}
 			record.Result.Status = RunCancelled
 			record.AttentionReason, record.AttentionKind = "", ""
-			setRuntimeError(&record, context.Canceled)
 			record.Result.Diagnostics = append(record.Result.Diagnostics, RunDiagnostic{Kind: "payload_error", Message: cause.Error()})
 			terminal = true
 		} else {
