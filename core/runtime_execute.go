@@ -267,6 +267,9 @@ func (r *Runtime) persistTransition(ctx context.Context, runID string, transitio
 			if err := commitPendingToolBatch(tx, &record); err != nil {
 				return err
 			}
+			if transition.Failure != nil {
+				setRuntimeError(&record, transition.Failure)
+			}
 		}
 		record.Result = cloneRunResult(transition.Result)
 		record.Result.Messages = nil
