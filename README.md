@@ -665,6 +665,61 @@ Examples that call a model need credentials; the others run offline.
   go run ./examples/deep_research "the impact of GLP-1 drugs on US healthcare costs"
   ```
 
+## Upgrading to v0.6
+
+v0.6 adds what a self-hosted platform needs on top of `Runtime`, and no
+existing API is removed.
+
+New:
+
+- **Run listing and labels.** `core.WithLabels` annotates a run at
+  admission; `Runtime.Runs(filter)` pages through runs by definition, scope,
+  state, attention, labels, and admission time.
+- **Change feed.** `Runtime.Changes` and `WaitChanges` read one global
+  cursor of committed run changes. `RetentionPolicy.HoldUnsynced` keeps
+  history until your consumer's `SyncedThrough` cursor has passed it.
+- **Manifests.** `Agent.Describe` and `Runtime.Describe` return a JSON
+  manifest of a definition for deploy checks and consoles.
+- **HTTP and host.** `extensions/httpserver` serves a `Runtime` over HTTP and
+  SSE, and the `host` module's `host.Main` runs a durable agent server.
+- **Testing kit.** `core/coretest` has a scripted provider and runtime
+  fixtures.
+- **Ergonomics.** `core.JSONResult`, the `enum` struct tag,
+  `core.StructuredOutputToolName`, `RunHandle.Child`,
+  `RunSnapshot.ToolCall` and `AppliedEffects`, and the `core.CurrentTime`
+  pre-send hook.
+
+Upgrade steps:
+
+1. **Back up the store.** Stop the process and copy the SQLite database (see
+   [storage upgrades](docs/durable-runtime.md#storage-upgrades-and-backups)).
+2. **Open it with v0.6.** The first `NewRuntime` on a version-9 store
+   upgrades it in place, in one transaction: every existing run enters the
+   run list, and each run gets one entry in the change feed so an exporter
+   sees it. The store is then version 10.
+3. **Do not roll back without the backup.** Releases before v0.6 refuse a
+   version-10 store. Restore the backup to roll back.
+
+Behavior changes to expect:
+
+- **Tool argument decoding.** Arguments that pass the schema but cannot
+  decode into a `Func` parameter (an integer overflowing its field) return a
+  recoverable error result instead of failing the run. Integral numbers such
+  as `2.0` now decode into Go integer fields.
+- **Streaming tool calls without arguments** receive `{}`, as on the
+  non-streaming path.
+- **`tools.WriteFile`** deduplicates only identical retries (same path and
+  content), so a run can revise a file. Pre-write failures report
+  `EffectNotApplied`.
+- **Recovery.** A run stopped by a graceful `Close` after its final answer
+  was committed is finished by `Recover`, as after a crash. A run whose
+  structured-output corrections ran out stays failed across a crash.
+- **Effect guards.** Reconcile and late tool completions change a semantic
+  guard only while their operation still owns it.
+- **Wrapped policies.** An invalid wait or effect policy under
+  `WithToolRetry`, `WithLegacyToolErrors`, or `WithToolEffectPolicy` is now
+  rejected by `core.New`.
+
 ## Upgrading from v0.4
 
 This release makes `Runtime` the only way to run an agent. The direct entry
@@ -701,11 +756,8 @@ Behavior changes to expect:
 - **Nesting.** A tool that runs another agent inside itself is not part of
   the parent's durable run. Use `ChildTool` for composition.
 - **Storage.** v0.5.0 is the first released Runtime version, using encoding 9.
-  Earlier pre-release stores are rejected, not migrated. v0.6.0 raises the
-  store version to 10 the first time it opens a version-9 store: it indexes
-  every existing run for `Runtime.Runs` and records one change per run in the
-  change feed. Releases before v0.6.0 refuse a version-10 store, so take a
-  backup before upgrading if you may need to roll back. See
+  Earlier pre-release stores are rejected, not migrated. See
+  [Upgrading to v0.6](#upgrading-to-v06) for the version-10 store upgrade. See
   [storage upgrades](docs/durable-runtime.md#storage-upgrades-and-backups).
 
 ## Agent skill

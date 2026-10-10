@@ -725,13 +725,19 @@ path when they cannot.
 
 ## Storage upgrades and backups
 
-The store records its encoding version (currently 9). A build opens only
-stores of its own version and rejects others at `NewRuntime`, without
-rewriting them, so a failed upgrade never damages data. v0.5.0 is the first
-released `Runtime` version and uses encoding 9; earlier pre-release stores
-must be drained (every run terminal) and discarded. A future encoding
-change will ship with an explicit migration tool and its own version; the
-runtime will never migrate implicitly.
+The store records its storage version (currently 10). Records keep
+encoding 9; version 10 adds the run list index, the change feed, and the
+admission clock. v0.5 wrote version 9. v0.6 upgrades a version-9 store in
+place the first time `NewRuntime` opens it, in one transaction: every run
+enters the run list, the admission clock starts after the latest admission,
+and every run without a change-feed entry gets one, so an exporter sees it
+and `HoldUnsynced` retention holds it until synced. The version then becomes
+10, which v0.5 refuses, so an older binary can never write runs the indexes
+miss; roll back by restoring a backup taken before the upgrade. Any other
+version is rejected at `NewRuntime` without being rewritten. v0.5.0 is the
+first released `Runtime` version; earlier pre-release stores must be
+drained (every run terminal) and discarded. A future record encoding change
+will ship with an explicit migration tool and its own version.
 
 Back up a SQLite store with the runtime closed (`Runtime.Close`, then copy
 the database file together with its `-wal` file), or while it is open with
