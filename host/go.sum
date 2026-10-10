@@ -1,7 +1,11 @@
 github.com/dustin/go-humanize v1.0.1 h1:GzkhY7T5VNhEkwH0PVJgjz+fX1rhBrR7pRT3mDkpeCY=
 github.com/dustin/go-humanize v1.0.1/go.mod h1:Mu1zIs6XwVuF/gI1OepvI0qD18qycQx+mFykh5fBlto=
-github.com/emotional-data8482/automata v0.5.2 h1:QV2jH9Tu9IQyM7bHmYvRpWPSU3U3nBmJFpEQ0E6RGKk=
-github.com/emotional-data8482/automata v0.5.2/go.mod h1:cdZWiuUvSP4zSH85Md2TE3ASj2SUy4yt29TOfSHE/K8=
+github.com/emotional-data8482/automata v0.6.0 h1:HNkHjPQ5P48F9tpSi3gJd0B9iXQ1KS6uNcjLGwvALVU=
+github.com/emotional-data8482/automata v0.6.0/go.mod h1:cdZWiuUvSP4zSH85Md2TE3ASj2SUy4yt29TOfSHE/K8=
+github.com/emotional-data8482/automata/extensions/httpserver v0.6.0 h1:aytzsiirmDq/hv2UkC4UFcCqPhjL7WBgcLYI/PUcvjE=
+github.com/emotional-data8482/automata/extensions/httpserver v0.6.0/go.mod h1:aid1m7j2+6vLNcOKWrDgVRyWvCKcprx1yLTXCUM3Etc=
+github.com/emotional-data8482/automata/extensions/sqlite v0.5.3 h1:+gxwL2jfNNM9oWAP6NZ6Rrq4rbrvg6c8LgAPl+QPP4k=
+github.com/emotional-data8482/automata/extensions/sqlite v0.5.3/go.mod h1:WAXU8tukXgkIXpubphOCYKo3Rv5nltriqViH7ctAqtk=
 github.com/google/pprof v0.0.0-20250317173921-a4b03ec1a45e h1:ijClszYn+mADRFY17kjQEVQ1XRhq2/JR1M3sGqeJoxs=
 github.com/google/pprof v0.0.0-20250317173921-a4b03ec1a45e/go.mod h1:boTsfXsheKC2y+lKOCMpSfarhxDeIzfZG1jqGcPl3cA=
 github.com/google/uuid v1.6.0 h1:NIvaJDMOsjHA8n1jAhLSgzrAzy1Hgr+hNrb57e+94F0=
