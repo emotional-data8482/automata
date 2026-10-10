@@ -2,4 +2,4 @@ module github.com/emotional-data8482/automata/extensions/httpserver
 
 go 1.26.2
 
-require github.com/emotional-data8482/automata v0.5.3
+require github.com/emotional-data8482/automata v0.6.0
