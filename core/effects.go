@@ -99,8 +99,7 @@ type effectPolicyTool struct {
 
 func (t *effectPolicyTool) toolEffectPolicy() ToolEffectPolicy { return t.policy }
 func (t *effectPolicyTool) durableWaitPolicy() DurableWaitPolicy {
-	policy, _, _ := waitPolicyFor(t.Tool)
-	return policy
+	return declaredWaitPolicy(t.Tool)
 }
 
 // WithToolEffectPolicy attaches an explicit durable effect contract to a Tool.
@@ -113,11 +112,17 @@ type toolEffectPolicyProvider interface {
 	toolEffectPolicy() ToolEffectPolicy
 }
 
-func effectPolicyFor(tool Tool) (ToolEffectPolicy, error) {
-	policy := ToolEffectPolicy{Kind: ToolEffectLegacy}
+// declaredEffectPolicy returns the effect policy a tool declares, unvalidated,
+// so wrappers forward the innermost policy and its validation error.
+func declaredEffectPolicy(tool Tool) ToolEffectPolicy {
 	if provider, ok := tool.(toolEffectPolicyProvider); ok {
-		policy = provider.toolEffectPolicy()
+		return provider.toolEffectPolicy()
 	}
+	return ToolEffectPolicy{Kind: ToolEffectLegacy}
+}
+
+func effectPolicyFor(tool Tool) (ToolEffectPolicy, error) {
+	policy := declaredEffectPolicy(tool)
 	switch policy.Kind {
 	case ToolEffectLegacy, ToolEffectReadOnly, ToolEffectMutating:
 	default:
@@ -186,6 +191,34 @@ type ToolBatchSnapshot struct {
 	Ordinal     int
 	Committed   bool
 	Invocations []ToolInvocationSnapshot
+}
+
+// ToolCall returns the invocation of the model tool call with ID callID, from
+// the latest batch that holds it.
+func (s RunSnapshot) ToolCall(callID string) (ToolInvocationSnapshot, bool) {
+	for i := len(s.ToolBatches) - 1; i >= 0; i-- {
+		for _, invocation := range s.ToolBatches[i].Invocations {
+			if invocation.Call.ID == callID {
+				return invocation, true
+			}
+		}
+	}
+	return ToolInvocationSnapshot{}, false
+}
+
+// AppliedEffects returns the effect reports of the invocations that applied
+// an external effect, in batch and model order. A non-empty tool limits them
+// to that tool's calls. Each report carries the tool's receipt.
+func (s RunSnapshot) AppliedEffects(tool string) []EffectReport {
+	var out []EffectReport
+	for _, batch := range s.ToolBatches {
+		for _, invocation := range batch.Invocations {
+			if invocation.Effect.Status == EffectApplied && (tool == "" || invocation.Call.Name == tool) {
+				out = append(out, invocation.Effect)
+			}
+		}
+	}
+	return out
 }
 
 // EffectResolution is an authoritative reconciliation of an uncertain

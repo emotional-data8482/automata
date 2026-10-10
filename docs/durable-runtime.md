@@ -62,9 +62,13 @@ later run transitions.
   `RunStream` bounds only that API operation or view. Once admission commits,
   disconnecting it does not cancel the logical run.
 - `Runtime.Close` cancels its worker context and waits for execution to yield
-  before closing storage. An interrupted whole-loop segment is conservatively
+  and in-flight committed-run hooks (including host-command deliveries) to
+  finish before closing storage. Hook contexts retain their per-hook timeout;
+  closing the Runtime does not shorten it. An interrupted whole-loop segment is conservatively
   marked `RuntimeNeedsAttention` (`AttentionProvider` when a provider call was
-  in flight); it is never automatically replayed.
+  in flight); it is never automatically replayed. `Recover` finishes one whose
+  final provider answer was already committed, exactly as after a crash at the
+  same point, because finishing it repeats no provider call or tool.
 - `RunHandle.Cancel` is the logical cancellation command. A persisted deadline
   (`WithDeadline`) has the same logical ownership. Both reach every required
   durable child (see [Durable children](#durable-children)).
@@ -114,7 +118,7 @@ for {
     for _, event := range page.Events {
         apply(event)
         if event.Kind == core.CommittedRunState && event.State == core.RuntimeTerminal {
-            return nil // no later commits follow a terminal state
+            return nil // execution finished; late reconciliation may append evidence
         }
     }
     cursor = page.Next
@@ -140,7 +144,10 @@ full result once, when the run is terminal or needs attention. After
 `Runtime.Close`, waiters stop waiting and return `ErrRuntimeClosed`; a run
 pruned by retention returns `ErrRunPruned`. `Snapshot`
 remains the authoritative full view, and its cost grows with the run's
-history.
+history. `RunHandle.Summary` reads only the compact record (the same view as
+`Runtime.Runs`), so a host can verify ownership and inspect status even when
+history is unavailable. It does not load transcripts, waits, tool payloads,
+or descendant accounting.
 
 ## Committed hooks
 
@@ -161,6 +168,20 @@ because an external effect may have happened without its outcome being stored.
 If it stops before the marker, no hook ran, so recovery invokes the currently
 configured hooks once and commits the terminal state.
 
+Hooks cover every terminal path except an acknowledged hook-attention run
+or a cancellation whose committed history is unavailable. That cancellation
+finishes from the compact record without exposing fabricated history to hooks.
+Canceling a ready, waiting, or needs-attention run, a waiting deadline, and
+cancellation propagated to suspended descendants all pass through
+`RuntimeFinalizing` like an executed run. `Cancel` delivers the hooks of the
+runs it finalized, deepest descendant first, before it returns; a delivery that
+never starts is finished by the background driver or `Recover`. Repair waits
+for finalizing descendants before delivering ancestor hooks, including when
+a descendant hook outlasts the repair interval. If cancellation commits but
+its finalization wait is interrupted by the caller context or Runtime closure,
+`Cancel` may return an error without undoing the cancellation; an exact retry
+still resolves the persisted cancel receipt.
+
 A run in hook attention (`RunSnapshot.Attention.Kind == AttentionHooks`) also keeps a waiting
 durable parent blocked or its conversation busy. After checking whatever the
 interrupted hooks might have done, the host calls `handle.AcknowledgeHooks(ctx)`.
@@ -178,8 +199,9 @@ The provider-neutral `core.Store` contract is a small atomic transaction port:
 Core owns bucket names and versioned encodings; adapters own database details
 and must pass `core/storetest`. `extensions/sqlite` is the supported local
 adapter and keeps its driver out of the root module. It enforces one local
-owner with an OS advisory lock. Storage encoding version 9 is current; stores
-written by an earlier version are rejected without being rewritten.
+owner with an OS advisory lock. Records use encoding 9; the current store
+version is 10. See [Storage upgrades and backups](#storage-upgrades-and-backups)
+for the transactional version-9 store upgrade and rollback requirements.
 
 On recovery, admitted-but-unstarted work can run after its exact binding is
 registered. Accepted provider turns and durable tool batches resume from their
@@ -314,9 +336,12 @@ when a tool reports uncertainty: late reconciliation retains the evidence but
 never resumes the canceled run.
 
 `tools.ReadFile` is a representative read-only binding. `tools.WriteFile` is a
-mutating binding with a content-digest receipt and sandbox-root/path semantic
-guard. Custom legacy bindings should be deliberately wrapped as read-only or
-mutating before relying on restart recovery.
+mutating binding with a content-digest receipt. It has no permanent semantic
+guard: a new model call can intentionally restore earlier file content. Exact
+admission retries and committed invocation outcomes prevent replay, while a
+write interrupted after dispatch still requires reconciliation. Custom legacy
+bindings should be deliberately wrapped as read-only or mutating before
+relying on restart recovery.
 
 ## Durable questions and approvals
 
@@ -530,7 +555,8 @@ or billing ledger.
 
 Children are required: there is no detached mode. Canceling a run cancels every
 non-terminal descendant in the same commit, before any local worker is
-signaled. Suspended descendants become terminal at once. Running descendants
+signaled. Suspended descendants pass through finalizing and their committed-run
+hooks before becoming terminal. Running descendants
 move to `RuntimeCancelRequested` and cannot admit children or dispatch reserved
 tools; after a crash, recovery finishes their cancellation without dispatching
 anything. A child inherits its parent's deadline at admission. When a waiting
@@ -703,13 +729,19 @@ path when they cannot.
 
 ## Storage upgrades and backups
 
-The store records its encoding version (currently 9). A build opens only
-stores of its own version and rejects others at `NewRuntime`, without
-rewriting them, so a failed upgrade never damages data. v0.5.0 is the first
-released `Runtime` version and uses encoding 9; earlier pre-release stores
-must be drained (every run terminal) and discarded. A future encoding
-change will ship with an explicit migration tool and its own version; the
-runtime will never migrate implicitly.
+The store records its storage version (currently 10). Records keep
+encoding 9; version 10 adds the run list index, the change feed, and the
+admission clock. v0.5 wrote version 9. v0.6 upgrades a version-9 store in
+place the first time `NewRuntime` opens it, in one transaction: every run
+enters the run list, the admission clock starts after the latest admission,
+and every run without a change-feed entry gets one, so an exporter sees it
+and `HoldUnsynced` retention holds it until synced. The version then becomes
+10, which v0.5 refuses, so an older binary can never write runs the indexes
+miss; roll back by restoring a backup taken before the upgrade. Any other
+version is rejected at `NewRuntime` without being rewritten. v0.5.0 is the
+first released `Runtime` version; earlier pre-release stores must be
+drained (every run terminal) and discarded. A future record encoding change
+will ship with an explicit migration tool and its own version.
 
 Back up a SQLite store with the runtime closed (`Runtime.Close`, then copy
 the database file together with its `-wal` file), or while it is open with

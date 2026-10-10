@@ -211,3 +211,32 @@ func systemPrefixLen(messages []Message) int {
 	}
 	return n
 }
+
+// Usage on the last assistant message describes the request actually sent,
+// which a previous compaction made small. The canonical history must still
+// trigger compaction on the next turn, and messages after that usage (a large
+// tool result) must count (bug review E2).
+func TestCompactorEstimatesCanonicalHistoryNotCompactedUsage(t *testing.T) {
+	msgs := []Message{SystemMessage("sys")}
+	for range 10 {
+		msgs = append(msgs, UserMessage(bigText(2000)), asstText(bigText(2000)))
+	}
+	msgs = append(msgs, UserMessage("next"), withUsage(asstText("small reply"), &Usage{InputTokens: 50, OutputTokens: 5}))
+	sum := &countingSummarizer{reply: "SUMMARY"}
+	hook := Compactor(sum, CompactorConfig{TriggerTokens: 5000, KeepRecent: 2})
+	for turn := 1; turn <= 2; turn++ {
+		req, err := hook(context.Background(), Request{Messages: msgs})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(req.Messages) >= len(msgs) {
+			t.Fatalf("turn %d sent %d of %d messages; want compaction", turn, len(req.Messages), len(msgs))
+		}
+		msgs = append(msgs, UserMessage("again"), withUsage(asstText("ok"), &Usage{InputTokens: 60, OutputTokens: 5}))
+	}
+
+	tail := []Message{withUsage(asstText("hi"), &Usage{InputTokens: 100}), UserMessage(bigText(4000))}
+	if got := estimateTokens(tail); got < 1100 {
+		t.Fatalf("estimate with a large message after usage = %d, want it counted", got)
+	}
+}

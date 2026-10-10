@@ -2,6 +2,7 @@ package claude
 
 import (
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -261,5 +262,27 @@ func TestConvertMessagesToolResultMixedError(t *testing.T) {
 	}
 	if !strings.Contains(s, "failed:") || !strings.Contains(s, `"type":"image"`) {
 		t.Errorf("mixed error tool result lost content\n got: %s", s)
+	}
+}
+
+// Tool schemas keep every root keyword, so $defs references resolve and
+// additionalProperties:false reaches the model (bug review P2).
+func TestConvertToolsKeepsRootSchemaKeywords(t *testing.T) {
+	schema := json.RawMessage(`{"type":"object","properties":{"item":{"$ref":"#/$defs/item"}},"required":["item"],"additionalProperties":false,"$defs":{"item":{"type":"string"}}}`)
+	tools := convertTools([]core.ToolDefinition{{Name: "add", Description: "add an item", InputSchema: schema}})
+	data, err := json.Marshal(tools[0].OfTool.InputSchema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatal(err)
+	}
+	var want map[string]any
+	if err := json.Unmarshal(schema, &want); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("sent schema = %s, want %s", data, schema)
 	}
 }

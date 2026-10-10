@@ -340,8 +340,9 @@ func TestRuntimeCancelReceiptSurvivesLaterCommits(t *testing.T) {
 	if err := handle.Cancel(context.Background()); err != nil {
 		t.Fatalf("cancel retry did not resolve its receipt: %v", err)
 	}
+	// Generation 2 is the cancellation, 3 the terminal commit after hooks.
 	record := getRecord(t, base, runID)
-	if record.State != RuntimeRunning || record.Result.Status != RunCancelled || record.Generation != 2 {
+	if record.State != RuntimeRunning || record.Result.Status != RunCancelled || record.Generation != 3 {
 		t.Fatalf("retry re-derived state instead of resolving its receipt: %#v", record)
 	}
 }
@@ -366,7 +367,9 @@ func TestRuntimeTransactionFaultsPreserveEvidenceAndRecover(t *testing.T) {
 		// called: the run needs attention, and recovery resumes it safely.
 		{failAt: 4, recordState: RuntimeNeedsAttention, recoveredState: RuntimeTerminal},
 		{failAt: 5, recordState: RuntimeNeedsAttention, recoveredState: RuntimeNeedsAttention},
-		{failAt: 6, recordState: RuntimeNeedsAttention, recoveredState: RuntimeNeedsAttention},
+		// The final answer was accepted before the fault: recovery finishes it
+		// from the saved answer without calling the provider again.
+		{failAt: 6, recordState: RuntimeNeedsAttention, recoveredState: RuntimeTerminal},
 		// A classified final response is a safe continuation boundary in v3.
 		{failAt: 7, recordState: RuntimeRunning, recoveredState: RuntimeTerminal},
 		// No hook is configured, so none can have been delivered: recovery

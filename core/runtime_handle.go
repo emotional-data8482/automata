@@ -53,6 +53,17 @@ func (h *RunHandle) Snapshot(ctx context.Context) (RunSnapshot, error) {
 	return snapshot, nil
 }
 
+// Summary returns the compact committed view used by Runtime.Runs, without
+// reading transcripts, tool payloads, waits, or descendants. It remains usable
+// for ownership checks and operator commands when history is unavailable.
+func (h *RunHandle) Summary(ctx context.Context) (RunSummary, error) {
+	record, err := h.runtime.compactRecord(ctx, h.runID)
+	if err != nil {
+		return RunSummary{}, err
+	}
+	return h.runtime.runSummary(record), nil
+}
+
 // loadSnapshotRecord reads everything a host-facing snapshot shows in one read
 // transaction: the full record, tree accounting, and the event head. Execution
 // paths use loadRuntimeRun, which skips the tree walk.
@@ -110,8 +121,14 @@ func (h *RunHandle) follow(ctx context.Context, events <-chan runtimeStreamItem,
 		}
 		if read || view.gone || view.closed || mayHaveSettled(view.state) {
 			_, settled, err := h.settledState(ctx)
-			if err != nil || settled {
+			if err != nil {
 				return err
+			}
+			if settled {
+				// The run published these events before it settled; deliver
+				// what is already buffered instead of dropping it.
+				drainLiveEvents(events, onEvent)
+				return nil
 			}
 			if view.closed {
 				return ErrRuntimeClosed
@@ -134,6 +151,24 @@ func (h *RunHandle) follow(ctx context.Context, events <-chan runtimeStreamItem,
 			case <-changed:
 				break wait
 			}
+		}
+	}
+}
+
+// drainLiveEvents delivers the events already buffered for a view, up to its
+// terminal marker, without waiting for more.
+func drainLiveEvents(events <-chan runtimeStreamItem, onEvent func(StreamEvent)) {
+	for {
+		select {
+		case item := <-events:
+			if item.terminal {
+				return
+			}
+			if onEvent != nil {
+				onEvent(item.event)
+			}
+		default:
+			return
 		}
 	}
 }
@@ -221,13 +256,16 @@ func resultWithRunID(result RunResult, runID string) RunResult {
 }
 
 // Cancel durably cancels the run and every non-terminal descendant in one
-// commit. A suspended run becomes terminal at once; a running one stops
-// dispatching and finishes as canceled. An exact retry returns the original
-// outcome, even after a lost acknowledgement or later transitions.
+// commit. A suspended run finishes as canceled before Cancel returns, after
+// its committed-run hooks (and those of its suspended descendants) run; a
+// running one stops dispatching and finishes as canceled. An exact retry
+// returns the original outcome, even after a lost acknowledgement or later
+// transitions.
 func (h *RunHandle) Cancel(ctx context.Context) error {
 	var cancels []context.CancelFunc
-	var canceledChild, parentRunID string
+	var finalizing []string
 	err := h.runtime.transaction(ctx, true, func(tx StoreTransaction) error {
+		finalizing = finalizing[:0]
 		// Resolve an exact retry from the persisted receipt before touching
 		// current state: a lost acknowledgement followed by any later command
 		// still resolves the original outcome without re-deriving state.
@@ -256,31 +294,28 @@ func (h *RunHandle) Cancel(ctx context.Context) error {
 		case RuntimeFinalizing, RuntimeTerminal:
 			return nil
 		case RuntimeReady, RuntimeWaiting, RuntimeNeedsAttention:
-			record.Result.Status = RunCancelled
-			record.AttentionReason = ""
-			record.AttentionKind = ""
 			setRuntimeError(&record, context.Canceled)
-			if record.ParentRunID != "" {
-				canceledChild, parentRunID = h.runID, record.ParentRunID
+			hooks, err := finalizeCanceledTx(tx, &record)
+			if err != nil {
+				return err
+			}
+			if hooks {
+				finalizing = append(finalizing, h.runID)
 			}
 		case RuntimeRunning:
 			record.State = RuntimeCancelRequested
-		}
-		record.Generation++
-		if receipt.ObservedState == RuntimeReady || receipt.ObservedState == RuntimeWaiting || receipt.ObservedState == RuntimeNeedsAttention {
-			err = commitTerminalTx(tx, &record)
-		} else {
-			err = putRuntimeRun(tx, record)
-		}
-		if err != nil {
-			return err
+			record.Generation++
+			if err := putRuntimeRun(tx, record); err != nil {
+				return err
+			}
 		}
 		// Required descendants are canceled in this same commit, before any
 		// local worker is signaled.
-		running, err := propagateCancellationTx(tx, h.runID, context.Canceled)
+		running, descendants, err := propagateCancellationTx(tx, h.runID, context.Canceled)
 		if err != nil {
 			return err
 		}
+		finalizing = append(finalizing, descendants...)
 		data, err := json.Marshal(receipt)
 		if err != nil {
 			return err
@@ -298,16 +333,54 @@ func (h *RunHandle) Cancel(ctx context.Context) error {
 		h.runtime.mu.Unlock()
 		return nil
 	})
-	if err == nil {
-		for _, cancel := range cancels {
-			cancel()
+	if err != nil {
+		return err
+	}
+	for _, cancel := range cancels {
+		cancel()
+	}
+	// Deliver hooks deepest first, so each descendant is terminal before its
+	// ancestor. Finishing hooks commits the terminal state and notifies a
+	// waiting parent through the central child-completion boundary. A failed
+	// delivery leaves the run finalizing for the driver or Recover; the
+	// cancellation itself has committed.
+	for i := len(finalizing) - 1; i >= 0; i-- {
+		if err := h.runtime.completeRunHooks(finalizing[i]); err != nil {
+			return err
+		}
+		if err := h.runtime.waitRunFinalization(ctx, finalizing[i]); err != nil {
+			return err
 		}
 	}
-	if err == nil && canceledChild != "" {
-		// Cancellation durably terminalized a suspended child run; notify the
-		// parent through the same central child-completion boundary so the
-		// parent sees the model-visible cancellation outcome.
-		_ = h.runtime.afterRunDisposition(context.Background(), storedRuntimeRun{RunID: canceledChild, ParentRunID: parentRunID, State: RuntimeTerminal})
+	return nil
+}
+
+// Child returns a handle to the durable child run admitted for the model tool
+// call with ID callID, so a host can await or decode a child's result without
+// walking the parent's tool batches. It returns [ErrOperationNotFound] when
+// the run has no such call, or the call did not admit a child run.
+func (h *RunHandle) Child(ctx context.Context, callID string) (*RunHandle, error) {
+	childRunID := ""
+	err := h.runtime.transaction(ctx, false, func(tx StoreTransaction) error {
+		if _, err := getRuntimeRun(tx, h.runID); err != nil {
+			return err
+		}
+		return tx.Scan(runtimeInvocationsBucket, h.runID+"/", func(_ string, raw []byte) error {
+			var invocation storedToolInvocation
+			if err := json.Unmarshal(raw, &invocation); err != nil {
+				return err
+			}
+			if invocation.Call.ID == callID && invocation.ChildRunID != "" {
+				childRunID = invocation.ChildRunID
+			}
+			return nil
+		})
+	})
+	if err != nil {
+		return nil, err
 	}
-	return err
+	if childRunID == "" {
+		return nil, fmt.Errorf("%w: no child run for tool call %q", ErrOperationNotFound, callID)
+	}
+	return h.runtime.Handle(childRunID), nil
 }

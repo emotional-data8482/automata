@@ -72,8 +72,7 @@ type durableWaitTool struct {
 
 func (t *durableWaitTool) durableWaitPolicy() DurableWaitPolicy { return t.policy }
 func (t *durableWaitTool) toolEffectPolicy() ToolEffectPolicy {
-	policy, _ := effectPolicyFor(t.Tool)
-	return policy
+	return declaredEffectPolicy(t.Tool)
 }
 
 type durableWaitPolicyProvider interface {
@@ -89,12 +88,19 @@ func WithDurableWait(tool Tool, policy DurableWaitPolicy) Tool {
 	return &durableWaitTool{Tool: tool, policy: policy}
 }
 
-func waitPolicyFor(tool Tool) (DurableWaitPolicy, bool, error) {
-	provider, ok := tool.(durableWaitPolicyProvider)
-	if !ok {
-		return DurableWaitPolicy{}, false, nil
+// declaredWaitPolicy returns the wait policy a tool declares, unvalidated.
+// Wrappers forward it so that waitPolicyFor validates the innermost policy:
+// validating inside a wrapper would turn an invalid approval into a zero
+// policy, which reads as "no approval configured".
+func declaredWaitPolicy(tool Tool) DurableWaitPolicy {
+	if provider, ok := tool.(durableWaitPolicyProvider); ok {
+		return provider.durableWaitPolicy()
 	}
-	policy := provider.durableWaitPolicy()
+	return DurableWaitPolicy{}
+}
+
+func waitPolicyFor(tool Tool) (DurableWaitPolicy, bool, error) {
+	policy := declaredWaitPolicy(tool)
 	if policy.Kind == "" {
 		return DurableWaitPolicy{}, false, nil
 	}

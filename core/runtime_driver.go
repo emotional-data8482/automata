@@ -136,6 +136,12 @@ func (r *Runtime) observeCommits(commits []runCommit) {
 		if suspendedForDeadline(storedRuntimeRun{State: record.State, AttentionKind: record.AttentionKind}) && !record.Deadline.IsZero() {
 			r.driver.schedule(commit.runID, record.Deadline)
 		}
+		if record.State == RuntimeFinalizing && suspendedState(commit.previous) {
+			// Cancellation finalized a run no worker owns; its canceler
+			// delivers the hooks, and this repair finishes a delivery that
+			// never started.
+			r.driver.schedule(commit.runID, now.Add(runtimeRepairDelay))
+		}
 		if record.ParentRunID != "" && commit.previous != record.State &&
 			(record.State == RuntimeTerminal || record.State == RuntimeNeedsAttention) {
 			r.driver.schedule(record.ParentRunID, now.Add(runtimeRepairDelay))
@@ -163,6 +169,11 @@ func (r *Runtime) maintainRun(ctx context.Context, runID string) {
 	}
 	if record.State == RuntimeTerminal && record.ParentRunID != "" {
 		_ = r.wakeParentFromChild(ctx, runID)
+		return
+	}
+	if record.State == RuntimeFinalizing && len(record.HookDelivery) == 0 {
+		// A canceled suspended run whose hook delivery never started.
+		_ = r.goCompleteRunHooks(runID)
 		return
 	}
 	if !suspendedForDeadline(record) {
@@ -212,8 +223,12 @@ func (r *Runtime) maintainSuspended(ctx context.Context, record storedRuntimeRun
 		var err error
 		switch classifyRecovery(record, facts) {
 		case recoveryMaintainSuspended:
-			facts.deadlineFinalized, err = r.expireWaitingDeadline(ctx, record.RunID)
+			var descendants []string
+			facts.deadlineFinalized, descendants, err = r.expireWaitingDeadline(ctx, record.RunID)
 			facts.deadlineChecked = true
+			for i := len(descendants) - 1; i >= 0; i-- {
+				_ = completeHooks(descendants[i])
+			}
 		case recoveryFinishHooks:
 			return completeHooks(record.RunID)
 		case recoveryInspectChildren:
@@ -268,4 +283,9 @@ func (r *Runtime) armSuspended(ctx context.Context, runID string) error {
 		r.driver.schedule(runID, next)
 	}
 	return err
+}
+
+// suspendedState reports a state in which no worker owns the run.
+func suspendedState(state RuntimeState) bool {
+	return state == RuntimeReady || state == RuntimeWaiting || state == RuntimeNeedsAttention
 }

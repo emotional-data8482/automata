@@ -16,15 +16,41 @@ import (
 func convertTools(tools []core.ToolDefinition) []anthropic.ToolUnionParam {
 	out := make([]anthropic.ToolUnionParam, 0, len(tools))
 	for _, t := range tools {
-		var schema anthropic.ToolInputSchemaParam
-		_ = json.Unmarshal(t.InputSchema, &schema)
-		tp := anthropic.ToolParam{Name: t.Name, InputSchema: schema}
+		tp := anthropic.ToolParam{Name: t.Name, InputSchema: toolInputSchema(t.InputSchema)}
 		if t.Description != "" {
 			tp.Description = anthropic.String(t.Description)
 		}
 		out = append(out, anthropic.ToolUnionParam{OfTool: &tp})
 	}
 	return out
+}
+
+// toolInputSchema carries every root keyword ($defs, additionalProperties,
+// descriptions) to Anthropic. The SDK's typed fields hold only properties,
+// required, and type; everything else travels in ExtraFields.
+func toolInputSchema(raw json.RawMessage) anthropic.ToolInputSchemaParam {
+	var root map[string]any
+	if err := json.Unmarshal(raw, &root); err != nil {
+		return anthropic.ToolInputSchemaParam{}
+	}
+	var schema anthropic.ToolInputSchemaParam
+	if properties, ok := root["properties"]; ok {
+		schema.Properties = properties
+	}
+	if required, ok := root["required"].([]any); ok {
+		for _, name := range required {
+			if name, ok := name.(string); ok {
+				schema.Required = append(schema.Required, name)
+			}
+		}
+	}
+	delete(root, "properties")
+	delete(root, "required")
+	delete(root, "type")
+	if len(root) > 0 {
+		schema.ExtraFields = root
+	}
+	return schema
 }
 
 // redactedThinkingData is the shape core stores in a RawBlock for Anthropic's

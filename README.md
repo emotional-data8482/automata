@@ -28,7 +28,9 @@ It is built for agents inside web servers and job workers, not notebooks.
 | Module / package | What it is |
 | --- | --- |
 | `core` | `Agent` definitions, `Runtime`, tools, child agents, conversations, approvals, streaming, and the storage port |
+| `agents` | Typed shorthand over `core`: `Define[I, O]` builds and registers a definition, then runs it or exposes it as a child tool |
 | `core/storetest` | Conformance suite for `core.Store` adapters |
+| `core/coretest` | Test kit: a scripted provider (`NewProvider`, `NewStreamProvider`) that replays turns and records requests, plus `Runtime` fixtures |
 | `tools` (module) | First-party tools: `HTTPFetch`, `ReadFile`/`WriteFile` (sandboxed), `Shell` (allow-listed), `WebSearch`; `LoadAgentsMD` and `LoadSkills` for AGENTS.md instructions and Agent Skills |
 | `extensions/sqlite` (module) | The supported persistent store: one exclusive local owner, WAL, `synchronous=FULL` |
 | `extensions/claude` (module) | Anthropic provider; thinking, images, prompt caching, native structured output |
@@ -36,6 +38,8 @@ It is built for agents inside web servers and job workers, not notebooks.
 | `extensions/openrouter` (module) | OpenRouter Chat Completions provider (official SDK); text, reasoning, images, tools, and structured output |
 | `extensions/tavily` (module) | Tavily backend for `tools.WebSearch` |
 | `extensions/mcp` (module) | Model Context Protocol through the official Go SDK: `mcpclient` turns a server's tools into `core.Tool`s, `mcpserver` serves `core.Tool`s |
+| `extensions/httpserver` (module) | `net/http` and SSE API over a `Runtime`: admission, listing, status, resumable event and change streams, cancellation, wait answers, manifests |
+| `host` (module) | `host.Main`: opens the store, registers definitions, recovers, applies retention, and serves the HTTP API |
 | `retry`, `tracing` | Backoff policy and span interfaces used by core |
 | `examples/*` (modules) | Runnable demos (see [Examples](#examples)) |
 
@@ -166,6 +170,11 @@ fmt.Println(retry.ID() == handle.ID())
   ID to exactly one run. An exact retry, even after a lost response or a
   restart, returns the original run. A changed task, definition, deadline, or
   conversation returns `ErrAdmissionConflict`.
+- **Labels and listing.** `WithLabels` attaches bounded host annotations
+  (schedule, actor, request IDs) that are not part of admission identity and
+  are inherited by child runs. `Runtime.Runs` pages through runs in admission
+  order, filtered by definition, idempotency scope, state, attention kind,
+  labels, and admission time.
 - **Restart.** A new process opens the same store, registers the same
   definition revisions, and calls `Recover`. Admitted work starts, accepted
   turns and completed tool calls are not repeated, suspended runs keep
@@ -183,9 +192,11 @@ and the operations runbook.
 ## Tools
 
 `core.Func` derives a tool's JSON schema from a Go struct. Exported fields
-are properties, fields without `omitempty` are required, and a `desc` tag
-describes a field. `core.FuncResult` returns a `core.ToolResult` for rich
-content (text and image blocks):
+are properties, fields without `omitempty` are required, a `desc` tag
+describes a field, and an `enum:"approve,reject"` tag limits its values
+(each element's, for a slice). `core.FuncResult` returns a `core.ToolResult`
+for rich content (text and image blocks); `core.JSONResult(v)` returns `v`
+encoded as JSON text:
 
 ```go
 // Fragment
@@ -370,7 +381,7 @@ the run fails with an error that matches `core.ErrInvalidStructuredOutput`;
 `*core.InvalidStructuredOutputError`. Set `StructuredOutputConfig.Native` to
 use provider-native schema enforcement when the provider supports it (Claude
 `output_config`, OpenAI `response_format`). Other providers fall back to a
-hidden `automata_structured_output` tool. Schemas share one supported subset.
+hidden `automata_structured_output` tool (`core.StructuredOutputToolName`). Schemas share one supported subset.
 Unsupported assertion keywords such as `$ref`, `oneOf`, and `const` are
 rejected at `core.New`.
 
@@ -414,8 +425,41 @@ parent's call caps, deadline, and cancellation, are never retried
 implicitly, and keep their own transcripts, effects, and receipts. The
 child's task is the model's validated arguments as JSON, and the parent
 receives the child's structured output or final message. Read a child's
-typed output with `core.Decode` on the child run's snapshot
-(`ToolInvocationSnapshot.ChildRunID` links down).
+typed output from its run: `handle.Child(ctx, callID)` returns the child
+run's handle for a tool call, and `core.Decode` reads its awaited result.
+`RunSnapshot.ToolCall(callID)` returns any call's invocation, and
+`RunSnapshot.AppliedEffects(tool)` returns the receipts a tool reported.
+
+### Typed child agents
+
+The `agents` package states a definition's input and output types once.
+`agents.Define[I, O]` derives the output contract from `O` (or none when `O`
+is `string`), builds the agent, and registers it. The returned value exposes
+the definition as a child tool with an input schema from `I`, runs it directly,
+and decodes its results:
+
+```go
+// Fragment
+reviewer, err := agents.Define[ReviewRequest, ReviewVerdict](runtime, agents.Spec{
+	ID: "reviewer", Revision: "v1", Provider: provider,
+	Config: core.AgentConfig{SystemPrompt: "Review the named artifact."},
+})
+lead, err := agents.Register(runtime, agents.Spec{
+	ID: "lead", Revision: "v1", Provider: provider,
+	Config: core.AgentConfig{Tools: []core.Tool{
+		reviewer.Tool("review", "Ask the reviewer for a verdict on one artifact."),
+	}},
+})
+
+// Direct run: the task is the input as JSON, exactly as a child call sends it.
+verdict, result, err := reviewer.Run(ctx, runtime, ReviewRequest{Artifact: "report.md"})
+// A child run's result from its snapshot decodes the same way.
+verdict, err = reviewer.Output(childSnapshot.Result)
+```
+
+A derived contract allows `agents.DefaultMaxCorrections` correction turns;
+set `Config.StructuredOutput` without a `Schema` to choose `Native` or another
+budget.
 
 ## Conversations
 
@@ -567,6 +611,14 @@ for {
 transcript, tool batches and effects, waits, attention, failure, and
 accounting across child runs.
 
+A host that indexes or exports every run follows one runtime-wide cursor
+instead of one per run. `Runtime.WaitChanges(ctx, cursor, limit)` returns
+`RunChange` entries in commit order, each naming the run and the range of its
+committed events that commit appended; `core.WithChangeEvents()` attaches
+those events with their transcript messages. Set
+`RetentionPolicy.HoldUnsynced` and `SyncedThrough` to the cursor you have
+durably stored, and `Prune` never removes history you have not exported.
+
 ## Long conversations
 
 `core.Compactor` is a pre-send hook that summarizes older turns to stay
@@ -574,6 +626,12 @@ within a token budget. It keeps the system prompt and recent turns intact,
 never separates a tool call from its result, and only changes what is sent,
 never the committed transcript. The Claude provider's
 `WithConversationCache()` caches the message prefix.
+
+A model has no clock. `core.CurrentTime(nil)` is a pre-send hook that
+prefixes the latest user message with the current time. Within each Runtime
+worker segment, a canonical user message keeps its first stamp across tool
+turns, so prompt caches stay warm. New runs, resumed segments, and direct hook
+calls get fresh stamps; timestamps are a rendered hint, not a durable clock.
 
 ## Examples
 
@@ -608,6 +666,62 @@ Examples that call a model need credentials; the others run offline.
   go run ./examples/deep_research "the impact of GLP-1 drugs on US healthcare costs"
   ```
 
+## Upgrading to v0.6
+
+v0.6 adds what a self-hosted platform needs on top of `Runtime`, and no
+existing API is removed.
+
+New:
+
+- **Run listing and labels.** `core.WithLabels` annotates a run at
+  admission; `Runtime.Runs(filter)` pages through runs by definition, scope,
+  state, attention, labels, and admission time.
+- **Change feed.** `Runtime.Changes` and `WaitChanges` read one global
+  cursor of committed run changes. `RetentionPolicy.HoldUnsynced` keeps
+  history until your consumer's `SyncedThrough` cursor has passed it.
+- **Manifests.** `Agent.Describe` and `Runtime.Describe` return a JSON
+  manifest of a definition for deploy checks and consoles.
+- **HTTP and host.** `extensions/httpserver` serves a `Runtime` over HTTP and
+  SSE, and the `host` module's `host.Main` runs a durable agent server.
+- **Testing kit.** `core/coretest` has a scripted provider and runtime
+  fixtures.
+- **Ergonomics.** `core.JSONResult`, the `enum` struct tag,
+  `core.StructuredOutputToolName`, `RunHandle.Child`,
+  `RunSnapshot.ToolCall` and `AppliedEffects`, and the `core.CurrentTime`
+  pre-send hook.
+
+Upgrade steps:
+
+1. **Back up the store.** Stop the process and copy the SQLite database (see
+   [storage upgrades](docs/durable-runtime.md#storage-upgrades-and-backups)).
+2. **Open it with v0.6.** The first `NewRuntime` on a version-9 store
+   upgrades it in place, in one transaction: every existing run enters the
+   run list, and each run gets one entry in the change feed so an exporter
+   sees it. The store is then version 10.
+3. **Do not roll back without the backup.** Releases before v0.6 refuse a
+   version-10 store. Restore the backup to roll back.
+
+Behavior changes to expect:
+
+- **Tool argument decoding.** Arguments that pass the schema but cannot
+  decode into a `Func` parameter (an integer overflowing its field) return a
+  recoverable error result instead of failing the run. Integral numbers such
+  as `2.0` now decode into Go integer fields.
+- **Streaming tool calls without arguments** receive `{}`, as on the
+  non-streaming path.
+- **`tools.WriteFile`** allows every new model call to replace a file,
+  including restoring previous content. Durable admission retries and
+  committed tool outcomes prevent replay; there is no permanent path/content
+  semantic guard. Pre-write failures report `EffectNotApplied`.
+- **Recovery.** A run stopped by a graceful `Close` after its final answer
+  was committed is finished by `Recover`, as after a crash. A run whose
+  structured-output corrections ran out stays failed across a crash.
+- **Effect guards.** Reconcile and late tool completions change a semantic
+  guard only while their operation still owns it.
+- **Wrapped policies.** An invalid wait or effect policy under
+  `WithToolRetry`, `WithLegacyToolErrors`, or `WithToolEffectPolicy` is now
+  rejected by `core.New`.
+
 ## Upgrading from v0.4
 
 This release makes `Runtime` the only way to run an agent. The direct entry
@@ -620,7 +734,7 @@ points, which were process-local and lost on restart, are removed:
 | `agent.RunBackground(...)` | `rt.Submit(...)`, then `handle.Await(ctx)` |
 | `agent.NewSession()`, `ResumeSession`, `Session.Run` | `rt.Run(ctx, ref, task, core.WithConversation(thread, head))` |
 | `core.RunTyped[T]`, `RunSessionTyped[T]` | `AgentConfig.StructuredOutput{Schema: core.OutputSchema[T]()}`, then `core.Decode[T](result)` |
-| `core.AsTool[P]`, `AsToolFunc[P]` | `core.ChildTool[P](name, description, childRef)` (the child receives JSON) |
+| `core.AsTool[P]`, `AsToolFunc[P]` | `core.ChildTool[P](name, description, childRef)`, or `agents.Define[P, O](...)` then `.Tool(name, description)` (the child receives JSON) |
 | `core.DurableChildTool(def, DurableChildPolicy{...})` | `core.NewChildTool(def, ref)` |
 | `WithCallOptions`, `WithMaxTurns`, `WithToolPolicy`, `WithTools`, `WithMaxCorrectionTurns`, `WithNativeStructuredOutput` | Set them on `AgentConfig` and register a new revision. |
 | `AgentConfig.DefaultCallOptions` | `AgentConfig.CallOptions` |
@@ -645,6 +759,7 @@ Behavior changes to expect:
   the parent's durable run. Use `ChildTool` for composition.
 - **Storage.** v0.5.0 is the first released Runtime version, using encoding 9.
   Earlier pre-release stores are rejected, not migrated. See
+  [Upgrading to v0.6](#upgrading-to-v06) for the version-10 store upgrade. See
   [storage upgrades](docs/durable-runtime.md#storage-upgrades-and-backups).
 
 ## Agent skill

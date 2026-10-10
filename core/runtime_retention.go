@@ -50,6 +50,18 @@ type RetentionPolicy struct {
 	// them return ErrRunPruned. Child runs are deleted only with their root,
 	// and conversation turns are kept.
 	Runs time.Duration
+	// Changes removes runtime-wide change feed entries (see
+	// [Runtime.Changes]). Cursors inside the removed range return
+	// ErrEventGap.
+	Changes time.Duration
+	// HoldUnsynced makes every class wait on an external consumer of the
+	// change feed: a run whose latest change is after SyncedThrough keeps its
+	// events, history, and record, a run tree is deleted only when every run
+	// in it is synced, and change entries after SyncedThrough are kept. Set
+	// SyncedThrough to the change sequence the consumer has durably stored,
+	// so history is never deleted before it is exported.
+	HoldUnsynced  bool
+	SyncedThrough uint64
 	// Limit bounds how many runs each class prunes in one call. Zero selects
 	// 128. PruneReport.More reports that eligible runs remain.
 	Limit int
@@ -60,6 +72,8 @@ type PruneReport struct {
 	Events  int
 	History int
 	Runs    int
+	// Changes counts change feed entries removed.
+	Changes int
 	// Skipped counts runs left in place because a payload they hold is
 	// unavailable (see ErrPayloadUnavailable); they stay indexed.
 	Skipped int
@@ -90,7 +104,7 @@ func retentionIndexKey(at time.Time, runID string) string {
 // replay-safe or lose evidence a pending decision needs.
 func (r *Runtime) Prune(ctx context.Context, policy RetentionPolicy) (PruneReport, error) {
 	var report PruneReport
-	if policy.Events < 0 || policy.History < 0 || policy.Runs < 0 || policy.Limit < 0 {
+	if policy.Events < 0 || policy.History < 0 || policy.Runs < 0 || policy.Changes < 0 || policy.Limit < 0 {
 		return report, errors.New("retention ages and limit cannot be negative")
 	}
 	limit := policy.Limit
@@ -104,9 +118,9 @@ func (r *Runtime) Prune(ctx context.Context, policy RetentionPolicy) (PruneRepor
 		count  *int
 		apply  func(StoreTransaction, storedRuntimeRun) (pruneOutcome, error)
 	}{
-		{runtimeRetainEventsBucket, policy.Events, &report.Events, pruneRunEvents},
-		{runtimeRetainHistoryBucket, policy.History, &report.History, pruneRunHistory},
-		{runtimeRetainRunsBucket, policy.Runs, &report.Runs, pruneRunTree},
+		{runtimeRetainEventsBucket, policy.Events, &report.Events, policy.holdRun(pruneRunEvents, false)},
+		{runtimeRetainHistoryBucket, policy.History, &report.History, policy.holdRun(pruneRunHistory, false)},
+		{runtimeRetainRunsBucket, policy.Runs, &report.Runs, policy.holdRun(pruneRunTree, true)},
 	}
 	for _, class := range classes {
 		if class.age == 0 {
@@ -119,7 +133,46 @@ func (r *Runtime) Prune(ctx context.Context, policy RetentionPolicy) (PruneRepor
 		}
 		report.More = report.More || more
 	}
+	if policy.Changes > 0 {
+		err := r.transaction(ctx, true, func(tx StoreTransaction) error {
+			var more bool
+			var err error
+			report.Changes, more, err = pruneChanges(tx, now.Add(-policy.Changes), policy.HoldUnsynced, policy.SyncedThrough, limit)
+			report.More = report.More || more
+			return err
+		})
+		if err != nil {
+			return report, err
+		}
+	}
 	return report, nil
+}
+
+// holdRun wraps a retention class so it leaves runs the change feed
+// consumer has not synced (see RetentionPolicy.HoldUnsynced); tree checks
+// every run linked beneath the root.
+func (policy RetentionPolicy) holdRun(apply func(StoreTransaction, storedRuntimeRun) (pruneOutcome, error), tree bool) func(StoreTransaction, storedRuntimeRun) (pruneOutcome, error) {
+	if !policy.HoldUnsynced {
+		return apply
+	}
+	return func(tx StoreTransaction, record storedRuntimeRun) (pruneOutcome, error) {
+		runs := []string{record.RunID}
+		for i := 0; i < len(runs); i++ {
+			last, err := lastRunChange(tx, runs[i])
+			if err != nil || last > policy.SyncedThrough {
+				return pruneLater, err
+			}
+			if !tree {
+				break
+			}
+			children, err := linkedChildRunIDs(tx, runs[i])
+			if err != nil {
+				return pruneLater, err
+			}
+			runs = append(runs, children...)
+		}
+		return apply(tx, record)
+	}
 }
 
 // pruneClass walks one retention index up to cutoff. Runs apply defers stay
@@ -283,6 +336,13 @@ type storedPrunedRun struct {
 // semantic duplicates rejected and resolve an exact admission retry to the
 // pruned identity instead of new work.
 func deleteRun(tx StoreTransaction, runID string, now time.Time) error {
+	record, err := getRuntimeRun(tx, runID)
+	if err != nil {
+		return err
+	}
+	if err := tx.Delete(runtimeRunListBucket, runListKey(record)); err != nil {
+		return err
+	}
 	for _, prefix := range []struct{ bucket, prefix string }{
 		{runtimeFactsBucket, runID + "/"},
 		{runtimeEventsBucket, runID + "/"},
@@ -298,6 +358,7 @@ func deleteRun(tx StoreTransaction, runID string, now time.Time) error {
 	}
 	for _, key := range []struct{ bucket, key string }{
 		{runtimeEventHeadsBucket, runID},
+		{runtimeRunChangesBucket, runID},
 		{runtimeReceiptsBucket, cancelReceiptKey(runID)},
 		{runtimeReceiptsBucket, hooksAckReceiptKey(runID)},
 		{runtimeActiveBucket, runID},

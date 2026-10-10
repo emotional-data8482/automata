@@ -156,6 +156,10 @@ type durableLoopTransition struct {
 	// declared structured-output contracts. Runtime persists it atomically
 	// with the transition's transcript so correction state survives restart.
 	StructuredCorrections int
+	// Failure, when set on a batch commit, is the run's terminal failure.
+	// Runtime commits it with the transcript so a restart finalizes the run
+	// instead of continuing past it.
+	Failure error
 }
 
 func (l *loop) run(ctx context.Context, task, mode string, cfg runConfig, invoke invokeFn) (RunResult, error) {

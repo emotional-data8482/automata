@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"math/big"
+	"reflect"
 	"regexp"
 	"sort"
 	"strconv"
@@ -42,6 +44,9 @@ type schemaContract struct {
 	// unknown JSON fields are still ignored on the typed path, matching
 	// json.Unmarshal.
 	rejectUnknown bool
+	// goInt is set only by Go-derived integer contracts: the payload must
+	// also fit the Go integer kind it decodes into.
+	goInt reflect.Kind
 
 	enum []any
 
@@ -391,6 +396,11 @@ func (c *schemaContract) validate(val any, path string) []string {
 		if c.typ == "integer" && !value.IsInt() {
 			return []string{c.violation(path, "expected integer, got non-integral number %s", number)}
 		}
+		if c.goInt != reflect.Invalid {
+			if low, high := goIntRange(c.goInt); value.Num().Cmp(low) < 0 || value.Num().Cmp(high) > 0 {
+				return []string{c.violation(path, "integer %s is out of range [%s, %s]", number, low, high)}
+			}
+		}
 		for _, bound := range []struct {
 			limit     *json.Number
 			belowOK   bool // false for minimum-style bounds, true for maximum-style
@@ -576,5 +586,27 @@ func jsonValuesEqual(a, b any) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+// goIntRange returns the inclusive range of a Go integer kind.
+func goIntRange(kind reflect.Kind) (*big.Int, *big.Int) {
+	switch kind {
+	case reflect.Int8:
+		return big.NewInt(math.MinInt8), big.NewInt(math.MaxInt8)
+	case reflect.Int16:
+		return big.NewInt(math.MinInt16), big.NewInt(math.MaxInt16)
+	case reflect.Int32:
+		return big.NewInt(math.MinInt32), big.NewInt(math.MaxInt32)
+	case reflect.Int, reflect.Int64:
+		return big.NewInt(math.MinInt64), big.NewInt(math.MaxInt64)
+	case reflect.Uint8:
+		return new(big.Int), big.NewInt(math.MaxUint8)
+	case reflect.Uint16:
+		return new(big.Int), big.NewInt(math.MaxUint16)
+	case reflect.Uint32:
+		return new(big.Int), big.NewInt(math.MaxUint32)
+	default: // Uint, Uint64
+		return new(big.Int), new(big.Int).SetUint64(math.MaxUint64)
 	}
 }

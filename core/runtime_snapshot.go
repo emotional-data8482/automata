@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 )
 
 type RuntimeState string
@@ -43,6 +44,17 @@ type RunSnapshot struct {
 	// are marked pruned, while state, accepted output, usage, and effect
 	// reports remain.
 	HistoryPruned bool
+	// Scope and Key are the idempotency identity the run was admitted
+	// under (see [WithIdempotencyKey]); a child run carries its root's scope
+	// and no key.
+	Scope string
+	Key   string
+	// Labels are the host annotations from admission (see [WithLabels]).
+	// CreatedAt is the admission time and UpdatedAt the last record write;
+	// both are zero for runs stored before they were recorded.
+	Labels    map[string]string
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }
 
 // ParentRef links a child to the durable invocation that admitted it.
@@ -135,6 +147,11 @@ func snapshotFromRecord(record storedRuntimeRun) RunSnapshot {
 		Waits:         append([]WaitSnapshot(nil), record.Waits...),
 		EventSequence: record.EventSequence,
 		HistoryPruned: record.HistoryPruned,
+		Scope:         record.AdmissionScope,
+		Key:           record.AdmissionKey,
+		Labels:        cloneLabels(record.Labels),
+		CreatedAt:     record.CreatedAt,
+		UpdatedAt:     record.UpdatedAt,
 	}
 	if record.ParentRunID != "" {
 		snapshot.Parent = &ParentRef{RunID: record.ParentRunID, OperationID: record.ParentOperationID}

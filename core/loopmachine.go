@@ -65,6 +65,7 @@ type loopMachine struct {
 	tools      []ToolDefinition
 	registry   map[string]registeredTool
 	hooks      []PreSendHook
+	clockTimes currentTimeStamps
 	request    Request
 	response   Response
 	calls      []ToolUseBlock
@@ -133,6 +134,10 @@ func (m *loopMachine) drive() (RunResult, error) {
 }
 
 func (m *loopMachine) persistTransition(kind transitionKind) error {
+	return m.persistTransitionWithFailure(kind, nil)
+}
+
+func (m *loopMachine) persistTransitionWithFailure(kind transitionKind, failure error) error {
 	result := cloneRunResult(m.result)
 	result.RunID = m.cfg.scope.id
 	result.Messages = m.loop.snapshot()
@@ -141,7 +146,7 @@ func (m *loopMachine) persistTransition(kind transitionKind) error {
 	result.Turns = m.cfg.scope.turns
 	result.ProviderAttempts = m.cfg.scope.providerAttempts
 	result.Usage = m.cfg.scope.usage
-	transition := durableLoopTransition{Kind: kind, Result: result}
+	transition := durableLoopTransition{Kind: kind, Result: result, Failure: failure}
 	transition.StructuredCorrections = m.structuredCorrections()
 	if kind == transitionProviderAccepted {
 		transition.EffectiveTools = make([]string, 0, len(m.loop.toolsByName))
@@ -351,6 +356,14 @@ func (m *loopMachine) prepareTurn() loopState {
 			tracing.Int("step", step),
 			tracing.Int("hook_count", len(m.hooks)),
 		)
+		messageIndex := -1
+		for i := len(l.messages) - 1; i >= 0; i-- {
+			if l.messages[i].Role == "user" {
+				messageIndex = i
+				break
+			}
+		}
+		hookCtx = context.WithValue(hookCtx, currentTimeContextKey{}, currentTimeContext{times: &m.clockTimes, message: messageIndex})
 		var hookErr error
 		for i, hook := range m.hooks {
 			inMsgs, inTools := len(req.Messages), len(req.Tools)
@@ -609,7 +622,13 @@ func (m *loopMachine) executeTools() loopState {
 				})
 			}
 			l.messages = append(l.messages, results...)
-			if err := m.persistTransition(transitionBatchCommitted); err != nil {
+			var exhausted error
+			if len(violations) > 0 && !corrected {
+				// Commit the exhausted budget with the batch: a restart must
+				// finalize this failure, not ask the provider again.
+				exhausted = &InvalidStructuredOutputError{Violations: violations}
+			}
+			if err := m.persistTransitionWithFailure(transitionBatchCommitted, exhausted); err != nil {
 				return m.fail(&durableTransitionFailure{cause: err})
 			}
 			if len(violations) == 0 {

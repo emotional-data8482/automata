@@ -3,7 +3,9 @@ package core
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -17,8 +19,11 @@ import (
 type PreSendHook func(context.Context, Request) (Request, error)
 
 // CommittedRunHook observes an execution result after Runtime has durably
-// committed it and before the run becomes terminal. Name identifies the hook
-// in persisted results. Timeout supplies each attempt's context deadline; zero
+// committed it and before the run becomes terminal, including suspended runs
+// and descendants finalized by cancellation or a waiting deadline. Cancellation
+// with unavailable history skips hooks rather than fabricating a snapshot, and
+// acknowledged interrupted deliveries are never repeated. Name identifies the
+// hook in persisted results. Timeout supplies each attempt's context deadline; zero
 // selects 30 seconds. Hook implementations must honor context cancellation.
 //
 // A hook error is recorded in RunSnapshot.Hooks. It never changes the
@@ -61,4 +66,82 @@ func validateCommittedRunHooks(hooks []CommittedRunHook) ([]CommittedRunHook, er
 		seen[hook.Name] = struct{}{}
 	}
 	return frozen, nil
+}
+
+// CurrentTime returns a [PreSendHook] that tells the model the time, which it
+// otherwise does not know. It prefixes the latest user message in the view
+// sent to the provider with "Current time: <RFC 3339 time>". Within a Runtime
+// worker segment, each canonical user message keeps its first stamp across
+// tool turns, even if a request transform compacts history. Independent runs
+// and resumed worker segments get fresh stamps. Direct calls to the hook also
+// get a fresh stamp. The canonical transcript is unchanged; nil selects [time.Now].
+func CurrentTime(now func() time.Time) PreSendHook {
+	if now == nil {
+		now = time.Now
+	}
+	clock := &currentTimeClock{now: now}
+	return func(ctx context.Context, req Request) (Request, error) {
+		for i := len(req.Messages) - 1; i >= 0; i-- {
+			message := req.Messages[i]
+			if message.Role != "user" {
+				continue
+			}
+			at := clock.stamp(ctx)
+			stamp := TextBlock{Text: "Current time: " + at.Format(time.RFC3339) + "\n\n"}
+			message.Blocks = append(Blocks{stamp}, message.Blocks...)
+			req.Messages = slices.Clone(req.Messages)
+			req.Messages[i] = message
+			break
+		}
+		return req, nil
+	}
+}
+
+// These stamps belong to a worker, not an Agent: no cross-run cache or
+// eviction is needed, and the worker releases them with its loop machine.
+type currentTimeContextKey struct{}
+
+type currentTimeContext struct {
+	times   *currentTimeStamps
+	message int // canonical index, before any request transforms
+}
+
+type currentTimeStampKey struct {
+	clock   *currentTimeClock
+	message int
+}
+
+type currentTimeStamps struct {
+	mu     sync.Mutex
+	stamps map[currentTimeStampKey]time.Time
+}
+
+type currentTimeClock struct {
+	mu  sync.Mutex
+	now func() time.Time
+}
+
+func (c *currentTimeClock) read() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now()
+}
+
+func (c *currentTimeClock) stamp(ctx context.Context) time.Time {
+	scope, ok := ctx.Value(currentTimeContextKey{}).(currentTimeContext)
+	if !ok {
+		return c.read()
+	}
+	scope.times.mu.Lock()
+	defer scope.times.mu.Unlock()
+	key := currentTimeStampKey{clock: c, message: scope.message}
+	if at, ok := scope.times.stamps[key]; ok {
+		return at
+	}
+	if scope.times.stamps == nil {
+		scope.times.stamps = make(map[currentTimeStampKey]time.Time)
+	}
+	at := c.read()
+	scope.times.stamps[key] = at
+	return at
 }

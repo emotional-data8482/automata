@@ -25,6 +25,13 @@ import (
 // without implicit rewrite.
 const runtimeEncodingVersion = 9
 
+// runtimeStoreVersion is the store-wide storage version. Version 10 keeps the
+// encoding-9 records and adds the run list index, the change feed, and the
+// admission clock. A version-9 store upgrades in place when opened; releases
+// that only know version 9 refuse a version-10 store, so they cannot write
+// runs the index and feed would miss.
+const runtimeStoreVersion = 10
+
 const (
 	runtimeMetaBucket         = "runtime_meta"
 	runtimeRunsBucket         = "runtime_runs"
@@ -128,14 +135,27 @@ type storedRuntimeRun struct {
 	// commits before the first hook is invoked: a finalizing run without it
 	// provably delivered no hook, so recovery can finish it; with it, delivery
 	// outcome is unknown and needs attention (see [RunHandle.AcknowledgeHooks]).
-	HookDelivery             []string            `json:"hook_delivery,omitempty"`
-	UnknownAttempts          int                 `json:"unknown_attempts,omitempty"`
-	UnknownAttemptGeneration uint64              `json:"unknown_attempt_generation,omitempty"`
-	FreshAttempts            int                 `json:"fresh_attempts,omitempty"`
-	ToolBatches              []ToolBatchSnapshot `json:"-"`
-	Waits                    []WaitSnapshot      `json:"-"`
-	Tree                     TreeAccounting      `json:"-"`
-	EventSequence            uint64              `json:"-"`
+	HookDelivery             []string `json:"hook_delivery,omitempty"`
+	UnknownAttempts          int      `json:"unknown_attempts,omitempty"`
+	UnknownAttemptGeneration uint64   `json:"unknown_attempt_generation,omitempty"`
+	FreshAttempts            int      `json:"fresh_attempts,omitempty"`
+	// AdmissionScope and AdmissionKey are the idempotency identity the run
+	// was admitted under, empty without one. Labels are the host's bounded
+	// annotations from admission (see [WithLabels]). Child runs inherit their
+	// parent's scope and labels, never its key. None of them is part of the
+	// admission identity.
+	AdmissionScope string            `json:"admission_scope,omitempty"`
+	AdmissionKey   string            `json:"admission_key,omitempty"`
+	Labels         map[string]string `json:"labels,omitempty"`
+	// CreatedAt is the admission time and keys the run listing index;
+	// UpdatedAt is the time of the last record write. Both are zero on runs
+	// stored before they were recorded.
+	CreatedAt     time.Time           `json:"created_at,omitzero"`
+	UpdatedAt     time.Time           `json:"updated_at,omitzero"`
+	ToolBatches   []ToolBatchSnapshot `json:"-"`
+	Waits         []WaitSnapshot      `json:"-"`
+	Tree          TreeAccounting      `json:"-"`
+	EventSequence uint64              `json:"-"`
 }
 
 func (record storedRuntimeRun) definition() DefinitionRef {
@@ -325,6 +345,7 @@ func decodeRuntimeRun(raw []byte) (storedRuntimeRun, error) {
 }
 
 func putRuntimeRun(tx StoreTransaction, record storedRuntimeRun) error {
+	record.UpdatedAt = time.Now().UTC()
 	data, err := json.Marshal(record)
 	if err != nil {
 		return err

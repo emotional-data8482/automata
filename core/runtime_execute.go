@@ -39,10 +39,13 @@ func (r *Runtime) markPayloadAttention(ctx context.Context, runID string, cause 
 			return err
 		}
 		recordPayloadBlock(&record, cause)
-		if record.State == RuntimeCancelRequested {
+		if record.State == RuntimeCancelRequested ||
+			(record.State == RuntimeFinalizing && record.Result.Status == RunCancelled && len(record.HookDelivery) == 0) {
+			if record.State == RuntimeCancelRequested {
+				setRuntimeError(&record, context.Canceled)
+			}
 			record.Result.Status = RunCancelled
 			record.AttentionReason, record.AttentionKind = "", ""
-			setRuntimeError(&record, context.Canceled)
 			record.Result.Diagnostics = append(record.Result.Diagnostics, RunDiagnostic{Kind: "payload_error", Message: cause.Error()})
 			terminal = true
 		} else {
@@ -220,8 +223,16 @@ func (r *Runtime) execute(workerCtx context.Context, runID string) {
 }
 
 func (r *Runtime) completeExecution(runID string, result RunResult, runErr, workerErr error) error {
-	record, err := r.finishExecution(runID, result, runErr, workerErr)
-	if err != nil {
+	return r.completeExecutionAt(runID, 0, result, runErr, workerErr)
+}
+
+// completeExecutionAt finishes a run only while it is still executing and, when
+// generation is non-zero, still at that generation. A caller acting on a
+// record it read earlier (Recover) must not rewrite a run that has since
+// finished elsewhere.
+func (r *Runtime) completeExecutionAt(runID string, generation uint64, result RunResult, runErr, workerErr error) error {
+	record, err := r.finishExecution(runID, generation, result, runErr, workerErr)
+	if err != nil || record.RunID == "" {
 		return err
 	}
 	if record.State == RuntimeNeedsAttention {
@@ -255,6 +266,9 @@ func (r *Runtime) persistTransition(ctx context.Context, runID string, transitio
 		if transition.Kind == transitionBatchCommitted {
 			if err := commitPendingToolBatch(tx, &record); err != nil {
 				return err
+			}
+			if transition.Failure != nil {
+				setRuntimeError(&record, transition.Failure)
 			}
 		}
 		record.Result = cloneRunResult(transition.Result)
@@ -300,12 +314,18 @@ func (r *Runtime) claim(ctx context.Context, runID string) (storedRuntimeRun, bo
 	return claimed, didClaim, err
 }
 
-func (r *Runtime) finishExecution(runID string, result RunResult, runErr, workerErr error) (storedRuntimeRun, error) {
+func (r *Runtime) finishExecution(runID string, generation uint64, result RunResult, runErr, workerErr error) (storedRuntimeRun, error) {
 	var committed storedRuntimeRun
 	err := r.transaction(context.Background(), true, func(tx StoreTransaction) error {
 		record, err := getRuntimeRun(tx, runID)
 		if err != nil {
 			return err
+		}
+		if record.State != RuntimeRunning && record.State != RuntimeCancelRequested {
+			return nil
+		}
+		if generation != 0 && record.Generation != generation {
+			return nil
 		}
 		if err := appendTranscript(tx, runID, &record, result.Messages); err != nil {
 			return err

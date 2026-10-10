@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -66,7 +65,9 @@ func readRootFile(root, name string) (string, error) {
 
 // WriteFile returns a "write_file" tool that writes files strictly inside
 // root, creating parent directories as needed. Path traversal and symlinks
-// that escape the root are rejected (enforced by [os.Root]).
+// that escape the root are rejected (enforced by [os.Root]). Each model call
+// is a new write, including restoring older content. Durable admission and
+// committed tool outcomes prevent replay; no store-wide semantic guard is used.
 func WriteFile(root string) core.Tool {
 	tool := core.FuncResult("write_file",
 		"Write a file (creating parent directories) inside the sandboxed working directory, replacing any existing content.",
@@ -82,18 +83,32 @@ func WriteFile(root string) core.Tool {
 			if p.Path == "" {
 				return effectError(fmt.Errorf("path is required"), core.EffectNotApplied), nil
 			}
+			if !filepath.IsLocal(p.Path) {
+				return effectError(fmt.Errorf("path %q must be relative and stay inside the working directory", p.Path), core.EffectNotApplied), nil
+			}
 			r, err := os.OpenRoot(root)
 			if err != nil {
 				return effectError(err, core.EffectNotApplied), nil
 			}
 			defer r.Close()
 
-			if dir := filepath.Dir(p.Path); dir != "." && dir != string(filepath.Separator) {
+			// Failures before the file is opened change no file content: a
+			// model typo (a parent that is a file, an escaping symlink) is
+			// reported as not applied so the run can recover.
+			if dir := filepath.Dir(p.Path); dir != "." {
 				if err := r.MkdirAll(dir, 0o755); err != nil {
-					return effectError(err, core.EffectUnknown), nil
+					return effectError(err, core.EffectNotApplied), nil
 				}
 			}
-			if err := r.WriteFile(p.Path, []byte(p.Content), 0o644); err != nil {
+			f, err := r.OpenFile(p.Path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+			if err != nil {
+				return effectError(err, core.EffectNotApplied), nil
+			}
+			_, err = f.Write([]byte(p.Content))
+			if closeErr := f.Close(); err == nil {
+				err = closeErr
+			}
+			if err != nil {
 				if ctx.Err() != nil {
 					return core.ToolResult{Effect: core.EffectReport{Status: core.EffectUnknown}}, ctx.Err()
 				}
@@ -108,15 +123,5 @@ func WriteFile(root string) core.Tool {
 	return core.WithToolEffectPolicy(tool, core.ToolEffectPolicy{
 		Kind:  core.ToolEffectMutating,
 		Scope: "filesystem:" + absoluteRoot,
-		SemanticKey: func(raw json.RawMessage) (string, error) {
-			var p writeFileParams
-			if err := json.Unmarshal(raw, &p); err != nil {
-				return "", err
-			}
-			if p.Path == "" {
-				return "", fmt.Errorf("path is required")
-			}
-			return filepath.Clean(p.Path), nil
-		},
 	})
 }

@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"github.com/emotional-data8482/automata/retry"
 	"reflect"
 	"strings"
@@ -20,8 +19,13 @@ func (t *funcTool[P]) Definition() ToolDefinition { return cloneToolDefinition(t
 func (t *funcTool[P]) Execute(ctx context.Context, args json.RawMessage) (ToolResult, error) {
 	var params P
 	if len(args) > 0 && string(args) != "null" {
-		if err := json.Unmarshal(args, &params); err != nil {
-			return ToolResult{}, fmt.Errorf("invalid args: %w", err)
+		if err := json.Unmarshal(canonicalIntegralNumbers(args, reflect.TypeFor[P]()), &params); err != nil {
+			// The handler never ran: a model argument mistake the schema
+			// check could not catch (such as an int64 overflow) is
+			// recoverable, not fatal.
+			result := ErrorResult("invalid args: " + err.Error())
+			result.Effect = EffectReport{Status: EffectNotApplied}
+			return result, nil
 		}
 	}
 	return t.handler(ctx, params)
@@ -38,7 +42,9 @@ func Func[P any](name, description string, handler func(context.Context, P) (str
 
 // FuncResult wraps a typed rich handler with a root input schema derived from P.
 // Its single Execute method preserves blocks through registration and wrappers.
-// ErrorResult is recoverable; a non-nil Go error aborts execution.
+// ErrorResult is recoverable; a non-nil Go error aborts execution. Arguments
+// that fail to decode into P (for example an integer that overflows its field)
+// return a recoverable not-applied error result without calling handler.
 func FuncResult[P any](name, description string, handler func(context.Context, P) (ToolResult, error)) Tool {
 	return &funcTool[P]{definition: buildDefinition(name, description, reflect.TypeFor[P]()), handler: handler}
 }
@@ -65,12 +71,10 @@ func (t *retryTool) Execute(ctx context.Context, args json.RawMessage) (ToolResu
 	return last, err
 }
 func (t *retryTool) toolEffectPolicy() ToolEffectPolicy {
-	policy, _ := effectPolicyFor(t.Tool)
-	return policy
+	return declaredEffectPolicy(t.Tool)
 }
 func (t *retryTool) durableWaitPolicy() DurableWaitPolicy {
-	policy, _, _ := waitPolicyFor(t.Tool)
-	return policy
+	return declaredWaitPolicy(t.Tool)
 }
 
 type nonRetryableToolEffectError struct{ cause error }
@@ -89,12 +93,10 @@ func WithToolRetry(t Tool, cfg retry.Config) Tool { return &retryTool{Tool: t, c
 type legacyErrorTool struct{ Tool }
 
 func (t *legacyErrorTool) toolEffectPolicy() ToolEffectPolicy {
-	policy, _ := effectPolicyFor(t.Tool)
-	return policy
+	return declaredEffectPolicy(t.Tool)
 }
 func (t *legacyErrorTool) durableWaitPolicy() DurableWaitPolicy {
-	policy, _, _ := waitPolicyFor(t.Tool)
-	return policy
+	return declaredWaitPolicy(t.Tool)
 }
 
 func (t *legacyErrorTool) Execute(ctx context.Context, args json.RawMessage) (ToolResult, error) {
@@ -154,6 +156,16 @@ func objectSchema(t reflect.Type, visiting map[reflect.Type]bool) map[string]any
 			if desc := field.Tag.Get("desc"); desc != "" {
 				prop["description"] = desc
 			}
+			if values, nullable, ok := enumTag(field); ok {
+				target := prop
+				if items, ok := prop["items"].(map[string]any); ok {
+					target, nullable = items, enumNullable(field.Type.Elem())
+				}
+				if nullable {
+					values = append(values, nil)
+				}
+				target["enum"] = values
+			}
 			props[jsonName] = prop
 
 			if !optional {
@@ -167,6 +179,46 @@ func objectSchema(t reflect.Type, visiting map[reflect.Type]bool) map[string]any
 		"properties": props,
 		"required":   required,
 	}
+}
+
+// enumTag reads a field's `enum:"a,b,c"` tag: the comma-separated values the
+// field (or, for a slice or array, each element) may take. Values are parsed
+// as the field's scalar kind: strings verbatim, numbers as JSON numbers, and
+// booleans as true or false. nullable reports that the field also admits
+// null, which the schema's enum must then list.
+func enumTag(field reflect.StructField) (values []any, nullable bool, ok bool) {
+	tag, ok := field.Tag.Lookup("enum")
+	if !ok {
+		return nil, false, false
+	}
+	t := field.Type
+	nullable = enumNullable(t)
+	for t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	if (t.Kind() == reflect.Slice || t.Kind() == reflect.Array) && t.Elem().Kind() != reflect.Uint8 {
+		t = t.Elem()
+		for t.Kind() == reflect.Pointer {
+			t = t.Elem()
+		}
+	}
+	for value := range strings.SplitSeq(tag, ",") {
+		switch t.Kind() {
+		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+			reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
+			reflect.Float32, reflect.Float64:
+			values = append(values, json.Number(strings.TrimSpace(value)))
+		case reflect.Bool:
+			values = append(values, strings.TrimSpace(value) == "true")
+		default:
+			values = append(values, value)
+		}
+	}
+	return values, nullable, true
+}
+
+func enumNullable(t reflect.Type) bool {
+	return t.Kind() == reflect.Pointer
 }
 
 var (

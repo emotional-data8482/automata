@@ -206,8 +206,7 @@ func (r *Runtime) initialize(ctx context.Context) error {
 	return r.store.Transaction(ctx, true, func(tx StoreTransaction) error {
 		raw, err := tx.Get(runtimeMetaBucket, "encoding")
 		if errors.Is(err, ErrStoreKeyNotFound) {
-			data, _ := json.Marshal(runtimeEncodingVersion)
-			return tx.Put(runtimeMetaBucket, "encoding", data)
+			return putStoreVersion(tx)
 		}
 		if err != nil {
 			return err
@@ -216,11 +215,26 @@ func (r *Runtime) initialize(ctx context.Context) error {
 		if err := json.Unmarshal(raw, &version); err != nil {
 			return fmt.Errorf("decode runtime storage version: %w", err)
 		}
-		if version != runtimeEncodingVersion {
+		switch version {
+		case runtimeStoreVersion:
+			return nil
+		case runtimeEncodingVersion:
+			// A store last written by a release without the run list index
+			// or change feed. Upgrade it in place, then raise the version
+			// so an older binary cannot write runs the index and feed miss.
+			if err := upgradeStoreIndexes(tx); err != nil {
+				return fmt.Errorf("upgrade runtime storage version %d: %w", version, err)
+			}
+			return putStoreVersion(tx)
+		default:
 			return fmt.Errorf("unsupported runtime storage version %d", version)
 		}
-		return nil
 	})
+}
+
+func putStoreVersion(tx StoreTransaction) error {
+	data, _ := json.Marshal(runtimeStoreVersion)
+	return tx.Put(runtimeMetaBucket, "encoding", data)
 }
 
 // Register binds an immutable Agent to a definition ID and revision and

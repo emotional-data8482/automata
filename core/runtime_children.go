@@ -145,9 +145,20 @@ func (r *Runtime) admitChildRun(tx StoreTransaction, parent storedRuntimeRun, in
 		// Pin the child definition's own subtree and PerTool caps on the child
 		// record at admission; the child charges its ancestors from their
 		// persisted records, not from any context.
-		ToolBudget: pinnedToolCaps(binding.agent.toolPolicy),
+		ToolBudget:     pinnedToolCaps(binding.agent.toolPolicy),
+		Labels:         cloneLabels(parent.Labels),
+		AdmissionScope: parent.AdmissionScope,
+		CreatedAt:      now,
 	}
+	createdAt, err := admissionTime(tx, now)
+	if err != nil {
+		return receipt, err
+	}
+	record.CreatedAt = createdAt
 	if err := putRuntimeRun(tx, record); err != nil {
+		return receipt, err
+	}
+	if err := putRunListIndex(tx, record); err != nil {
 		return receipt, err
 	}
 	link := storedChildLink{
@@ -404,20 +415,21 @@ func linkedChildRunIDs(tx StoreTransaction, runID string) ([]string, error) {
 // linked beneath runID inside the caller's transaction, so the intent commits
 // atomically with the ancestor's own transition: recovery can never lose it,
 // and no descendant can admit children or dispatch reserved tools beneath the
-// canceled ancestor. Suspended descendants terminalize at once; running
-// descendants move to cancel-requested and are returned so the caller can
-// stop their live workers after commit. A deadline propagates to suspended
-// descendants only: each running descendant inherited that same deadline at
-// admission and its own worker already enforces it.
-func propagateCancellationTx(tx StoreTransaction, runID string, cause error) ([]string, error) {
+// canceled ancestor. Suspended descendants move to finalizing and are
+// returned in finalizing so the caller delivers their committed-run hooks
+// after commit (see finalizeCanceledTx); running descendants move to
+// cancel-requested and are returned in running so the caller can stop their
+// live workers. A deadline propagates to suspended descendants only: each
+// running descendant inherited that same deadline at admission and its own
+// worker already enforces it.
+func propagateCancellationTx(tx StoreTransaction, runID string, cause error) (running, finalizing []string, err error) {
 	deadline := errors.Is(cause, context.DeadlineExceeded)
-	var running []string
 	seen := map[string]bool{runID: true}
 	queue := []string{runID}
 	for len(queue) > 0 {
 		children, err := linkedChildRunIDs(tx, queue[0])
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		queue = queue[1:]
 		for _, childRunID := range children {
@@ -428,13 +440,10 @@ func propagateCancellationTx(tx StoreTransaction, runID string, cause error) ([]
 			queue = append(queue, childRunID)
 			child, err := getRuntimeRun(tx, childRunID)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			switch child.State {
 			case RuntimeReady, RuntimeWaiting, RuntimeNeedsAttention:
-				child.Result.Status = RunCancelled
-				child.AttentionReason = ""
-				child.AttentionKind = ""
 				setRuntimeError(&child, cause)
 			case RuntimeRunning:
 				if deadline {
@@ -446,23 +455,45 @@ func propagateCancellationTx(tx StoreTransaction, runID string, cause error) ([]
 				continue
 			}
 			if err := resolveReservedInvocations(tx, child); err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			if err := cancelRunWaits(tx, child.RunID); err != nil {
-				return nil, err
+				return nil, nil, err
 			}
-			child.Generation++
 			if child.State == RuntimeCancelRequested {
+				child.Generation++
 				err = putRuntimeRun(tx, child)
 			} else {
-				err = commitTerminalTx(tx, &child)
+				var hooks bool
+				hooks, err = finalizeCanceledTx(tx, &child)
+				if hooks {
+					finalizing = append(finalizing, child.RunID)
+				}
 			}
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 		}
 	}
-	return running, nil
+	return running, finalizing, nil
+}
+
+// finalizeCanceledTx moves a suspended run (ready, waiting, or needing
+// attention) to canceled. The caller has already set the run's error. Like
+// an executed run, it passes through finalizing so committed-run hooks
+// observe it; the caller delivers them after commit when this reports true,
+// and Recover or the driver finishes a delivery that never starts. A run
+// whose hook delivery already started (hook attention) is terminalized
+// directly: its hooks are never invoked again.
+func finalizeCanceledTx(tx StoreTransaction, record *storedRuntimeRun) (bool, error) {
+	record.Result.Status = RunCancelled
+	record.AttentionReason, record.AttentionKind = "", ""
+	record.Generation++
+	if len(record.HookDelivery) > 0 {
+		return false, commitTerminalTx(tx, record)
+	}
+	record.State = RuntimeFinalizing
+	return true, putRuntimeRun(tx, *record)
 }
 
 // markParentChildAttentionTx moves a waiting parent to needs-attention with a

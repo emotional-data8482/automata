@@ -11,7 +11,7 @@ inventory_check() {
     ([.modules[].path] | length == (unique | length)) and
     ([.modules[] | select(.path == "." and .kind == "published")] | length == 1) and
     all(.modules[];
-      (.path | test("^(\\.|tools|extensions/[a-z0-9_-]+|examples/[a-z0-9_-]+)$")) and
+      (.path | test("^(\\.|tools|host|extensions/[a-z0-9_-]+|examples/[a-z0-9_-]+)$")) and
       (.kind == "published" or .kind == "example") and
       (.race | type == "boolean") and
       (.smoke | test("^(\\.|[a-z0-9_-]+)$")) and

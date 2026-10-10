@@ -42,12 +42,10 @@ func (t frozenTool) Execute(ctx context.Context, args json.RawMessage) (ToolResu
 	return t.executor.Execute(ctx, args)
 }
 func (t frozenTool) toolEffectPolicy() ToolEffectPolicy {
-	policy, _ := effectPolicyFor(t.executor)
-	return policy
+	return declaredEffectPolicy(t.executor)
 }
 func (t frozenTool) durableWaitPolicy() DurableWaitPolicy {
-	policy, _, _ := waitPolicyFor(t.executor)
-	return policy
+	return declaredWaitPolicy(t.executor)
 }
 func freezeTools(ts []Tool, terminal string) ([]Tool, error) {
 	registry, defs, err := registerTools(ts, terminal)

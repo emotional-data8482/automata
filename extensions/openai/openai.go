@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
 	"sort"
 	"strings"
 
@@ -209,8 +210,13 @@ func jsonSchemaResponseFormat(raw json.RawMessage) *responseFormat {
 func strictifySchema(s map[string]any, strict *bool) map[string]any {
 	out := make(map[string]any, len(s)+1)
 	isObject := false
-	if t, ok := s["type"].(string); ok && t == "object" {
-		isObject = true
+	switch t := s["type"].(type) {
+	case string:
+		isObject = t == "object"
+	case []any:
+		// Core emits ["object","null"] for pointer-to-struct fields; strict
+		// mode needs such an object closed exactly like a plain one.
+		isObject = slices.Contains(t, any("object"))
 	}
 	for k, v := range s {
 		if k == "properties" {

@@ -118,13 +118,24 @@ func (s *Store) Transaction(ctx context.Context, writable bool, fn func(core.Sto
 	if closed || db == nil {
 		return errors.New("sqlite runtime store is closed")
 	}
-	tx, err := db.BeginTx(ctx, &sql.TxOptions{ReadOnly: !writable})
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	// The transaction is detached from ctx: database/sql rolls back a
+	// canceled transaction on a background goroutine, which can hold the
+	// connection open after Close returns and make a reopen fail with
+	// SQLITE_BUSY. Cancellation is checked at the boundaries instead, and
+	// the deferred rollback releases the connection before returning.
+	tx, err := db.BeginTx(context.WithoutCancel(ctx), &sql.TxOptions{ReadOnly: !writable})
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 	view := &transaction{tx: tx, writable: writable}
 	if err := fn(view); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
 		return err
 	}
 	return tx.Commit()

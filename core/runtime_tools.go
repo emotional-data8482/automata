@@ -112,6 +112,27 @@ type storedEffectGuard struct {
 	Status      EffectStatus `json:"status"`
 }
 
+// putOwnedEffectGuard records status on a semantic guard only while the guard
+// is missing or still owned by operationID. A guard is shared by every run on
+// the store, so a stale writer (a late worker completion, or a reconcile of an
+// older operation) must never replace a newer owner's reservation or applied
+// record: that would let a later run apply the same mutation again.
+func putOwnedEffectGuard(tx StoreTransaction, key, operationID string, status EffectStatus) error {
+	raw, err := tx.Get(runtimeEffectGuardsBucket, key)
+	if err == nil {
+		var guard storedEffectGuard
+		if err := json.Unmarshal(raw, &guard); err != nil {
+			return err
+		}
+		if guard.OperationID != operationID {
+			return nil
+		}
+	} else if !errors.Is(err, ErrStoreKeyNotFound) {
+		return err
+	}
+	return putStoredJSON(tx, runtimeEffectGuardsBucket, key, storedEffectGuard{OperationID: operationID, Status: status})
+}
+
 type reconcileReceipt struct {
 	Version     int              `json:"version"`
 	RunID       string           `json:"run_id"`
@@ -648,16 +669,31 @@ func (r *Runtime) completeToolInvocation(ctx context.Context, invocation storedT
 		setInvocationError(&invocation, fmt.Errorf("%w: tool result record is %d bytes, over the %d-byte limit", ErrPayloadTooLarge, len(encoded), r.maxPayload))
 	}
 	return r.transaction(context.WithoutCancel(ctx), true, func(tx StoreTransaction) error {
+		key := invocationStorageKey(invocation.RunID, invocation.BatchID, invocation.Ordinal)
+		raw, err := tx.Get(runtimeInvocationsBucket, key)
+		if err != nil {
+			return err
+		}
+		var stored storedToolInvocation
+		if err := json.Unmarshal(raw, &stored); err != nil {
+			return err
+		}
+		if stored.OperationID != invocation.OperationID || (stored.State != ToolInvocationReserved && stored.State != ToolInvocationDispatched) {
+			// Recovery, cancellation, or Reconcile already settled this
+			// invocation. A late worker must not replace that outcome or the
+			// guard it left behind.
+			return nil
+		}
 		if invocation.GuardKey != "" {
 			status := effect.Status
 			if status == EffectUnreported {
 				status = EffectUnknown
 			}
-			if err := putStoredJSON(tx, runtimeEffectGuardsBucket, invocation.GuardKey, storedEffectGuard{OperationID: invocation.OperationID, Status: status}); err != nil {
+			if err := putOwnedEffectGuard(tx, invocation.GuardKey, invocation.OperationID, status); err != nil {
 				return err
 			}
 		}
-		return putStoredJSON(tx, runtimeInvocationsBucket, invocationStorageKey(invocation.RunID, invocation.BatchID, invocation.Ordinal), invocation)
+		return putStoredJSON(tx, runtimeInvocationsBucket, key, invocation)
 	})
 }
 
@@ -945,19 +981,8 @@ func resolveReservedInvocations(tx StoreTransaction, record storedRuntimeRun) er
 		}
 		setInvocationError(&invocation, nil)
 		if invocation.GuardKey != "" {
-			raw, guardErr := tx.Get(runtimeEffectGuardsBucket, invocation.GuardKey)
-			if guardErr == nil {
-				var guard storedEffectGuard
-				if err := json.Unmarshal(raw, &guard); err != nil {
-					return err
-				}
-				if guard.OperationID == invocation.OperationID {
-					if err := putStoredJSON(tx, runtimeEffectGuardsBucket, invocation.GuardKey, storedEffectGuard{OperationID: invocation.OperationID, Status: EffectNotApplied}); err != nil {
-						return err
-					}
-				}
-			} else if !errors.Is(guardErr, ErrStoreKeyNotFound) {
-				return guardErr
+			if err := putOwnedEffectGuard(tx, invocation.GuardKey, invocation.OperationID, EffectNotApplied); err != nil {
+				return err
 			}
 		}
 		if err := putStoredJSON(tx, runtimeInvocationsBucket, invocationStorageKey(record.RunID, record.PendingBatchID, invocation.Ordinal), invocation); err != nil {
@@ -1061,7 +1086,7 @@ func (h *RunHandle) Reconcile(ctx context.Context, operationID string, resolutio
 			return err
 		}
 		if found.GuardKey != "" {
-			if err := putStoredJSON(tx, runtimeEffectGuardsBucket, found.GuardKey, storedEffectGuard{OperationID: operationID, Status: resolution.Effect.Status}); err != nil {
+			if err := putOwnedEffectGuard(tx, found.GuardKey, operationID, resolution.Effect.Status); err != nil {
 				return err
 			}
 		}

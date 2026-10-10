@@ -172,9 +172,10 @@ func TestFuncResultInvalidArgs(t *testing.T) {
 	tool := FuncResult("weather", "look up weather", func(_ context.Context, a resultArgs) (ToolResult, error) {
 		return TextResult("never"), nil
 	})
-	_, err := tool.Execute(context.Background(), json.RawMessage(`{"city":42}`))
-	if err == nil || !strings.HasPrefix(err.Error(), "invalid args: ") {
-		t.Errorf("err = %v, want prefix %q", err, "invalid args: ")
+	// Decode failures are model-recoverable: the handler never ran.
+	out, err := tool.Execute(context.Background(), json.RawMessage(`{"city":42}`))
+	if err != nil || !out.IsError || !strings.HasPrefix(out.Text(), "invalid args: ") || out.Effect.Status != EffectNotApplied {
+		t.Errorf("result = %#v, err = %v; want a not-applied error result", out, err)
 	}
 }
 

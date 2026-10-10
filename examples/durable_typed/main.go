@@ -9,9 +9,9 @@
 // The reviewer's typed verdict is kept on its own child run, and the lead
 // continues the same conversation in a second, serialized turn.
 //
-// No JSON schema is written by hand: core.OutputSchema derives the output
-// contracts, core.ChildTool derives the child's input schema, and core.Decode
-// validates and decodes accepted output.
+// No JSON schema is written by hand: core.OutputSchema derives the
+// publisher's output contract, and agents.Define derives the reviewer's input
+// and output contracts from Go types, then decodes the child's accepted output.
 package main
 
 import (
@@ -23,6 +23,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/emotional-data8482/automata/agents"
 	"github.com/emotional-data8482/automata/core"
 	"github.com/emotional-data8482/automata/extensions/sqlite"
 )
@@ -178,38 +179,36 @@ func publishWithCorrection(ctx context.Context, runtime *core.Runtime) {
 // reviewThread delegates to a reviewer as a durable child run, then continues
 // the lead's conversation in a second turn from its committed history.
 func reviewThread(ctx context.Context, runtime *core.Runtime) {
-	reviewer, err := core.New(&fakeProvider{turns: []core.Message{
-		withUsage(core.AssistantMessage(core.ToolUseBlock{ID: "verdict-1", Name: "automata_structured_output", Input: json.RawMessage(`{"verdict":"approve","notes":"receipt report.md#1 matches the brief"}`)}), 40),
-	}}, core.AgentConfig{
-		MaxTurns:         3,
-		StructuredOutput: &core.StructuredOutputConfig{Schema: core.OutputSchema[ReviewVerdict]()},
+	// agents.Define derives the reviewer's output contract from ReviewVerdict
+	// and registers it; Tool pins that revision as a child tool whose input
+	// schema comes from ReviewRequest. Each call is admitted as its own
+	// durable run linked to the lead's call.
+	reviewer, err := agents.Define[ReviewRequest, ReviewVerdict](runtime, agents.Spec{
+		ID: "reviewer", Revision: "demo-v1",
+		Provider: &fakeProvider{turns: []core.Message{
+			withUsage(core.AssistantMessage(core.ToolUseBlock{ID: "verdict-1", Name: "automata_structured_output", Input: json.RawMessage(`{"verdict":"approve","notes":"receipt report.md#1 matches the brief"}`)}), 40),
+		}},
+		Config: core.AgentConfig{MaxTurns: 3},
 	})
 	if err != nil {
-		exitf("construct reviewer: %v", err)
-	}
-	reviewerRef, err := runtime.Register("reviewer", "demo-v1", reviewer)
-	if err != nil {
-		exitf("register reviewer: %v", err)
+		exitf("define reviewer: %v", err)
 	}
 
-	// The child tool pins the reviewer's registered definition and revision;
-	// each call is admitted as its own durable run linked to the lead's call.
-	review := core.ChildTool[ReviewRequest]("review", "Ask the reviewer for a verdict on one artifact.", reviewerRef)
-	lead, err := core.New(&fakeProvider{turns: []core.Message{
-		withUsage(core.AssistantMessage(core.ToolUseBlock{ID: "review-1", Name: "review", Input: json.RawMessage(`{"artifact":"report.md"}`)}), 30),
-		withUsage(core.AssistantMessage(core.TextBlock{Text: "The reviewer approved report.md."}), 60),
-		withUsage(core.AssistantMessage(core.TextBlock{Text: "Team update: report.md is published and approved."}), 80),
-	}}, core.AgentConfig{
-		Tools:      []core.Tool{review},
-		MaxTurns:   4,
-		ToolPolicy: core.ToolPolicy{MaxCalls: 4},
+	leadRef, err := agents.Register(runtime, agents.Spec{
+		ID: "lead", Revision: "demo-v1",
+		Provider: &fakeProvider{turns: []core.Message{
+			withUsage(core.AssistantMessage(core.ToolUseBlock{ID: "review-1", Name: "review", Input: json.RawMessage(`{"artifact":"report.md"}`)}), 30),
+			withUsage(core.AssistantMessage(core.TextBlock{Text: "The reviewer approved report.md."}), 60),
+			withUsage(core.AssistantMessage(core.TextBlock{Text: "Team update: report.md is published and approved."}), 80),
+		}},
+		Config: core.AgentConfig{
+			Tools:      []core.Tool{reviewer.Tool("review", "Ask the reviewer for a verdict on one artifact.")},
+			MaxTurns:   4,
+			ToolPolicy: core.ToolPolicy{MaxCalls: 4},
+		},
 	})
 	if err != nil {
-		exitf("construct lead: %v", err)
-	}
-	leadRef, err := runtime.Register("lead", "demo-v1", lead)
-	if err != nil {
-		exitf("register lead: %v", err)
+		exitf("define lead: %v", err)
 	}
 
 	thread := core.ConversationRef{Scope: "demo", ID: "report-review"}
@@ -233,7 +232,7 @@ func reviewThread(ctx context.Context, runtime *core.Runtime) {
 	if err != nil {
 		exitf("snapshot child run: %v", err)
 	}
-	verdict, err := core.Decode[ReviewVerdict](child.Result)
+	verdict, err := reviewer.Output(child.Result)
 	if err != nil {
 		exitf("decode child verdict: %v", err)
 	}
