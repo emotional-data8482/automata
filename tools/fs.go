@@ -82,18 +82,32 @@ func WriteFile(root string) core.Tool {
 			if p.Path == "" {
 				return effectError(fmt.Errorf("path is required"), core.EffectNotApplied), nil
 			}
+			if !filepath.IsLocal(p.Path) {
+				return effectError(fmt.Errorf("path %q must be relative and stay inside the working directory", p.Path), core.EffectNotApplied), nil
+			}
 			r, err := os.OpenRoot(root)
 			if err != nil {
 				return effectError(err, core.EffectNotApplied), nil
 			}
 			defer r.Close()
 
-			if dir := filepath.Dir(p.Path); dir != "." && dir != string(filepath.Separator) {
+			// Failures before the file is opened change no file content: a
+			// model typo (a parent that is a file, an escaping symlink) is
+			// reported as not applied so the run can recover.
+			if dir := filepath.Dir(p.Path); dir != "." {
 				if err := r.MkdirAll(dir, 0o755); err != nil {
-					return effectError(err, core.EffectUnknown), nil
+					return effectError(err, core.EffectNotApplied), nil
 				}
 			}
-			if err := r.WriteFile(p.Path, []byte(p.Content), 0o644); err != nil {
+			f, err := r.OpenFile(p.Path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+			if err != nil {
+				return effectError(err, core.EffectNotApplied), nil
+			}
+			_, err = f.Write([]byte(p.Content))
+			if closeErr := f.Close(); err == nil {
+				err = closeErr
+			}
+			if err != nil {
 				if ctx.Err() != nil {
 					return core.ToolResult{Effect: core.EffectReport{Status: core.EffectUnknown}}, ctx.Err()
 				}
@@ -116,7 +130,10 @@ func WriteFile(root string) core.Tool {
 			if p.Path == "" {
 				return "", fmt.Errorf("path is required")
 			}
-			return filepath.Clean(p.Path), nil
+			// Only an identical retry (same path and content) dedupes; a
+			// later revision of the same file is a new mutation.
+			digest := sha256.Sum256([]byte(p.Content))
+			return filepath.Clean(p.Path) + "#" + hex.EncodeToString(digest[:]), nil
 		},
 	})
 }
