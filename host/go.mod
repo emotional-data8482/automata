@@ -21,5 +21,8 @@ require (
 	modernc.org/sqlite v1.51.0 // indirect
 )
 
-// httpserver is unreleased; drop this replace when it is tagged.
+
+// httpserver is not tagged yet: the go command reads a required version's
+// go.mod even for workspace modules. Tag it, require the tag, and drop this
+// replace before releasing host.
 replace github.com/emotional-data8482/automata/extensions/httpserver => ../extensions/httpserver
