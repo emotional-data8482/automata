@@ -173,15 +173,26 @@ func (c *compactor) summarize(ctx context.Context, prefix []Message) (string, er
 	return resp.Message.Text(), nil
 }
 
-// estimateTokens approximates the token size of a message list. It prefers the
-// most recent reported [Usage] (real provider numbers) and falls back to a
-// ~4-chars-per-token heuristic over the serialized transcript when no usage is
-// available (e.g. a freshly resumed session).
+// estimateTokens approximates the token size of the canonical message list.
+// The most recent reported [Usage] describes the request actually sent, which
+// may itself have been compacted, so it can under-report the full history; and
+// messages after it (such as large tool results) are not in it at all. The
+// estimate is therefore the larger of that usage plus a ~4-chars-per-token
+// heuristic over the later messages, and the heuristic over every message.
 func estimateTokens(messages []Message) int {
+	estimate := heuristicTokens(messages)
 	for i := len(messages) - 1; i >= 0; i-- {
 		if u := messages[i].Usage; u != nil {
-			return u.InputTokens + u.CacheReadTokens + u.CacheCreationTokens + u.OutputTokens
+			reported := u.InputTokens + u.CacheReadTokens + u.CacheCreationTokens + u.OutputTokens
+			return max(estimate, reported+heuristicTokens(messages[i+1:]))
 		}
+	}
+	return estimate
+}
+
+func heuristicTokens(messages []Message) int {
+	if len(messages) == 0 {
+		return 0
 	}
 	blob, err := json.Marshal(messages)
 	if err != nil {
