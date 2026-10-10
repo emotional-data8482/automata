@@ -46,13 +46,25 @@ snapshot, err := rt.Conversation(ctx, core.ConversationRef{Scope: tenant, ID: th
 report, err := rt.Prune(ctx, core.RetentionPolicy{Events: 24 * time.Hour, History: 30 * 24 * time.Hour, Runs: 90 * 24 * time.Hour})
 ```
 
-`core.NewEphemeralRuntime()` is `NewRuntime` on a fresh memory store. Storage failure never falls back to memory. An oversized durable payload (a turn, a tool batch, or a tool result over `MaxPayloadBytes`) is never truncated: the run needs attention instead.
+`core.NewEphemeralRuntime()` is `NewRuntime` on a fresh memory store. A custom `core.Store` adapter should pass `storetest.Conformance(t, open)` from `core/storetest`. Storage failure never falls back to memory. An oversized durable payload (a turn, a tool batch, or a tool result over `MaxPayloadBytes`) is never truncated: the run needs attention instead.
 
 `ToolPolicy` belongs to the definition: `Timeout` bounds each execution (including the limiter wait, not durable waits), `MaxCalls` and per-tool `MaxCalls` reserve budget in model order and are shared with child runs, and `RateLimiter` accepts anything with `Wait(ctx) error` (such as `*rate.Limiter`). An invalid policy fails `core.New` with `ErrInvalidToolPolicy`.
 
-Submit options: `core.WithIdempotencyKey(scope, key)`, `core.WithDeadline(t)`, `core.WithConversation(ref, expectedHead)`. An exact retry of a keyed submission (same task, definition, deadline, conversation) returns the original run; a changed one returns `core.ErrAdmissionConflict`.
+Submit options: `core.WithIdempotencyKey(scope, key)`, `core.WithDeadline(t)`, `core.WithConversation(ref, expectedHead)`, `core.WithLabels(labels)`. An exact retry of a keyed submission (same task, definition, deadline, conversation) returns the original run; a changed one returns `core.ErrAdmissionConflict`. Labels are bounded host annotations inherited by children, not part of admission identity; a retry keeps the original labels.
 
 `RunHandle`: `ID`, `Await`, `Snapshot`, `Observe` (live view), `Events` / `WaitEvents` (committed cursor pages), `Cancel`, `ResolveWait`, `Reconcile`, `AcknowledgeHooks`. Canceling the context of any call only stops that call; `Cancel` and the deadline are the only logical cancellations.
+
+## Listing, Change Feed, and Manifests (v0.6)
+
+```go
+page, err := rt.Runs(ctx, core.RunFilter{Scope: tenant, RootsOnly: true, After: runCursor, Limit: 100})
+changes, err := rt.WaitChanges(ctx, changeCursor, 256, core.WithChangeEvents())
+manifest, err := rt.Describe(ref) // agent.Describe() needs no Runtime
+```
+
+`RunPage.Next` resumes oldest-admission-first listing. Continue when `More` is true, even if a selective filter returned no runs. `Changes` is the nonblocking global feed; `WaitChanges` waits when caught up. Persist `ChangePage.Next` only after consuming the page. `ErrEventGap` requires resynchronization, and `EventsPruned` means attached events are gone. `RetentionPolicy{HoldUnsynced: true, SyncedThrough: cursor}` holds unsynced history for an exporter; the host owns this acknowledgement cursor. A global feed spans scopes, so do not expose it directly to tenant clients.
+
+Manifests describe a registered definition's tools, policies, output schema, and limits; they are deploy/inspection data, not execution or authorization. `RunHandle.Child(ctx, callID)` opens a durable child's handle, while `RunSnapshot.ToolCall(callID)` and `AppliedEffects(tool)` avoid manual batch scans.
 
 ## RunResult
 
@@ -86,11 +98,13 @@ type Tool interface {
 }
 ```
 
-Prefer `core.Func` (text) or `core.FuncResult` (rich blocks). Schema derivation supports primitives, pointers, nested structs, slices, string-keyed maps, `time.Time`, `[]byte`, interfaces, and `json.RawMessage`; exported fields without `omitempty` are required.
+Prefer `core.Func` (text) or `core.FuncResult` (rich blocks). `core.JSONResult(value)` encodes JSON text and returns `(ToolResult, error)`; handle encoding errors. Schema derivation supports primitives, pointers, nested structs, slices, string-keyed maps, `time.Time`, `[]byte`, interfaces, and `json.RawMessage`; exported fields without `omitempty` are required. The `enum:"a,b"` tag constrains a field's values. Integral JSON numbers such as `2.0` decode into Go integers; overflow or other typed-decoding failures are recoverable tool errors.
 
 Wrappers: `core.WithToolRetry(tool, cfg)`, `core.WithToolEffectPolicy(tool, policy)`, `core.WithDurableWait(tool, policy)`, `core.WithLegacyToolErrors(tool)` (turns a custom tool's Go errors into model-visible error results). Child tools: `core.ChildTool[P](name, description, ref)` or `core.NewChildTool(definition, ref)`; they cannot be retried, wrapped in a wait, or given an effect policy.
 
 Results: `TextResult`, `BlockResult`, `ErrorResult`, `ImageResult`, `URLImageResult`; set `ToolResult.Effect` (`EffectApplied` with a `Receipt`, `EffectNotApplied`, `EffectUnknown`, `EffectNone`) for mutating tools.
+
+Progress: `core.ReportToolProgress(ctx, core.ToolProgress{Progress: done, Total: total, Message: status})` sends a provisional report to the receiver `ctx` carries; it does nothing without one. The Runtime installs a receiver around each execution and publishes `StreamToolProgress` events. To run a tool elsewhere (a test, or serving it over another protocol), install one with `ctx, stop := core.WithToolProgress(ctx, receive)`: calls to `receive` are serialized, it must not report on the context it was installed on, and `stop` must run before the tool's result is used.
 
 ## Errors
 
@@ -123,4 +137,4 @@ default:
 
 ## Hooks
 
-`core.PreSendHook func(ctx, core.Request) (core.Request, error)` transforms the provider-facing request each turn without changing committed history (`core.Compactor` is one). `core.CommittedRunHook{Name, Timeout, Handle}` runs after a run's result commits; its outcome is recorded in `RunSnapshot.Hooks` and never changes the result. An interrupted delivery needs `AcknowledgeHooks`.
+`core.PreSendHook func(ctx, core.Request) (core.Request, error)` transforms the provider-facing request each turn without changing committed history (`core.Compactor` is one). `core.CurrentTime(nil)` prefixes the latest user message in the provider view with an RFC 3339 timestamp; the stamp stays stable across tool turns within a worker segment. Pass a clock function for deterministic tests. Neither changes committed history. `core.CommittedRunHook{Name, Timeout, Handle}` runs after a run's result commits; its outcome is recorded in `RunSnapshot.Hooks` and never changes the result. An interrupted delivery needs `AcknowledgeHooks`.

@@ -1,6 +1,6 @@
-# Providers and First-Party Tools
+# Providers, First-Party Tools, and MCP
 
-Automata keeps provider SDKs, the SQLite store, and tool integrations in separate Go modules. Add only what the application uses and keep module releases compatible (pin the same release across `automata` and its extensions).
+Automata keeps provider SDKs, the SQLite store, the MCP SDK, and tool integrations in separate Go modules. Add only what the application uses and keep module releases compatible. These modules are tagged independently: internal requirements are minimum compatible versions, not coordinated release numbers. The v0.6 server baseline is core v0.6.0, SQLite v0.5.3, HTTP v0.6.0, and host v0.6.0; MCP remains independently tagged at v0.5.3. Check a module's published version rather than assuming checkout-only changes are available via `@latest`.
 
 ## Anthropic Claude
 
@@ -120,7 +120,8 @@ The runtime streams from providers that implement `core.StreamProvider`, even fo
 ## SQLite Store
 
 ```bash
-go get github.com/emotional-data8482/automata/extensions/sqlite@latest
+go get github.com/emotional-data8482/automata@v0.6.0 \
+  github.com/emotional-data8482/automata/extensions/sqlite@v0.5.3
 ```
 
 ```go
@@ -129,6 +130,20 @@ rt, err := core.NewRuntime(ctx, core.RuntimeConfig{Store: store})
 ```
 
 WAL with `synchronous=FULL`, one connection, and an exclusive OS lock (`ErrOwned` for a second owner; Unix only). Process-crash recovery is tested; power loss and network filesystems are not supported. Back up with the runtime closed, or with `VACUUM INTO` from another connection.
+
+Use SQLite v0.5.3 or later for the transaction cancellation/reopen fix. Before opening an existing version-9 Runtime store with core v0.6, stop its owner and back up the database. `NewRuntime` upgrades it transactionally to version 10; older core releases refuse that store, so rollback requires restoring the backup.
+
+## HTTP API and Host
+
+```bash
+go get github.com/emotional-data8482/automata/host@v0.6.0
+```
+
+Host v0.6.0 selects core v0.6.0, `extensions/httpserver` v0.6.0, and SQLite v0.5.3 without replacements. Use `host.Main(host.Options{Register: registerDefinitions})` for a standalone service, or `host.Run(ctx, options)` for an embedded lifecycle. It opens the store, registers definitions, recovers, runs retention, and drains HTTP and closes the Runtime on shutdown. Register every revision persisted runs may pin.
+
+For an existing Runtime, use `httpserver.New(httpserver.Config{Runtime: rt, Authorize: authorize})` and serve the returned handler. Authorization is required; `Scope` enables tenant isolation and `Actor` supplies audit identity. Content is redacted unless `ExposeContent` is enabled. JSON/SSE routes expose admission, listing, status, committed events, waits, cancellation, reconciliation, hook acknowledgement, definitions, and a global change feed for single-tenant servers. The unauthenticated `/v1/openapi.json` route exposes the API schema, not run data.
+
+Host defaults come from `AUTOMATA_ADDR`, `AUTOMATA_DB`, and `AUTOMATA_TOKEN`; it refuses startup without an authorization callback or bearer token. Middleware around streaming response writers must preserve write-deadline support (for example via `Unwrap() http.ResponseWriter`). HTTP streams carry committed events, not provisional tool-progress reports. See `host/README.md` and `extensions/httpserver/README.md` for the lifecycle and route contracts.
 
 ## Retry Policy
 
@@ -175,7 +190,7 @@ core.AgentConfig{Tools: []core.Tool{tools.ReadFile(workspaceRoot), tools.WriteFi
 ```
 
 - `ReadFile` exposes `read_file`, uses `os.Root` to reject traversal/symlink escapes, and truncates after 256 KiB.
-- `WriteFile` exposes `write_file`, uses `os.Root`, creates parent directories, and replaces complete file content. It is a mutating binding: it reports a content-digest receipt, and its semantic guard (scoped to the sandbox root) rejects a later write of a path whose earlier write is applied or unresolved, across every run on the store.
+- `WriteFile` exposes `write_file`, uses `os.Root`, creates parent directories, and replaces complete file content. It is a mutating binding and reports a content-digest receipt. Published tools v0.5.2 has a permanent path semantic guard that rejects later writes after an applied or unresolved write. The current repository source removes that guard so new model calls can revise or restore content, and reports pre-write failures as `EffectNotApplied`; that change needs a separate tools release and is not delivered by upgrading core alone.
 - Give read and write tools only to roles that need them. An isolated root limits filesystem scope but does not provide per-file authorization, version preconditions, conflict detection, audit persistence, or rollback.
 
 ### AGENTS.md Instructions
@@ -249,3 +264,47 @@ type Searcher interface {
 ```
 
 Tavily defaults to a 30-second client and asks for raw results rather than a synthesized answer. The model remains responsible for synthesis and citation.
+
+## MCP Servers
+
+```bash
+go get github.com/emotional-data8482/automata/extensions/mcp@latest
+```
+
+`extensions/mcp` wraps the official MCP Go SDK (`github.com/modelcontextprotocol/go-sdk/mcp`), which owns transports, framing, sessions, authentication, and capability negotiation. It requires core v0.5.3 or later (it uses tool progress).
+
+### Using a Server's Tools
+
+```go
+client, err := mcpclient.Connect(ctx,
+    &mcp.CommandTransport{Command: exec.Command("mcp-server-fetch")},
+    mcpclient.Options{})
+defer client.Close()
+remote, err := client.Tools(ctx, mcpclient.ToolOptions{Prefix: "fetch_"})
+agent, err := core.New(provider, core.AgentConfig{Tools: remote})
+```
+
+- Transports come from the SDK: `mcp.CommandTransport` for a local subprocess over stdio, `mcp.StreamableClientTransport` for a remote server (its `HTTPClient` carries authentication), and `mcp.NewInMemoryTransports` for tests.
+- `Tools` lists the server's tools in server order. `Prefix` is prepended to each advertised name so several servers cannot collide (calls use the server's own name); `Include` exposes only the named server tools, and naming one the server lacks is an error.
+- The list is a snapshot frozen with the agent. A server that changes its tools needs a new agent and a new registered revision.
+- Errors: an `isError` result and a server JSON-RPC error (unknown tool, invalid parameters, internal error) become recoverable error results. Cancellation is returned unchanged. A closed connection, expired session, network error, or transient HTTP status (429, 5xx) is a Go error and fatal to the run. Nothing is marked retryable, because a remote tool may have side effects.
+- Schemas: each input schema is rewritten into core's supported subset (local `$ref`s inlined, nullable unions collapsed, `const` to a one-value enum, `allOf` merged). Assertions core cannot express are dropped from the local pre-check; the server stays the authoritative validator.
+- Progress: every call requests progress notifications and republishes them with `core.ReportToolProgress`, so they reach live views as `StreamToolProgress` events. A notification after the call returns is dropped.
+- Content: text and images map to blocks, embedded image resources become images, and structured content is rendered as JSON text when the server sends no content blocks. Audio, resource links, and other binary resources degrade to a bracketed placeholder line.
+- Policy: remote tools are unclassified (`core.ToolEffectLegacy`) and need no approval. Wrap them with `core.WithToolEffectPolicy` or `core.WithDurableWait`; server annotations are hints, not a trust decision.
+- `Options.ClientOptions` configures the SDK client (sampling and elicitation handlers, keepalive, logging). `client.Session()` returns the SDK session for resources, prompts, and completion. The client and its tools are safe for concurrent use.
+
+### Serving Core Tools
+
+```go
+server := mcp.NewServer(&mcp.Implementation{Name: "files", Version: "v1"}, nil)
+if err := mcpserver.AddTools(server, tools.ReadFile(root)); err != nil {
+    return err
+}
+err := server.Run(ctx, &mcp.StdioTransport{})
+```
+
+- `AddTools` validates every tool before registering any: names must be non-empty and distinct, and each input schema must be an object schema. A same-named tool already on the server is replaced.
+- Each call validates its arguments against the schema, as a Runtime does, and returns a violation as an `isError` result. The tool then executes directly, with **no** Runtime policy: no `ToolPolicy` timeout, call budget, or rate limit, no durable wait, and no effect guard or recovery. Export only tools that are safe to call that way, and authenticate the transport (for example, in the HTTP handler in front of the streamable handler).
+- Results: `core.ErrorResult` becomes `isError` content, a Go error becomes a JSON-RPC internal error, and cancellation is returned unchanged. Text and inline images map to MCP content, URL images become resource links, other blocks degrade to a placeholder line, and effect reports are not sent.
+- When the client supplies a progress token, the tool's `core.ReportToolProgress` reports are sent as progress notifications for that request, stopping when the tool returns.

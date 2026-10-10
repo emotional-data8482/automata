@@ -1,8 +1,8 @@
 ---
 name: automata-go
-description: Build, extend, review, and troubleshoot agentic Go applications with github.com/emotional-data8482/automata. Use when creating tool-using agents, durable runs that survive restarts, typed outputs, child agents, conversations, approvals, live streams, provider integrations, or production-safe agent services in Go.
+description: Build, extend, review, and troubleshoot agentic Go applications with github.com/emotional-data8482/automata. Use when creating tool-using agents, durable runs that survive restarts, typed outputs, child agents, conversations, approvals, live streams and tool progress, provider integrations, MCP tool servers, or production-safe agent services in Go.
 license: Apache-2.0
-compatibility: "Automata v0.5.0+ (the first release with core.Runtime); Go 1.26.2+; provider credentials are needed only for live runs"
+compatibility: "Automata core v0.6.0+; SQLite v0.5.3+; HTTP and host v0.6.0+ when used; other modules are independently versioned; Go 1.26.2+; provider credentials are needed only for live runs"
 metadata:
   package: github.com/emotional-data8482/automata
 ---
@@ -11,7 +11,7 @@ metadata:
 
 Automata runs agents through one durable lifecycle. A `core.Agent` is an immutable definition (provider, prompt, tools, limits, output contract). A `core.Runtime` admits each task before running it, commits every step, and recovers after a restart without repeating completed work. Keep business state, authorization, and deterministic verification in application code.
 
-This skill targets the Runtime API, first released in v0.5.0. Direct `Agent.Run`, `Session`, `RunTyped`, `AsTool`, and `Approver` no longer exist; if an application uses them, migrate it with the table in the repository README ("Upgrading from v0.4"). Inspect `go.mod` first and keep the separately versioned Automata modules on compatible releases.
+This skill targets core v0.6.0 and the Runtime API, first released in v0.5.0. Direct `Agent.Run`, `Session`, `RunTyped`, `AsTool`, and `Approver` no longer exist; if an application uses them, migrate it with the table in the repository README ("Upgrading from v0.4"). Inspect `go.mod` first and keep the separately versioned Automata modules on compatible releases. Tool progress (`core.ReportToolProgress`) and `extensions/mcp` require core v0.5.3 or later. HTTP and host are published at v0.6.0; use SQLite v0.5.3 or later for the cancellation/reopen fix. Module versions need not match. Before upgrading a persistent v0.5 store, stop the owner and back it up: core v0.6 upgrades Runtime storage from version 9 to 10, and rollback requires restoring the backup.
 
 ## Workflow
 
@@ -25,6 +25,8 @@ This skill targets the Runtime API, first released in v0.5.0. Direct `Agent.Run`
    - Persistent store: `github.com/emotional-data8482/automata/extensions/sqlite`
    - Anthropic: `.../extensions/claude`; OpenAI-compatible: `.../extensions/openai`; OpenRouter: `.../extensions/openrouter`
    - First-party tools: `.../tools`; Tavily search backend: `.../extensions/tavily`
+   - MCP servers: `.../extensions/mcp` (`mcpclient` exposes a server's tools as `core.Tool`s; `mcpserver` serves `core.Tool`s to MCP clients)
+   - HTTP/SSE API: `.../extensions/httpserver`; durable server entry point: `.../host` (published v0.6.0 dependencies, no local replacements)
 
 3. **Design boundaries before prompts**
    - Give each agent one role and only the tools it needs.
@@ -42,14 +44,15 @@ This skill targets the Runtime API, first released in v0.5.0. Direct `Agent.Run`
    - `rt.Run(ctx, ref, task, opts...)`: admit and await.
    - `rt.RunStream(ctx, ref, task, onEvent, opts...)`: the same with a live view.
    - `rt.Submit(...)` + `handle.Await/Snapshot/Events/Cancel`: long-running or host-driven work.
-   - Options: `core.WithIdempotencyKey(scope, key)` for external task IDs, `core.WithDeadline(t)`, `core.WithConversation(ref, head)` for multi-turn chats.
+   - Options: `core.WithIdempotencyKey(scope, key)` for external task IDs, `core.WithDeadline(t)`, `core.WithConversation(ref, head)` for multi-turn chats, `core.WithLabels(labels)` for host annotations.
+   - Use `Runtime.Runs` for listing, `Changes`/`WaitChanges` for a committed global change feed, and `Agent.Describe`/`Runtime.Describe` for definition manifests.
 
 6. **Handle partial and uncertain outcomes**
    - Always inspect `core.RunResult` even when `err != nil`; transcript, usage, and turns are populated as far as the run got.
    - A run that needs attention (`core.ErrRunNeedsAttention`) is waiting for the host: reconcile an uncertain tool call, authorize a fresh provider attempt, acknowledge hooks, or cancel. See the recovery runbook in `docs/durable-runtime.md`.
 
 7. **Verify without spending model tokens**
-   - Test tools directly, and test agents with a scripted `core.Provider` through `core.NewEphemeralRuntime()`.
+   - Test tools directly, and use `core/coretest` for scripted providers, recorded requests, and Runtime fixtures. For restart-sensitive responses, use a transcript-driven provider rather than a call counter.
    - Run `gofmt`, `go test ./...`, and `go test -race ./...` for concurrent tool state; tool calls in one model turn run concurrently.
 
 ## Minimal Claude Agent
@@ -119,8 +122,10 @@ Note: `core.Func` treats a returned Go error as fatal to the run. Return `core.E
 - Fatal: a tool's Go error, logical cancellation (`RunHandle.Cancel`), the run deadline.
 - Tool calls in one turn run concurrently; results commit in model order. Protect shared state.
 - Tools are never retried implicitly. Wrap only idempotent operations with `core.WithToolRetry`.
-- Mutating tools: wrap with `core.WithToolEffectPolicy{Kind: core.ToolEffectMutating}` and report `EffectApplied` / `EffectNotApplied` / `EffectUnknown` on every return; send `core.ToolOperationFromContext(ctx).IdempotencyKey` to the destination.
+- Mutating tools: wrap with `core.WithToolEffectPolicy(tool, core.ToolEffectPolicy{Kind: core.ToolEffectMutating})` and report `EffectApplied` / `EffectNotApplied` / `EffectUnknown` on every return; send the `IdempotencyKey` of `core.ToolOperationFromContext(ctx)` to the destination.
 - A crash between dispatch and the committed outcome leaves the call uncertain; the run needs attention until the host calls `handle.Reconcile` with the destination's authoritative answer. The tool is never re-executed.
+- Long-running tools report provisional progress with `core.ReportToolProgress(ctx, core.ToolProgress{Progress: done, Total: total, Message: status})`. Reports reach live views as `StreamToolProgress` events before the call's result, are never persisted, and are dropped once `Execute` returns. Report at a rate a person could follow.
+- MCP server tools (`mcpclient`) are ordinary tools: server `isError` results and JSON-RPC errors are recoverable, a broken connection is fatal, and nothing is retried. They arrive unclassified with no approval requirement; wrap them like local tools.
 
 ## Architecture Defaults
 
@@ -128,7 +133,7 @@ Note: `core.Func` treats a returned Go error as fatal to the run. Return `core.E
 - `core.ChildTool[P](name, description, childRef)` for delegation; the child receives its validated arguments as JSON, so describe the fields in its system prompt.
 - `core.OutputSchema[T]()` + `core.Decode[T](result)` for anything Go consumes; never parse prose.
 - Conversations (`core.WithConversation`) only when later turns need earlier ones.
-- `core.StreamAccumulator` for UI/SSE state; child events arrive tagged by `Agent` and `InvocationID`.
+- `core.StreamAccumulator` for UI/SSE state; child events arrive tagged by `Agent` and `InvocationID`, and each tool call's view keeps its latest `Progress`.
 - Committed events (`handle.Events` from a saved cursor) for reliable delivery to other systems; live streams are provisional and may drop events.
 
 ## Production Safety Checklist
@@ -139,6 +144,7 @@ Note: `core.Func` treats a returned Go error as fatal to the run. Return `core.E
 - Every side-effecting tool declares its effect policy and uses the operation idempotency key.
 - Approvals bind the exact action (`ActionDigest`) and are authorized by `RuntimeConfig.Authorizer` against current policy.
 - Filesystem tools use an isolated root, shell tools exact argv allow-lists, network tools egress policy.
+- MCP clients expose only the server tools a role needs (`ToolOptions.Include`, with a `Prefix` per server) and declare effects or approvals on mutating ones. Tools served through `mcpserver` bypass Runtime policy (timeouts, budgets, approvals, effect guards), so export only tools safe to call directly and authenticate the transport.
 - API keys come from secret configuration, never prompts, transcripts, or logs.
 - An operator path exists for runs that need attention (reconcile, provider fresh attempts, hook acknowledgement, cancel) and for retention (`Runtime.Prune`).
 - Tests use scripted providers and cover tool failure, cancellation, max turns, and partial results.
@@ -148,5 +154,5 @@ Note: `core.Func` treats a returned Go error as fatal to the run. Return `core.E
 Load only the reference needed for the task:
 
 - [Core API and execution semantics](references/core-api.md)
-- [Providers and first-party tools](references/providers-and-tools.md)
+- [Providers, first-party tools, and MCP](references/providers-and-tools.md)
 - [Durability, streaming, typed output, children, approvals, and testing patterns](references/patterns.md)

@@ -8,9 +8,18 @@ authoritative, and this file must not grow into a stale duplicate of them.
 
 | Lifecycle | Entry points | Authoritative sources |
 | --- | --- | --- |
-| Runtime (the only lifecycle) | `core.Runtime`: `NewRuntime`/`NewEphemeralRuntime`, `Register` (returns `DefinitionRef`), `Submit`/`Run`/`RunStream` with `WithIdempotencyKey`/`WithDeadline`/`WithConversation`, `Recover`, `Prune`, `Conversation`, `Close`; `RunHandle`: `Await`, `Cancel`, `Snapshot`, `Observe`, `Events`/`WaitEvents`, `ResolveWait`, `Reconcile`, `AcknowledgeHooks`; `CommittedRunHook`s; `core.Store` and `extensions/sqlite` | `docs/durable-runtime.md`, `core/runtime*.go`, `core/example_test.go`, `extensions/AGENTS.md`, `extensions/sqlite/README.md` |
-| Definitions and typed helpers | `core.New`/`AgentConfig`, `Func`/`FuncResult`, `WithToolEffectPolicy`, `WithDurableWait`, `ChildTool`/`NewChildTool`, `OutputSchema`, `Decode` | `core/agent.go`, `core/tools.go`, `core/children.go`, `core/typed.go`, `README.md` |
-| Live streaming | `Runtime.RunStream`, `RunHandle.Observe`, child-event forwarding, `core.StreamAccumulator` | `core/stream.go`, `core/runtime.go` (`publish`), `core/accumulator.go`, `docs/durable-runtime.md#observation` |
+| Runtime (the only lifecycle) | `core.Runtime`: `NewRuntime`/`NewEphemeralRuntime`, `Register` (returns `DefinitionRef`), `Submit`/`Run`/`RunStream` with `WithIdempotencyKey`/`WithDeadline`/`WithConversation`/`WithLabels`, `Runs`, `Changes`/`WaitChanges`, `Describe`, `Recover`, `Prune`, `Conversation`, `Close`; `RunHandle`: `Await`, `Cancel`, `Snapshot`, `Observe`, `Events`/`WaitEvents`, `ResolveWait`, `Reconcile`, `AcknowledgeHooks`; `CommittedRunHook`s; `core.Store` and `extensions/sqlite` | `docs/durable-runtime.md`, `core/runtime*.go`, `core/example_test.go`, `extensions/AGENTS.md`, `extensions/sqlite/README.md` |
+| Definitions and typed helpers | `core.New`/`AgentConfig`, `Func`/`FuncResult`, `WithToolEffectPolicy`, `WithDurableWait`, `ChildTool`/`NewChildTool`, `OutputSchema`, `Decode`, `Agent.Describe`, `CurrentTime` | `core/agent.go`, `core/tools.go`, `core/children.go`, `core/typed.go`, `README.md` |
+| Live streaming | `Runtime.RunStream`, `RunHandle.Observe`, child-event forwarding, `core.ReportToolProgress`/`WithToolProgress`, `core.StreamAccumulator` | `core/stream.go`, `core/progress.go`, `core/runtime_live.go` (`publish`, `attachAncestors`), `core/accumulator.go`, `docs/durable-runtime.md#observation` |
+
+HTTP and host are independent published modules: `extensions/httpserver`
+serves the Runtime's committed state over HTTP/SSE; `host.Main`/`host.Run`
+own startup, recovery, retention, and shutdown. Inspect their READMEs and
+lifecycle tests together when changing server behavior. `core/coretest` is
+the stdlib-only provider/Runtime test kit, not a separate module.
+
+`core/AGENTS.md` ("Layout") says which `core/runtime_*.go` file owns each
+runtime role.
 
 Facts to keep straight:
 
@@ -32,19 +41,26 @@ Facts to keep straight:
   context, not shipped behavior; check each document's status before citing
   it as an implemented guarantee.
 
+Core v0.6 upgrades version-9 Runtime stores to version 10 in one transaction.
+Inspect `core/runtime_store_upgrade_test.go` and the storage-upgrade section
+of `docs/durable-runtime.md`; back up before upgrading and restore that backup
+for rollback. SQLite `v0.5.3` includes the transaction cancellation/reopen fix;
+HTTP and host `v0.6.0` are published, with host pinned to that SQLite patch.
+
 ## Change impact
 
 | Change | Inspect together |
 | --- | --- |
 | Message or block model | `core/blocks.go`, `core/types.go`, JSON round-trip tests, every provider adapter present under `extensions/`, `extensions/mcp` content conversion |
-| Run loop or errors | `core/loop.go`, `core/loopmachine.go`, `core/runtime.go` (failure persistence and `snapshotError`), `README.md` |
+| Run loop or errors | `core/loop.go`, `core/loopmachine.go`, `core/runtime_execute.go` (failure and attention transitions), `core/runtime_snapshot.go` (`snapshotError`), `README.md` |
 | Tool execution | `core/tools.go`, `core/runtime_tools.go`, waits, policy, effect policy, rich results, child tools, `extensions/mcp` (error mapping; schema lowering follows `core/schemacontract.go`) |
-| Streaming | `core/stream.go`, `core/runtime.go` (`publish`, `attachAncestors`), accumulator, every affected provider stream implementation |
+| Streaming or tool progress | `core/stream.go`, `core/progress.go`, `core/runtime_live.go` (`publish`, `attachAncestors`), accumulator, every affected provider stream implementation, `extensions/mcp` progress bridging (client and server) |
+| MCP bridge | `extensions/mcp/AGENTS.md`; `mcpclient` (error mapping, schema lowering, content degradation, progress) and `mcpserver` (argument validation outside Runtime policy, result mapping, progress tokens) |
 | Typed output | `core/typed.go`, schema derivation/validation, provider capability mapping |
 | Provider options | `core/provider.go`, request builders of the affected adapters, docs/examples |
-| Durable runtime or storage | `core/runtime*.go`, `core/waits.go`, `docs/durable-runtime.md`, `extensions/sqlite`, `internal/durabletest` |
+| Durable runtime or storage | `core/runtime*.go` (recovery decisions in `runtime_recovery_table.go`, applied by `runtime_recover.go`; terminal and attention transitions in `runtime_disposition.go`), `core/waits.go`, `docs/durable-runtime.md`, `core/storetest`, `extensions/sqlite`, `internal/durabletest` |
 | First-party tool API | `tools/`, affected backend extension, security bounds, consumer examples |
-| Module/version change | every published `go.mod`, `go.work`, examples, README release contract |
+| Module/version change | every published `go.mod`, `go.work`, `scripts/modules.json`, `.github/workflows`, examples, README release contract, `scripts/README.md` |
 
 Discover the provider set instead of assuming it: enumerate `extensions/*`
 adapters and read each adapter's `AGENTS.md` when a shared contract changes.
@@ -60,7 +76,7 @@ ladder. Then discover, classify, and test.
 
 | Class | Members | Properties |
 | --- | --- | --- |
-| Published | root (`core`), `tools`, and extensions listed in `scripts/modules.json` | tagged independently; release validation rejects replacements and exclusions |
+| Published | root (`core`, `retry`, `tracing`), `tools`, `host`, and extensions listed in `scripts/modules.json` | tagged independently; release validation rejects replacements and exclusions |
 | Example | `examples/*` | `replace` directives as dev conveniences, never tagged, never released |
 | Private fixture | `internal/durabletest` | local-only test fixture, gitignored and absent from `go.work`, never published |
 
@@ -72,11 +88,17 @@ CI-only publication workflow. Do not infer membership from memory.
 
 ```sh
 go test ./<affected package>       # targeted behavior
-go test -race ./core               # runtime, streams, tool batches, children, accumulators, hooks
+go test -race ./core               # runtime, streams, tool progress, tool batches, children, accumulators, hooks
 go test ./...                      # from each affected nested module directory
 GOWORK=off go test ./...           # published modules with dependencies or interfaces changed
 go build ./...                     # affected example modules, without credentials
 ```
+
+`scripts/check-modules.sh` runs the same checks as CI without publishing:
+`inventory` (`scripts/modules.json` matches `go.work`), `format`, `workspace`,
+`race <module>` for the inventory's race targets (root, `extensions/sqlite`,
+`extensions/mcp`, `extensions/httpserver`, `host`), and `release <module>` for an isolated release-readiness
+check.
 
 ### Claiming results
 
@@ -85,9 +107,11 @@ go build ./...                     # affected example modules, without credentia
   currently pinned in each module's `go.mod` — it does not by itself prove
   compatibility with every previously tagged release. Release readiness requires
   finalized requirements on published dependency versions and no replacements;
-  update those files in ordinary PRs before tagging.
-- Run race tests for changes to the runtime, streams, tool batches, children,
-  accumulators, hooks, or other concurrent state.
+  update those files in ordinary PRs before tagging. A module built on
+  unreleased core passes the workspace and fails `GOWORK=off` until core is
+  released and its requirement is bumped.
+- Run race tests for changes to the runtime, streams, tool progress, tool
+  batches, children, accumulators, hooks, or other concurrent state.
 - Live provider calls are opt-in integration checks; never require them for
   ordinary unit validation, and never claim provider behavior from unit tests
   alone.

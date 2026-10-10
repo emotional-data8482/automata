@@ -1,6 +1,6 @@
 # Application Patterns
 
-The repository's `core/example_test.go` holds compiled, output-checked versions of these patterns, and `examples/durable_host` shows a multi-process host.
+The repository's `core/example_test.go` holds compiled, output-checked examples. `examples/durable_host` demonstrates multi-process recovery over a separately owned SQLite store; `examples/durable_typed` demonstrates typed agents. For the HTTP server entry point, see `host/README.md`.
 
 ## Durable Service Integration
 
@@ -91,6 +91,17 @@ renderFinal(result, acc.Views(), acc.Totals())
 | `core.StreamToolProgress` | `ToolCall` (ID and Name), `Progress` from `core.ReportToolProgress` (outside a Runtime, receive it with `core.WithToolProgress`) |
 | `core.StreamToolResult` | `ToolCall`, `Result`, `ResultBlocks`, `IsError`, `Err` |
 
+A long-running tool reports progress from inside `Execute`:
+
+```go
+for i, file := range files {
+    core.ReportToolProgress(ctx, core.ToolProgress{Progress: float64(i), Total: float64(len(files)), Message: file})
+    // ... index file ...
+}
+```
+
+Each report arrives as a `StreamToolProgress` event before the call's result, including on ancestor views of a child run. Progress is provisional: never persisted, droppable by a bounded view, and ignored after `Execute` returns. The accumulator keeps each call's latest report in `ToolCallView.Progress`.
+
 Child-run events carry `Agent` (the child tool name) and `InvocationID` (the call that started the child); nested children keep the innermost tags. `StreamAccumulator.Views()` lists the observed run first, then child invocations in first-seen order. Live views are bounded and provisional: they drop events rather than slow the run. For reliable delivery (webhooks, queues, another process), read committed events:
 
 ```go
@@ -152,6 +163,25 @@ Compaction changes only the provider-facing view, keeps system and recent messag
 
 ## Testing Without Live Models
 
-Implement a scripted `core.Provider` that returns `core.Response{Message: core.AssistantMessage(...), StopReason: core.StopToolUse or StopEndTurn}` and run agents through `core.NewEphemeralRuntime()`. Deterministic providers that decide from the request transcript (not a call counter) keep working across restarts in multi-process tests.
+Core v0.6 includes a stdlib-only test kit:
+
+```go
+func TestAnswer(t *testing.T) {
+    provider := coretest.NewProvider(coretest.Text("done"))
+    agent := coretest.NewAgent(t, provider, core.AgentConfig{})
+    rt := coretest.NewRuntime(t, core.RuntimeConfig{}) // cleaned up by t.Cleanup
+    ref := coretest.Register(t, rt, "assistant", "v1", agent)
+    result, err := rt.Run(context.Background(), ref, "finish")
+    if err != nil || result.Output != "done" {
+        t.Fatalf("result=%+v err=%v", result, err)
+    }
+}
+```
+
+Import `github.com/emotional-data8482/automata/core/coretest`. Use `NewStreamProvider` for streaming, `ToolCall`/`ToolCalls` for tool turns, and `Requests()` to inspect what the provider saw. `ReusableStore` permits a memory-backed close/reopen fixture; it is not a substitute for SQLite process-crash tests.
+
+For restart-sensitive responses, implement a scripted `core.Provider` that returns `core.Response{Message: core.AssistantMessage(...), StopReason: core.StopToolUse or StopEndTurn}` and run agents through `core.NewEphemeralRuntime()`. Deterministic providers that decide from the request transcript (not a call counter) keep working across restarts in multi-process tests.
 
 Cover normal completion and typed decoding; tool request, result, and final turn; concurrent tool calls; recoverable tool errors and unknown tools; cancellation with `RunHandle.Cancel` and deadlines with `WithDeadline`; `ErrMaxTurnsExceeded` with a populated transcript; token-limit or incomplete `CompletionError` with partial output; approvals and denials; and, with a SQLite store in a temp dir, restart and reconciliation paths.
+
+To test a tool's progress without a Runtime, install a receiver with `ctx, stop := core.WithToolProgress(ctx, receive)`, call `Execute`, then call `stop` before asserting. Test MCP integrations over `mcp.NewInMemoryTransports()` instead of starting server subprocesses.

@@ -33,7 +33,7 @@ passed") in every report.
   unrelated dirty state; work around it and report it in the result.
 - Read the complete applicable instruction ancestry, not just the closest
   file: root `AGENTS.md` plus the `AGENTS.md` of every affected module and
-  package (`core/`, `tools/`, `extensions/`, `extensions/<provider>/`,
+  package (`core/`, `tools/`, `extensions/`, `extensions/<name>/`,
   `examples/`, `retry/`, `tracing/`). Nested guidance narrows root guidance;
   apply the most specific rules first.
 - Ground claims in current code, tests, `README.md`, and `docs/`. Treat
@@ -55,7 +55,8 @@ which layer the change touches:
   `Decode`). Anything that changes execution must be pinned by a registered
   revision or persisted with the admission.
 - **Shared** — the block model and transcript ordering, the live stream event
-  contract, and provider-neutral boundaries.
+  contract (including provisional tool progress), and provider-neutral
+  boundaries, including the MCP bridge in `extensions/mcp`.
 
 Preserve everywhere: partial `RunResult` data on failure; tool
 results committed in model request order; parent-run cancellation and
@@ -78,22 +79,43 @@ First apply the affected package's own `AGENTS.md` validation rules; they
 override the generic ladder below. Then:
 
 1. Discover affected modules from `go.mod` files and `go.work`; classify each
-   as published (`core`, `tools`, `extensions/*` — tagged independently;
-   release validation rejects replacements and exclusions), example
-   (`examples/*` — `replace` directives, never tagged), or private fixture
-   (`internal/durabletest`, local-only and absent from `go.work`).
-2. Run the narrowest useful checks first: targeted package tests, then
-   `go test -race ./core` for concurrency-sensitive changes (sessions,
-   streams, tool batches, accumulators, hooks).
+   with the `scripts/modules.json` inventory as published (root, `tools`,
+   `host`, `extensions/*` — tagged independently; release validation rejects
+   replacements and exclusions), example (`examples/*` — `replace`
+   directives, never tagged), or private fixture (`internal/durabletest`,
+   local-only and absent from `go.work`).
+2. Run the narrowest useful checks first: targeted package tests, then race
+   tests for concurrency-sensitive changes (runtime, streams, tool progress,
+   tool batches, children, accumulators, hooks). The inventory's race targets
+   are the root, `extensions/sqlite`, `extensions/mcp`,
+   `extensions/httpserver`, and `host`;
+   `scripts/check-modules.sh race <module>` runs one as CI does.
 3. For cross-module changes, test the root and every affected nested module.
    For published modules also run `GOWORK=off go test ./...`. Report workspace
    and workspace-off results separately — they are different claims, and
    neither alone proves compatibility with previously tagged published
-   versions.
+   versions. A module that uses unreleased core passes the workspace but not
+   `GOWORK=off` until core is released and its requirement is bumped.
 4. Build affected examples without credentials. Live provider calls are opt-in
    integration checks and are never required for ordinary validation.
 5. Report commands actually run with results, failures, deliberately skipped
    checks, and residual risk. Never present proposed validation as executed.
+
+Publication happens only through the approved **Release module** GitHub
+Actions workflow, one module per dispatch (see `scripts/README.md`).
+`scripts/release.sh` is its CI-only entry point, never a local check. Without
+an explicit release request, do not run it, dispatch the workflow, create
+tags, or push. Internal dependency versions are minimum compatible versions,
+not coordinated release numbers. Publish dependencies first, finalize each
+consumer's requirements and checksums in an ordinary PR with
+`GOWORK=off go mod tidy`, and pass `scripts/check-modules.sh release <module>` before dispatch.
+Wait for public-proxy consumer verification before releasing the next module.
+
+The v0.6 shipping baseline is core `v0.6.0`, SQLite `v0.5.3` (including the
+cancellation/reopen fix), HTTP `v0.6.0`, and host `v0.6.0`. Other modules retain
+their own tags; do not assume their current source has been published. Back up
+version-9 stores before core upgrades them transactionally to version 10;
+rollback requires restoring the backup (see `README.md`, "Upgrading to v0.6").
 
 ## 6. Delegate only when authorized and capable
 
