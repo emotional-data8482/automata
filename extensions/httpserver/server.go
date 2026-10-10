@@ -33,16 +33,22 @@ const (
 	ActionResolve  Action = "resolve_wait"
 	ActionChanges  Action = "changes"
 	ActionDescribe Action = "describe"
+	// ActionReconcile settles an uncertain tool operation; ActionAcknowledge
+	// acknowledges interrupted hook delivery. Both are operator decisions
+	// about external effects.
+	ActionReconcile   Action = "reconcile"
+	ActionAcknowledge Action = "acknowledge_hooks"
 )
 
 // Request describes an authorized operation. RunID is set for operations on
-// one run, Definition for submissions and manifests, and WaitID for wait
-// answers.
+// one run, Definition for submissions and manifests, WaitID for wait
+// answers, and OperationID for reconciliation.
 type Request struct {
-	Action     Action
-	RunID      string
-	WaitID     string
-	Definition core.DefinitionRef
+	Action      Action
+	RunID       string
+	WaitID      string
+	OperationID string
+	Definition  core.DefinitionRef
 }
 
 // ErrUnauthenticated is returned by an Authorize function to answer 401
@@ -106,6 +112,10 @@ func AllowAll(*http.Request, Request) error { return nil }
 //	GET  /v1/runs/{id}/events          committed events (JSON page or SSE)
 //	POST /v1/runs/{id}/cancel          cancel a run and its descendants
 //	POST /v1/runs/{id}/waits/{wait}    answer a question or approval
+//	POST /v1/runs/{id}/operations/{op}/reconcile
+//	                                   settle an uncertain tool operation
+//	POST /v1/runs/{id}/hooks/acknowledge
+//	                                   acknowledge interrupted hook delivery
 //	GET  /v1/changes                   runtime-wide change feed (JSON or SSE)
 //	GET  /v1/definitions/{id}/{rev}    definition manifest
 type Server struct {
@@ -141,6 +151,8 @@ func New(config Config) (*Server, error) {
 	s.mux.HandleFunc("GET /v1/runs/{id}/events", s.events)
 	s.mux.HandleFunc("POST /v1/runs/{id}/cancel", s.cancel)
 	s.mux.HandleFunc("POST /v1/runs/{id}/waits/{wait}", s.resolveWait)
+	s.mux.HandleFunc("POST /v1/runs/{id}/operations/{op}/reconcile", s.reconcile)
+	s.mux.HandleFunc("POST /v1/runs/{id}/hooks/acknowledge", s.acknowledgeHooks)
 	s.mux.HandleFunc("GET /v1/changes", s.changes)
 	s.mux.HandleFunc("GET /v1/definitions/{id}/{revision}", s.describe)
 	return s, nil
@@ -214,6 +226,8 @@ func writeRuntimeError(w http.ResponseWriter, err error) {
 		status, code = http.StatusConflict, "conversation_busy"
 	case errors.Is(err, core.ErrConversationConflict), errors.Is(err, core.ErrConversationBlocked):
 		status, code = http.StatusConflict, "conversation_conflict"
+	case errors.Is(err, core.ErrReconciliationConflict):
+		status, code = http.StatusConflict, "reconciliation_conflict"
 	case errors.Is(err, core.ErrWaitConflict), errors.Is(err, core.ErrWaitStale),
 		errors.Is(err, core.ErrWaitExpired), errors.Is(err, core.ErrApprovalActionMismatch):
 		status, code = http.StatusConflict, "wait_conflict"

@@ -38,6 +38,33 @@ type ResolveWaitRequest struct {
 	ActionDigest string          `json:"action_digest,omitempty"`
 }
 
+// ReconcileRequest is the body of POST
+// /v1/runs/{id}/operations/{op}/reconcile: what the destination
+// authoritatively reports about an uncertain operation, and the tool result
+// to commit to the model's history. Effect.Status must be "none",
+// "applied", or "not_applied". Result carries either Text or Blocks.
+type ReconcileRequest struct {
+	Result ReconcileResult   `json:"result"`
+	Effect core.EffectReport `json:"effect"`
+}
+
+type ReconcileResult struct {
+	Text    string      `json:"text,omitempty"`
+	Blocks  core.Blocks `json:"blocks,omitempty"`
+	IsError bool        `json:"is_error,omitempty"`
+}
+
+// OperationView is a tool operation awaiting reconciliation. Arguments is
+// set only when the server exposes content.
+type OperationView struct {
+	OperationID string                   `json:"operation_id"`
+	Tool        string                   `json:"tool"`
+	State       core.ToolInvocationState `json:"state"`
+	Effect      core.EffectStatus        `json:"effect,omitempty"`
+	ChildRunID  string                   `json:"child_run_id,omitempty"`
+	Arguments   json.RawMessage          `json:"arguments,omitempty"`
+}
+
 type DefinitionView struct {
 	ID       string `json:"id"`
 	Revision string `json:"revision,omitempty"`
@@ -69,23 +96,26 @@ type ConversationView struct {
 // RunView is a run's status. Content fields are set only when the server
 // exposes content.
 type RunView struct {
-	RunID         string               `json:"run_id"`
-	Definition    DefinitionView       `json:"definition"`
-	State         core.RuntimeState    `json:"state"`
-	Status        core.RunStatus       `json:"status,omitempty"`
-	Attention     *AttentionView       `json:"attention,omitempty"`
-	Failure       *FailureView         `json:"failure,omitempty"`
-	Parent        *ParentView          `json:"parent,omitempty"`
-	Conversation  *ConversationView    `json:"conversation,omitempty"`
-	Key           string               `json:"idempotency_key,omitempty"`
-	Labels        map[string]string    `json:"labels,omitempty"`
-	CreatedAt     *time.Time           `json:"created_at,omitempty"`
-	UpdatedAt     *time.Time           `json:"updated_at,omitempty"`
-	EventSequence uint64               `json:"event_sequence,omitempty"`
-	Turns         int                  `json:"turns,omitempty"`
-	Usage         *core.Usage          `json:"usage,omitempty"`
-	TreeRuns      int                  `json:"tree_runs,omitempty"`
-	Waits         []WaitView           `json:"waits,omitempty"`
+	RunID         string            `json:"run_id"`
+	Definition    DefinitionView    `json:"definition"`
+	State         core.RuntimeState `json:"state"`
+	Status        core.RunStatus    `json:"status,omitempty"`
+	Attention     *AttentionView    `json:"attention,omitempty"`
+	Failure       *FailureView      `json:"failure,omitempty"`
+	Parent        *ParentView       `json:"parent,omitempty"`
+	Conversation  *ConversationView `json:"conversation,omitempty"`
+	Key           string            `json:"idempotency_key,omitempty"`
+	Labels        map[string]string `json:"labels,omitempty"`
+	CreatedAt     *time.Time        `json:"created_at,omitempty"`
+	UpdatedAt     *time.Time        `json:"updated_at,omitempty"`
+	EventSequence uint64            `json:"event_sequence,omitempty"`
+	Turns         int               `json:"turns,omitempty"`
+	Usage         *core.Usage       `json:"usage,omitempty"`
+	TreeRuns      int               `json:"tree_runs,omitempty"`
+	Waits         []WaitView        `json:"waits,omitempty"`
+	// Uncertain lists tool operations whose outcome is unknown; settle each
+	// with the reconcile endpoint.
+	Uncertain     []OperationView      `json:"uncertain_operations,omitempty"`
 	Hooks         []core.RunHookResult `json:"hooks,omitempty"`
 	HistoryPruned bool                 `json:"history_pruned,omitempty"`
 
@@ -240,6 +270,21 @@ func (s *Server) snapshotView(snapshot core.RunSnapshot) RunView {
 	}
 	for _, wait := range snapshot.Waits {
 		view.Waits = append(view.Waits, s.waitView(wait))
+	}
+	for _, batch := range snapshot.ToolBatches {
+		for _, invocation := range batch.Invocations {
+			if invocation.State != core.ToolInvocationUncertain {
+				continue
+			}
+			operation := OperationView{
+				OperationID: invocation.OperationID, Tool: invocation.Call.Name, State: invocation.State,
+				Effect: invocation.Effect.Status, ChildRunID: invocation.ChildRunID,
+			}
+			if s.config.ExposeContent {
+				operation.Arguments = invocation.Call.Input
+			}
+			view.Uncertain = append(view.Uncertain, operation)
+		}
 	}
 	if s.config.ExposeContent {
 		view.Output = snapshot.Result.Output

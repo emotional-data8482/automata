@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"maps"
 	"net/http"
@@ -314,4 +315,85 @@ func pageLimit(r *http.Request) (int, error) {
 
 func wantsStream(r *http.Request) bool {
 	return r.URL.Query().Get("stream") == "true" || strings.Contains(r.Header.Get("Accept"), "text/event-stream")
+}
+
+func (s *Server) reconcile(w http.ResponseWriter, r *http.Request) {
+	runID, operationID := r.PathValue("id"), r.PathValue("op")
+	var body ReconcileRequest
+	if !s.decode(w, r, &body) {
+		return
+	}
+	if body.Result.Text != "" && len(body.Result.Blocks) > 0 {
+		badRequest(w, "result carries either text or blocks, not both")
+		return
+	}
+	switch body.Effect.Status {
+	case core.EffectNone, core.EffectApplied, core.EffectNotApplied:
+	default:
+		badRequest(w, "effect status must be none, applied, or not_applied")
+		return
+	}
+	scope, ok := s.authorize(w, r, Request{Action: ActionReconcile, RunID: runID, OperationID: operationID})
+	if !ok {
+		return
+	}
+	if _, err := s.runSnapshot(r.Context(), scope, runID); err != nil {
+		writeRuntimeError(w, err)
+		return
+	}
+	result := core.ToolResult{Blocks: body.Result.Blocks, IsError: body.Result.IsError}
+	if body.Result.Text != "" {
+		result.Blocks = core.Blocks{core.TextBlock{Text: body.Result.Text}}
+	}
+	handle := s.config.Runtime.Handle(runID)
+	if err := handle.Reconcile(r.Context(), operationID, core.EffectResolution{Result: result, Effect: body.Effect}); err != nil {
+		if isValidation(err) && !isReconcileError(err) {
+			badRequest(w, "%v", err)
+			return
+		}
+		writeRuntimeError(w, err)
+		return
+	}
+	s.writeRun(w, r, handle)
+}
+
+func isReconcileError(err error) bool {
+	return errors.Is(err, core.ErrReconciliationConflict) || errors.Is(err, core.ErrOperationNotFound) ||
+		errors.Is(err, core.ErrRunNotFound) || isContextError(err)
+}
+
+// acknowledgeHooks resolves a run left needing attention because committed-run
+// hook delivery was interrupted. The operator asserts the hooks' possible
+// effects are handled; they are never invoked again.
+func (s *Server) acknowledgeHooks(w http.ResponseWriter, r *http.Request) {
+	runID := r.PathValue("id")
+	scope, ok := s.authorize(w, r, Request{Action: ActionAcknowledge, RunID: runID})
+	if !ok {
+		return
+	}
+	snapshot, err := s.runSnapshot(r.Context(), scope, runID)
+	if err != nil {
+		writeRuntimeError(w, err)
+		return
+	}
+	handle := s.config.Runtime.Handle(runID)
+	if err := handle.AcknowledgeHooks(r.Context()); err != nil {
+		if errors.Is(err, core.ErrRunNotFound) || errors.Is(err, core.ErrRuntimeClosed) || isContextError(err) {
+			writeRuntimeError(w, err)
+			return
+		}
+		writeError(w, http.StatusConflict, "not_awaiting_acknowledgement",
+			fmt.Sprintf("run is %s, not awaiting hook acknowledgement", snapshot.State))
+		return
+	}
+	s.writeRun(w, r, handle)
+}
+
+func (s *Server) writeRun(w http.ResponseWriter, r *http.Request, handle *core.RunHandle) {
+	snapshot, err := handle.Snapshot(r.Context())
+	if err != nil {
+		writeRuntimeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, s.snapshotView(snapshot))
 }

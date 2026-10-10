@@ -23,6 +23,8 @@ http.Handle("/", server)
 | `GET /v1/runs/{id}/events` | Committed events as a JSON page, or SSE with `Accept: text/event-stream` |
 | `POST /v1/runs/{id}/cancel` | Cancel a run and its descendants |
 | `POST /v1/runs/{id}/waits/{wait}` | Answer a question or decide an approval |
+| `POST /v1/runs/{id}/operations/{op}/reconcile` | Settle an uncertain tool operation (listed as `uncertain_operations` on the run) with the destination's answer; the tool never runs again |
+| `POST /v1/runs/{id}/hooks/acknowledge` | Acknowledge interrupted committed-run hook delivery; the hooks never run again |
 | `GET /v1/changes` | Runtime-wide change feed (single-tenant servers only), JSON or SSE; `events=true` attaches events |
 | `GET /v1/definitions/{id}/{revision}` | Definition manifest |
 
