@@ -112,6 +112,19 @@ func TestHTTPFetchRejects(t *testing.T) {
 	}
 }
 
+func TestExtractTextCaseFoldingDoesNotShiftOffsets(t *testing.T) {
+	// U+0130 lowercases to three bytes, so a lowercased copy of the document
+	// is longer than the original and byte offsets into it no longer line up.
+	doc := strings.Repeat("İ", 20) + "<p>hello</p><script>secret()</script>world"
+	got := extractText(doc)
+	if strings.Contains(got, "secret") {
+		t.Errorf("script contents leaked:\n%s", got)
+	}
+	if !strings.Contains(got, "hello") || !strings.Contains(got, "world") {
+		t.Errorf("text around script missing:\n%q", got)
+	}
+}
+
 func TestExtractTextUnclosedSkipContainer(t *testing.T) {
 	if got := extractText("<p>before</p><script>var x = 1;"); got != "before" {
 		t.Errorf("got %q, want %q", got, "before")

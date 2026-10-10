@@ -122,7 +122,7 @@ var blockTags = map[string]bool{
 // entities are decoded. It is deliberately "readability-ish" — good enough to
 // hand a model the words on the page, not a faithful DOM rendering.
 func extractText(doc string) string {
-	lower := strings.ToLower(doc)
+	lower := asciiLower(doc)
 	var b strings.Builder
 	i := 0
 	for i < len(doc) {
@@ -175,6 +175,32 @@ func extractText(doc string) string {
 		}
 	}
 	return normalizeText(html.UnescapeString(b.String()))
+}
+
+// asciiLower lowercases ASCII letters in place, leaving every other byte
+// untouched. Unlike strings.ToLower it never changes the string's byte length,
+// so offsets computed against the result stay valid in the original document
+// (strings.ToLower can, for example, expand U+0130 'İ' from two bytes to
+// three, which would drift any byte offsets taken from it).
+func asciiLower(s string) string {
+	// Fast path: nothing to fold.
+	needsFold := false
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 'A' && s[i] <= 'Z' {
+			needsFold = true
+			break
+		}
+	}
+	if !needsFold {
+		return s
+	}
+	b := []byte(s)
+	for i, c := range b {
+		if c >= 'A' && c <= 'Z' {
+			b[i] = c + ('a' - 'A')
+		}
+	}
+	return string(b)
 }
 
 // tagName extracts the element name from raw tag content (already lowercased,
