@@ -65,12 +65,10 @@ func (t *retryTool) Execute(ctx context.Context, args json.RawMessage) (ToolResu
 	return last, err
 }
 func (t *retryTool) toolEffectPolicy() ToolEffectPolicy {
-	policy, _ := effectPolicyFor(t.Tool)
-	return policy
+	return declaredEffectPolicy(t.Tool)
 }
 func (t *retryTool) durableWaitPolicy() DurableWaitPolicy {
-	policy, _, _ := waitPolicyFor(t.Tool)
-	return policy
+	return declaredWaitPolicy(t.Tool)
 }
 
 type nonRetryableToolEffectError struct{ cause error }
@@ -89,12 +87,10 @@ func WithToolRetry(t Tool, cfg retry.Config) Tool { return &retryTool{Tool: t, c
 type legacyErrorTool struct{ Tool }
 
 func (t *legacyErrorTool) toolEffectPolicy() ToolEffectPolicy {
-	policy, _ := effectPolicyFor(t.Tool)
-	return policy
+	return declaredEffectPolicy(t.Tool)
 }
 func (t *legacyErrorTool) durableWaitPolicy() DurableWaitPolicy {
-	policy, _, _ := waitPolicyFor(t.Tool)
-	return policy
+	return declaredWaitPolicy(t.Tool)
 }
 
 func (t *legacyErrorTool) Execute(ctx context.Context, args json.RawMessage) (ToolResult, error) {

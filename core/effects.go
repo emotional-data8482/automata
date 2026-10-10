@@ -99,8 +99,7 @@ type effectPolicyTool struct {
 
 func (t *effectPolicyTool) toolEffectPolicy() ToolEffectPolicy { return t.policy }
 func (t *effectPolicyTool) durableWaitPolicy() DurableWaitPolicy {
-	policy, _, _ := waitPolicyFor(t.Tool)
-	return policy
+	return declaredWaitPolicy(t.Tool)
 }
 
 // WithToolEffectPolicy attaches an explicit durable effect contract to a Tool.
@@ -113,11 +112,17 @@ type toolEffectPolicyProvider interface {
 	toolEffectPolicy() ToolEffectPolicy
 }
 
-func effectPolicyFor(tool Tool) (ToolEffectPolicy, error) {
-	policy := ToolEffectPolicy{Kind: ToolEffectLegacy}
+// declaredEffectPolicy returns the effect policy a tool declares, unvalidated,
+// so wrappers forward the innermost policy and its validation error.
+func declaredEffectPolicy(tool Tool) ToolEffectPolicy {
 	if provider, ok := tool.(toolEffectPolicyProvider); ok {
-		policy = provider.toolEffectPolicy()
+		return provider.toolEffectPolicy()
 	}
+	return ToolEffectPolicy{Kind: ToolEffectLegacy}
+}
+
+func effectPolicyFor(tool Tool) (ToolEffectPolicy, error) {
+	policy := declaredEffectPolicy(tool)
 	switch policy.Kind {
 	case ToolEffectLegacy, ToolEffectReadOnly, ToolEffectMutating:
 	default:
