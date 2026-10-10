@@ -19,8 +19,9 @@
 //
 // ReadFile and the load_skill tool declare [core.ToolEffectReadOnly]. WriteFile declares
 // [core.ToolEffectMutating], reports an [core.EffectApplied] content-digest
-// receipt after a successful write, and installs a sandbox-root/path semantic
-// guard for durable Runtime execution. A crash after dispatch is still
-// uncertain until reconciled; local storage cannot prove what the filesystem
-// did.
+// receipt after a successful write. Each new model call is a fresh write,
+// including restoring older content; durable admission and committed outcomes
+// prevent replay without a permanent semantic guard. A crash after dispatch
+// is still uncertain until reconciled; local storage cannot prove what the
+// filesystem did.
 package tools

@@ -19,7 +19,7 @@ func (t *funcTool[P]) Definition() ToolDefinition { return cloneToolDefinition(t
 func (t *funcTool[P]) Execute(ctx context.Context, args json.RawMessage) (ToolResult, error) {
 	var params P
 	if len(args) > 0 && string(args) != "null" {
-		if err := json.Unmarshal(canonicalIntegralNumbers(args), &params); err != nil {
+		if err := json.Unmarshal(canonicalIntegralNumbers(args, reflect.TypeFor[P]()), &params); err != nil {
 			// The handler never ran: a model argument mistake the schema
 			// check could not catch (such as an int64 overflow) is
 			// recoverable, not fatal.

@@ -65,6 +65,7 @@ type loopMachine struct {
 	tools      []ToolDefinition
 	registry   map[string]registeredTool
 	hooks      []PreSendHook
+	clockTimes currentTimeStamps
 	request    Request
 	response   Response
 	calls      []ToolUseBlock
@@ -355,6 +356,14 @@ func (m *loopMachine) prepareTurn() loopState {
 			tracing.Int("step", step),
 			tracing.Int("hook_count", len(m.hooks)),
 		)
+		messageIndex := -1
+		for i := len(l.messages) - 1; i >= 0; i-- {
+			if l.messages[i].Role == "user" {
+				messageIndex = i
+				break
+			}
+		}
+		hookCtx = context.WithValue(hookCtx, currentTimeContextKey{}, currentTimeContext{times: &m.clockTimes, message: messageIndex})
 		var hookErr error
 		for i, hook := range m.hooks {
 			inMsgs, inTools := len(req.Messages), len(req.Tools)

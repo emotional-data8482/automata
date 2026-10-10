@@ -65,9 +65,9 @@ func (p *scriptedProvider) Invoke(context.Context, core.Request) (core.Response,
 	return core.Response{Message: m, StopReason: stop}, nil
 }
 
-// A file the agent wrote can be revised by a later run; only an identical
-// retry of the same content is deduplicated (bug review X1).
-func TestWriteFileGuardAllowsRevisions(t *testing.T) {
+// Every new model call can revise a file, including restoring older content.
+// An exact admission retry returns its committed outcome without writing again.
+func TestWriteFileAllowsRevisionsWithoutReplayingAdmissions(t *testing.T) {
 	root := t.TempDir()
 	runtime, err := core.NewRuntime(context.Background(), core.RuntimeConfig{Store: core.NewMemoryStore()})
 	if err != nil {
@@ -84,7 +84,8 @@ func TestWriteFileGuardAllowsRevisions(t *testing.T) {
 	var turns []core.Message
 	turns = append(turns, write("w1", "v1")...)
 	turns = append(turns, write("w2", "v2")...)
-	turns = append(turns, write("w3", "v2")...)
+	turns = append(turns, write("w3", "v1")...)
+	turns = append(turns, write("w4", "v1")...)
 	agent, err := core.New(&scriptedProvider{turns: turns}, core.AgentConfig{Tools: []core.Tool{WriteFile(root)}})
 	if err != nil {
 		t.Fatal(err)
@@ -94,10 +95,28 @@ func TestWriteFileGuardAllowsRevisions(t *testing.T) {
 		t.Fatal(err)
 	}
 	var results []string
-	for range 3 {
-		result, err := runtime.Run(context.Background(), ref, "write the notes")
+	var firstRun string
+	for i, want := range []string{"v1", "v2", "v1", "v1"} {
+		result, err := runtime.Run(context.Background(), ref, "write the notes", core.WithIdempotencyKey("writes", fmt.Sprint(i)))
 		if err != nil {
 			t.Fatal(err)
+		}
+		if i == 0 {
+			firstRun = result.RunID
+		}
+		data, err := os.ReadFile(filepath.Join(root, "notes.md"))
+		if err != nil || string(data) != want {
+			t.Fatalf("revision %d = %q, %v; want %q", i, data, err, want)
+		}
+		if i == 1 {
+			retry, err := runtime.Run(context.Background(), ref, "write the notes", core.WithIdempotencyKey("writes", "0"))
+			if err != nil || retry.RunID != firstRun {
+				t.Fatalf("admission retry = %s, %v; want %s", retry.RunID, err, firstRun)
+			}
+			data, err = os.ReadFile(filepath.Join(root, "notes.md"))
+			if err != nil || string(data) != "v2" {
+				t.Fatalf("admission retry rewrote the file: %q, %v", data, err)
+			}
 		}
 		for _, message := range result.Messages {
 			for _, block := range message.Blocks {
@@ -107,11 +126,12 @@ func TestWriteFileGuardAllowsRevisions(t *testing.T) {
 			}
 		}
 	}
-	data, err := os.ReadFile(filepath.Join(root, "notes.md"))
-	if err != nil || string(data) != "v2" {
-		t.Fatalf("file = %q, %v; want the revision v2", data, err)
+	if len(results) != 4 {
+		t.Fatalf("results = %q; want four committed writes", results)
 	}
-	if len(results) != 3 || !strings.HasPrefix(results[0], "wrote") || !strings.HasPrefix(results[1], "wrote") || !strings.Contains(results[2], "denied") {
-		t.Fatalf("results = %q; want two writes then a denied identical retry", results)
+	for _, result := range results {
+		if !strings.HasPrefix(result, "wrote") {
+			t.Fatalf("results = %q; every new model call should write", results)
+		}
 	}
 }

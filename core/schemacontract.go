@@ -1,7 +1,6 @@
 package core
 
 import (
-	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,7 +10,6 @@ import (
 	"regexp"
 	"sort"
 	"strconv"
-	"strings"
 )
 
 // This file is the one supported schema contract shared by every declared
@@ -611,63 +609,4 @@ func goIntRange(kind reflect.Kind) (*big.Int, *big.Int) {
 	default: // Uint, Uint64
 		return new(big.Int), new(big.Int).SetUint64(math.MaxUint64)
 	}
-}
-
-// canonicalIntegralNumbers rewrites integral JSON numbers written with a
-// fraction or exponent (2.0, 1e3) as plain integers, so encoding/json decodes
-// them into Go integer fields the way the schema contract already accepts
-// them. Floats decode identically either way. Numbers whose integer form
-// would exceed 20 digits are left alone: they fit no Go integer, and the
-// decode error reports them. raw is returned unchanged when nothing is
-// rewritten or it is not valid JSON.
-func canonicalIntegralNumbers(raw json.RawMessage) json.RawMessage {
-	if !bytes.ContainsAny(raw, ".eE") {
-		return raw
-	}
-	var value any
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.UseNumber()
-	if decoder.Decode(&value) != nil {
-		return raw
-	}
-	changed := false
-	var walk func(any) any
-	walk = func(v any) any {
-		switch v := v.(type) {
-		case map[string]any:
-			for key, item := range v {
-				v[key] = walk(item)
-			}
-		case []any:
-			for i, item := range v {
-				v[i] = walk(item)
-			}
-		case json.Number:
-			literal := v.String()
-			if !strings.ContainsAny(literal, ".eE") || len(literal) > 64 {
-				return v
-			}
-			if exponent := strings.IndexAny(literal, "eE"); exponent >= 0 {
-				if e, err := strconv.Atoi(strings.TrimPrefix(literal[exponent+1:], "+")); err != nil || e > 20 {
-					return v
-				}
-			}
-			r, ok := schemaNumberRat(v)
-			if !ok || !r.IsInt() || len(r.Num().String()) > 21 {
-				return v
-			}
-			changed = true
-			return json.Number(r.Num().String())
-		}
-		return v
-	}
-	value = walk(value)
-	if !changed {
-		return raw
-	}
-	out, err := json.Marshal(value)
-	if err != nil {
-		return raw
-	}
-	return out
 }

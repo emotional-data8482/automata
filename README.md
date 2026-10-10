@@ -628,9 +628,10 @@ never the committed transcript. The Claude provider's
 `WithConversationCache()` caches the message prefix.
 
 A model has no clock. `core.CurrentTime(nil)` is a pre-send hook that
-prefixes the latest user message with the current time. Each message keeps
-the time it was first sent, so a run's tool turns reuse the same prefix and
-prompt caches stay warm.
+prefixes the latest user message with the current time. Within each Runtime
+worker segment, a canonical user message keeps its first stamp across tool
+turns, so prompt caches stay warm. New runs, resumed segments, and direct hook
+calls get fresh stamps; timestamps are a rendered hint, not a durable clock.
 
 ## Examples
 
@@ -708,9 +709,10 @@ Behavior changes to expect:
   as `2.0` now decode into Go integer fields.
 - **Streaming tool calls without arguments** receive `{}`, as on the
   non-streaming path.
-- **`tools.WriteFile`** deduplicates only identical retries (same path and
-  content), so a run can revise a file. Pre-write failures report
-  `EffectNotApplied`.
+- **`tools.WriteFile`** allows every new model call to replace a file,
+  including restoring previous content. Durable admission retries and
+  committed tool outcomes prevent replay; there is no permanent path/content
+  semantic guard. Pre-write failures report `EffectNotApplied`.
 - **Recovery.** A run stopped by a graceful `Close` after its final answer
   was committed is finished by `Recover`, as after a crash. A run whose
   structured-output corrections ran out stays failed across a crash.

@@ -336,9 +336,9 @@
               },
               "text/event-stream": {
                 "schema": {
-                  "type": "string"
-                },
-                "description": "Each event's id is its sequence; data is the JSON view."
+                  "type": "string",
+                  "description": "Each event's id is its sequence; data is the JSON view."
+                }
               }
             }
           }
@@ -678,9 +678,9 @@
               },
               "text/event-stream": {
                 "schema": {
-                  "type": "string"
-                },
-                "description": "Each event's id is its sequence; data is the JSON view."
+                  "type": "string",
+                  "description": "Each event's id is its sequence; data is the JSON view."
+                }
               }
             }
           }

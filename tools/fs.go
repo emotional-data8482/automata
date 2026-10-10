@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -66,7 +65,9 @@ func readRootFile(root, name string) (string, error) {
 
 // WriteFile returns a "write_file" tool that writes files strictly inside
 // root, creating parent directories as needed. Path traversal and symlinks
-// that escape the root are rejected (enforced by [os.Root]).
+// that escape the root are rejected (enforced by [os.Root]). Each model call
+// is a new write, including restoring older content. Durable admission and
+// committed tool outcomes prevent replay; no store-wide semantic guard is used.
 func WriteFile(root string) core.Tool {
 	tool := core.FuncResult("write_file",
 		"Write a file (creating parent directories) inside the sandboxed working directory, replacing any existing content.",
@@ -122,18 +123,5 @@ func WriteFile(root string) core.Tool {
 	return core.WithToolEffectPolicy(tool, core.ToolEffectPolicy{
 		Kind:  core.ToolEffectMutating,
 		Scope: "filesystem:" + absoluteRoot,
-		SemanticKey: func(raw json.RawMessage) (string, error) {
-			var p writeFileParams
-			if err := json.Unmarshal(raw, &p); err != nil {
-				return "", err
-			}
-			if p.Path == "" {
-				return "", fmt.Errorf("path is required")
-			}
-			// Only an identical retry (same path and content) dedupes; a
-			// later revision of the same file is a new mutation.
-			digest := sha256.Sum256([]byte(p.Content))
-			return filepath.Clean(p.Path) + "#" + hex.EncodeToString(digest[:]), nil
-		},
 	})
 }

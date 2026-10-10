@@ -199,8 +199,9 @@ The provider-neutral `core.Store` contract is a small atomic transaction port:
 Core owns bucket names and versioned encodings; adapters own database details
 and must pass `core/storetest`. `extensions/sqlite` is the supported local
 adapter and keeps its driver out of the root module. It enforces one local
-owner with an OS advisory lock. Storage encoding version 9 is current; stores
-written by an earlier version are rejected without being rewritten.
+owner with an OS advisory lock. Records use encoding 9; the current store
+version is 10. See [Storage upgrades and backups](#storage-upgrades-and-backups)
+for the transactional version-9 store upgrade and rollback requirements.
 
 On recovery, admitted-but-unstarted work can run after its exact binding is
 registered. Accepted provider turns and durable tool batches resume from their
@@ -335,9 +336,12 @@ when a tool reports uncertainty: late reconciliation retains the evidence but
 never resumes the canceled run.
 
 `tools.ReadFile` is a representative read-only binding. `tools.WriteFile` is a
-mutating binding with a content-digest receipt and sandbox-root/path semantic
-guard. Custom legacy bindings should be deliberately wrapped as read-only or
-mutating before relying on restart recovery.
+mutating binding with a content-digest receipt. It has no permanent semantic
+guard: a new model call can intentionally restore earlier file content. Exact
+admission retries and committed invocation outcomes prevent replay, while a
+write interrupted after dispatch still requires reconciliation. Custom legacy
+bindings should be deliberately wrapped as read-only or mutating before
+relying on restart recovery.
 
 ## Durable questions and approvals
 

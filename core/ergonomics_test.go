@@ -141,7 +141,8 @@ func TestCurrentTimeStampsLatestUserMessageStably(t *testing.T) {
 	clock := time.Date(2026, 10, 10, 9, 30, 0, 0, time.UTC)
 	hook := CurrentTime(func() time.Time { return clock })
 	messages := []Message{UserMessage("earlier"), asstText("ok"), UserMessage("what day is it?")}
-	req, err := hook(context.Background(), Request{Messages: messages})
+	ctx := context.WithValue(context.Background(), currentTimeContextKey{}, currentTimeContext{times: &currentTimeStamps{}, message: 2})
+	req, err := hook(ctx, Request{Messages: messages})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -154,7 +155,7 @@ func TestCurrentTimeStampsLatestUserMessageStably(t *testing.T) {
 	// A later tool turn of the same run keeps the first stamp.
 	clock = clock.Add(time.Minute)
 	later := append(slices.Clone(messages), asstTool("c1", "lookup", `{}`), ToolResultBlockMessage("c1", Blocks{TextBlock{Text: "r"}}, false))
-	req, err = hook(context.Background(), Request{Messages: later})
+	req, err = hook(ctx, Request{Messages: later})
 	if err != nil {
 		t.Fatal(err)
 	}
