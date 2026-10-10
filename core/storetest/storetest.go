@@ -6,6 +6,7 @@ package storetest
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 
@@ -276,6 +277,153 @@ func Conformance(t *testing.T, open func(t *testing.T) core.Store) {
 		}
 		if len(seen) != 2 || seen[0] != "m/1" || seen[1] != "m/2" {
 			t.Fatalf("seen = %v, want [m/1 m/2]", seen)
+		}
+	})
+
+	// Runtime indexes (active runs, the run list, retention) are keys with
+	// empty values; a store that drops them loses whole indexes.
+	t.Run("EmptyValueMarkersAreStored", func(t *testing.T) {
+		store := open(t)
+		if err := store.Transaction(context.Background(), true, func(tx core.StoreTransaction) error {
+			if err := tx.Put("b", "nil", nil); err != nil {
+				return err
+			}
+			return tx.Put("b", "empty", []byte{})
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.Transaction(context.Background(), false, func(tx core.StoreTransaction) error {
+			for _, key := range []string{"nil", "empty"} {
+				value, err := tx.Get("b", key)
+				if err != nil {
+					t.Errorf("Get(%q) = %v, want an empty value", key, err)
+				} else if len(value) != 0 {
+					t.Errorf("Get(%q) = %q, want empty", key, value)
+				}
+			}
+			var scanned, paged []string
+			if err := tx.Scan("b", "", func(key string, _ []byte) error {
+				scanned = append(scanned, key)
+				return nil
+			}); err != nil {
+				return err
+			}
+			if _, err := tx.ScanPage("b", "", "", 10, func(key string, _ []byte) error {
+				paged = append(paged, key)
+				return nil
+			}); err != nil {
+				return err
+			}
+			if len(scanned) != 2 || len(paged) != 2 {
+				t.Errorf("scan = %v, page = %v; want both markers", scanned, paged)
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	// Runtime reads its own uncommitted writes inside one transaction, for
+	// example to charge a tool budget it just updated.
+	t.Run("TransactionReadsItsOwnWrites", func(t *testing.T) {
+		store := open(t)
+		if err := store.Transaction(context.Background(), true, func(tx core.StoreTransaction) error {
+			for _, key := range []string{"k/1", "k/2", "k/3"} {
+				if err := tx.Put("b", key, []byte("old")); err != nil {
+					return err
+				}
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.Transaction(context.Background(), true, func(tx core.StoreTransaction) error {
+			if err := tx.Put("b", "k/1", []byte("new")); err != nil {
+				return err
+			}
+			if err := tx.Put("b", "k/4", nil); err != nil {
+				return err
+			}
+			if err := tx.Delete("b", "k/2"); err != nil {
+				return err
+			}
+			if value, err := tx.Get("b", "k/1"); err != nil || string(value) != "new" {
+				t.Errorf("Get(k/1) = %q, %v; want the uncommitted overwrite", value, err)
+			}
+			if _, err := tx.Get("b", "k/4"); err != nil {
+				t.Errorf("Get(k/4) = %v; want the uncommitted put", err)
+			}
+			if _, err := tx.Get("b", "k/2"); !errors.Is(err, core.ErrStoreKeyNotFound) {
+				t.Errorf("Get(k/2) = %v; want the uncommitted delete", err)
+			}
+			want := "k/1=new k/3=old k/4="
+			var scanned, paged []string
+			if err := tx.Scan("b", "k/", func(key string, value []byte) error {
+				scanned = append(scanned, key+"="+string(value))
+				return nil
+			}); err != nil {
+				return err
+			}
+			after := ""
+			for {
+				last, err := tx.ScanPage("b", "k/", after, 2, func(key string, value []byte) error {
+					paged = append(paged, key+"="+string(value))
+					return nil
+				})
+				if err != nil {
+					return err
+				}
+				if last == "" {
+					break
+				}
+				after = last
+			}
+			if got := strings.Join(scanned, " "); got != want {
+				t.Errorf("Scan = %q, want %q", got, want)
+			}
+			if got := strings.Join(paged, " "); got != want {
+				t.Errorf("ScanPage = %q, want %q", got, want)
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	// The run list and change feed seek with cursors that are not stored
+	// keys, including a 0xff byte that sorts after every index key.
+	t.Run("ScanPageSeeksPastAbsentCursor", func(t *testing.T) {
+		store := open(t)
+		keys := []string{"0000000000000001/run-a", "0000000000000002/run-b", "0000000000000002/run-c", "0000000000000003/run-d"}
+		if err := store.Transaction(context.Background(), true, func(tx core.StoreTransaction) error {
+			for _, key := range keys {
+				if err := tx.Put("b", key, nil); err != nil {
+					return err
+				}
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		for cursor, want := range map[string]string{
+			"0000000000000002/\xff":  "0000000000000003/run-d",
+			"0000000000000001/":      "0000000000000001/run-a 0000000000000002/run-b 0000000000000002/run-c 0000000000000003/run-d",
+			"0000000000000002/run-b": "0000000000000002/run-c 0000000000000003/run-d",
+			"0000000000000003/\xff":  "",
+		} {
+			var seen []string
+			if err := store.Transaction(context.Background(), false, func(tx core.StoreTransaction) error {
+				_, err := tx.ScanPage("b", "", cursor, 0, func(key string, _ []byte) error {
+					seen = append(seen, key)
+					return nil
+				})
+				return err
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if got := strings.Join(seen, " "); got != want {
+				t.Errorf("ScanPage after %q = %q, want %q", cursor, got, want)
+			}
 		}
 	})
 
