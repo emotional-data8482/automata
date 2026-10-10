@@ -11,6 +11,8 @@ import (
 type Config struct {
 	MaxAttempts  int
 	InitialDelay time.Duration
+	// MaxDelay is the ceiling on the nominal (pre-jitter) delay. A value <= 0
+	// disables the cap, so delays grow unbounded with the multiplier.
 	MaxDelay     time.Duration
 	Multiplier   float64
 	RetryUnknown bool
@@ -94,8 +96,10 @@ func backoff(cfg Config, attempt int) time.Duration {
 		multiplier = 1
 	}
 	delay := float64(cfg.InitialDelay) * math.Pow(multiplier, float64(attempt))
-	if max := float64(cfg.MaxDelay); delay > max {
-		delay = max
+	if cfg.MaxDelay > 0 {
+		if max := float64(cfg.MaxDelay); delay > max {
+			delay = max
+		}
 	}
 	// Scale by a random factor in [0.5, 1.0): jitter down from the nominal
 	// delay only, so a jittered delay never exceeds MaxDelay after the cap
