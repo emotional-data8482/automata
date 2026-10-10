@@ -18,6 +18,9 @@ const (
 	// runListIndexedMeta marks a store whose run list index covers every
 	// run, including runs admitted before the index existed.
 	runListIndexedMeta = "run_list_indexed"
+	// runListClockMeta holds the latest admission time, so admission times
+	// (and the index keys built from them) only move forward.
+	runListClockMeta = "run_list_clock"
 )
 
 // Label bounds keep labels small enough to live on the compact run record.
@@ -87,6 +90,30 @@ func runListTimeKey(at time.Time, runID string) string {
 		return fmt.Sprintf("%016x/%s", 0, runID)
 	}
 	return retentionIndexKey(at, runID)
+}
+
+// admissionTime returns now, or just after the latest admission when the
+// wall clock stepped backwards, and records it. Run list keys then follow
+// commit order, so a poller's saved cursor never skips a later admission.
+func admissionTime(tx StoreTransaction, now time.Time) (time.Time, error) {
+	now = now.UTC()
+	raw, err := tx.Get(runtimeMetaBucket, runListClockMeta)
+	if err == nil {
+		var last time.Time
+		if err := last.UnmarshalText(raw); err != nil {
+			return time.Time{}, fmt.Errorf("run list clock: %w", err)
+		}
+		if !now.After(last) {
+			now = last.Add(time.Nanosecond)
+		}
+	} else if !errors.Is(err, ErrStoreKeyNotFound) {
+		return time.Time{}, err
+	}
+	text, err := now.MarshalText()
+	if err != nil {
+		return time.Time{}, err
+	}
+	return now, tx.Put(runtimeMetaBucket, runListClockMeta, text)
 }
 
 func putRunListIndex(tx StoreTransaction, record storedRuntimeRun) error {
@@ -162,9 +189,12 @@ type RunSummary struct {
 	Conversation *ConversationRef
 	// Scope and Key are the run's idempotency identity, empty without one;
 	// a child run carries its root's scope and no key.
-	Scope     string
-	Key       string
-	Labels    map[string]string
+	Scope  string
+	Key    string
+	Labels map[string]string
+	// CreatedAt is the admission time. It never moves backwards across
+	// admissions: after a wall-clock step back it is just after the previous
+	// admission, so listing order follows admission order.
 	CreatedAt time.Time
 	UpdatedAt time.Time
 }

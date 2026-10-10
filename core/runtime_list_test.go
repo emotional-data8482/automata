@@ -237,3 +237,52 @@ func TestRuntimeRunsBackfillsAndPrunesIndex(t *testing.T) {
 		t.Fatalf("pruned runs still listed: %+v", page.Runs)
 	}
 }
+
+// A backwards wall-clock step must not sort a later admission below a
+// poller's saved cursor (bug review C5).
+func TestRuntimeRunsCursorSurvivesClockStepBack(t *testing.T) {
+	runtime := newTestRuntime(t)
+	ref, err := runtime.Register("agent", "v1", testAgent(&scriptedProvider{turns: []Message{asstText("a"), asstText("b")}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := runtime.Submit(context.Background(), ref, "first")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The first run was admitted while the clock read an hour ahead; the
+	// clock has since stepped back.
+	ahead := time.Now().Add(time.Hour).UTC()
+	if err := runtime.transaction(context.Background(), true, func(tx StoreTransaction) error {
+		record, err := getRuntimeRun(tx, first.ID())
+		if err != nil {
+			return err
+		}
+		if err := tx.Delete(runtimeRunListBucket, runListKey(record)); err != nil {
+			return err
+		}
+		record.CreatedAt = ahead
+		if err := putRuntimeRun(tx, record); err != nil {
+			return err
+		}
+		text, _ := ahead.MarshalText()
+		if err := tx.Put(runtimeMetaBucket, runListClockMeta, text); err != nil {
+			return err
+		}
+		return putRunListIndex(tx, record)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	page, err := runtime.Runs(context.Background(), RunFilter{})
+	if err != nil || len(page.Runs) != 1 || page.Runs[0].RunID != first.ID() {
+		t.Fatalf("first page = %#v, %v", page, err)
+	}
+	second, err := runtime.Submit(context.Background(), ref, "second")
+	if err != nil {
+		t.Fatal(err)
+	}
+	next, err := runtime.Runs(context.Background(), RunFilter{After: page.Next})
+	if err != nil || len(next.Runs) != 1 || next.Runs[0].RunID != second.ID() {
+		t.Fatalf("poll after cursor = %#v, %v; want the later admission", next, err)
+	}
+}

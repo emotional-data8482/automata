@@ -150,6 +150,11 @@ func (r *Runtime) admitChildRun(tx StoreTransaction, parent storedRuntimeRun, in
 		AdmissionScope: parent.AdmissionScope,
 		CreatedAt:      now,
 	}
+	createdAt, err := admissionTime(tx, now)
+	if err != nil {
+		return receipt, err
+	}
+	record.CreatedAt = createdAt
 	if err := putRuntimeRun(tx, record); err != nil {
 		return receipt, err
 	}

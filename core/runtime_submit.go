@@ -199,6 +199,9 @@ func (r *Runtime) submit(ctx context.Context, definition DefinitionRef, task str
 				}
 			}
 		}
+		if record.CreatedAt, err = admissionTime(tx, record.CreatedAt); err != nil {
+			return err
+		}
 		if err := putRuntimeRun(tx, record); err != nil {
 			return err
 		}
