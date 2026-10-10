@@ -15,9 +15,6 @@ const (
 	// runtimeRunListBucket indexes every run by admission time, so listing
 	// pages through runs in a stable order without reading every record.
 	runtimeRunListBucket = "runtime_run_list"
-	// runListIndexedMeta marks a store whose run list index covers every
-	// run, including runs admitted before the index existed.
-	runListIndexedMeta = "run_list_indexed"
 	// runListClockMeta holds the latest admission time, so admission times
 	// (and the index keys built from them) only move forward.
 	runListClockMeta = "run_list_clock"
@@ -120,32 +117,56 @@ func putRunListIndex(tx StoreTransaction, record storedRuntimeRun) error {
 	return tx.Put(runtimeRunListBucket, runListKey(record), nil)
 }
 
-// backfillRunListIndex indexes runs stored before the run list index
-// existed, once per store. Their admission time is unknown, so they sort
-// first.
-func backfillRunListIndex(tx StoreTransaction) error {
-	if _, err := tx.Get(runtimeMetaBucket, runListIndexedMeta); err == nil {
-		return nil
-	} else if !errors.Is(err, ErrStoreKeyNotFound) {
-		return err
-	}
-	var keys []string
+// upgradeStoreIndexes brings a version-9 store's indexes up to date: every
+// run enters the run list index, the admission clock starts after the latest
+// admission, and every run with no recorded change gets one, so the change
+// feed reports it and HoldUnsynced retention holds it until a consumer syncs
+// past it. Runs with no recorded admission time sort first.
+func upgradeStoreIndexes(tx StoreTransaction) error {
+	var records []storedRuntimeRun
 	if err := tx.Scan(runtimeRunsBucket, "", func(_ string, raw []byte) error {
 		record, err := decodeRuntimeRun(raw)
 		if err != nil {
 			return err
 		}
-		keys = append(keys, runListKey(record))
+		records = append(records, record)
 		return nil
 	}); err != nil {
 		return err
 	}
-	for _, key := range keys {
-		if err := tx.Put(runtimeRunListBucket, key, nil); err != nil {
+	slices.SortFunc(records, func(a, b storedRuntimeRun) int {
+		return strings.Compare(runListKey(a), runListKey(b))
+	})
+	var latest time.Time
+	var commits []runCommit
+	for _, record := range records {
+		if err := putRunListIndex(tx, record); err != nil {
+			return err
+		}
+		if record.CreatedAt.After(latest) {
+			latest = record.CreatedAt
+		}
+		if last, err := lastRunChange(tx, record.RunID); err != nil {
+			return err
+		} else if last != 0 {
+			continue
+		}
+		head, err := getEventHead(tx, record.RunID)
+		if err != nil {
+			return err
+		}
+		commit := runCommit{runID: record.RunID, head: head.Head, state: record.State}
+		if head.Head > head.Floor {
+			commit.firstEvent = head.Floor + 1
+		}
+		commits = append(commits, commit)
+	}
+	if !latest.IsZero() {
+		if _, err := admissionTime(tx, latest); err != nil {
 			return err
 		}
 	}
-	return tx.Put(runtimeMetaBucket, runListIndexedMeta, nil)
+	return appendRunChanges(tx, commits, time.Now().UTC())
 }
 
 // RunFilter selects runs for [Runtime.Runs]. Zero fields match every run;

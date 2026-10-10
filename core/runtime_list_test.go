@@ -209,7 +209,8 @@ func TestRuntimeRunsBackfillsAndPrunesIndex(t *testing.T) {
 		if err := deletePrefix(tx, runtimeRunListBucket, ""); err != nil {
 			return err
 		}
-		return tx.Delete(runtimeMetaBucket, runListIndexedMeta)
+		// A version-9 store: written by a release without the index.
+		return tx.Put(runtimeMetaBucket, "encoding", []byte("9"))
 	}); err != nil {
 		t.Fatal(err)
 	}

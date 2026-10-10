@@ -104,7 +104,8 @@ func getChangeHead(tx StoreTransaction) (storedEventHead, error) {
 }
 
 // lastRunChange is the run's latest change sequence, zero for a run with no
-// recorded change (stored before the feed existed).
+// recorded change. Opening a store upgrades runs stored before the feed
+// existed with a change of their own (see upgradeStoreIndexes).
 func lastRunChange(tx StoreTransaction, runID string) (uint64, error) {
 	raw, err := tx.Get(runtimeRunChangesBucket, runID)
 	if errors.Is(err, ErrStoreKeyNotFound) {

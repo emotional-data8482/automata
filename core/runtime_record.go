@@ -25,6 +25,13 @@ import (
 // without implicit rewrite.
 const runtimeEncodingVersion = 9
 
+// runtimeStoreVersion is the store-wide storage version. Version 10 keeps the
+// encoding-9 records and adds the run list index, the change feed, and the
+// admission clock. A version-9 store upgrades in place when opened; releases
+// that only know version 9 refuse a version-10 store, so they cannot write
+// runs the index and feed would miss.
+const runtimeStoreVersion = 10
+
 const (
 	runtimeMetaBucket         = "runtime_meta"
 	runtimeRunsBucket         = "runtime_runs"

@@ -691,7 +691,11 @@ Behavior changes to expect:
 - **Nesting.** A tool that runs another agent inside itself is not part of
   the parent's durable run. Use `ChildTool` for composition.
 - **Storage.** v0.5.0 is the first released Runtime version, using encoding 9.
-  Earlier pre-release stores are rejected, not migrated. See
+  Earlier pre-release stores are rejected, not migrated. v0.6.0 raises the
+  store version to 10 the first time it opens a version-9 store: it indexes
+  every existing run for `Runtime.Runs` and records one change per run in the
+  change feed. Releases before v0.6.0 refuse a version-10 store, so take a
+  backup before upgrading if you may need to roll back. See
   [storage upgrades](docs/durable-runtime.md#storage-upgrades-and-backups).
 
 ## Agent skill
