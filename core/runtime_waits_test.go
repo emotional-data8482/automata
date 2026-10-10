@@ -296,6 +296,9 @@ func TestRuntimeApprovalIsRevalidatedImmediatelyBeforeDispatch(t *testing.T) {
 }
 
 func TestRuntimeExpiredApprovalCannotDispatchAndRetryIsStable(t *testing.T) {
+	// The expiry must outlast the poll that observes the pending wait; with
+	// a shorter one, Runtime can expire the wait and finish the run first.
+	const expiry = 100 * time.Millisecond
 	provider := &scriptedProvider{turns: []Message{asstTool("write-1", "write", `{}`), asstText("expired safely")}}
 	var calls atomic.Int64
 	tool := FuncResult("write", "write", func(context.Context, struct{}) (ToolResult, error) {
@@ -303,7 +306,7 @@ func TestRuntimeExpiredApprovalCannotDispatchAndRetryIsStable(t *testing.T) {
 		return ToolResult{Blocks: Blocks{TextBlock{Text: "written"}}, Effect: EffectReport{Status: EffectApplied}}, nil
 	})
 	tool = WithToolEffectPolicy(tool, ToolEffectPolicy{Kind: ToolEffectMutating})
-	tool = WithDurableWait(tool, DurableWaitPolicy{Kind: WaitApproval, ExpiresAfter: time.Millisecond, Target: func(json.RawMessage) (string, error) { return "record-1", nil }})
+	tool = WithDurableWait(tool, DurableWaitPolicy{Kind: WaitApproval, ExpiresAfter: expiry, Target: func(json.RawMessage) (string, error) { return "record-1", nil }})
 	agent, err := New(provider, AgentConfig{Tools: []Tool{tool}})
 	if err != nil {
 		t.Fatal(err)
@@ -321,7 +324,7 @@ func TestRuntimeExpiredApprovalCannotDispatchAndRetryIsStable(t *testing.T) {
 		t.Fatal(err)
 	}
 	wait := waitForRuntimeWait(t, handle)
-	time.Sleep(2 * time.Millisecond)
+	time.Sleep(time.Until(wait.ExpiresAt) + time.Millisecond)
 	resolution := WaitResolution{Decision: Allow, ActionDigest: wait.ActionDigest}
 	if err := handle.ResolveWait(context.Background(), wait.ID, resolution); !errors.Is(err, ErrWaitExpired) {
 		t.Fatalf("expired resolution = %v", err)

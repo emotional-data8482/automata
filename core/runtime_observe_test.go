@@ -414,6 +414,11 @@ func TestRuntimeStalledObserverDoesNotBlockCommits(t *testing.T) {
 		}
 	}
 	runtime.mu.Unlock()
+	// The run can settle before the observer goroutine takes its first
+	// event, so wait for that callback rather than assume it already ran.
+	for deadline := time.Now().Add(2 * time.Second); delivered.Load() == 0 && time.Now().Before(deadline); {
+		time.Sleep(time.Millisecond)
+	}
 	if got := delivered.Load(); got != 1 {
 		t.Fatalf("stalled observer received %d callbacks, want 1", got)
 	}

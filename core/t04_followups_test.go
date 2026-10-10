@@ -296,6 +296,32 @@ func TestRuntimeFatalBatchEmitsQueuedCancellationResult(t *testing.T) {
 	}
 }
 
+// A view that first wakes after the run settled still delivers the events
+// the run buffered for it before settling.
+func TestFollowDeliversEventsBufferedBeforeSettle(t *testing.T) {
+	runtime := newTestRuntime(t)
+	if _, err := runtime.Register("agent", "v1", testAgent(&scriptedProvider{turns: []Message{asstText("done")}})); err != nil {
+		t.Fatal(err)
+	}
+	result, err := runtime.Run(context.Background(), DefinitionRef{ID: "agent", Revision: "v1"}, "work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := make(chan runtimeStreamItem, 3)
+	events <- runtimeStreamItem{event: StreamEvent{Kind: StreamToolResult, ToolCall: ToolUseBlock{ID: "first"}}}
+	events <- runtimeStreamItem{event: StreamEvent{Kind: StreamToolResult, ToolCall: ToolUseBlock{ID: "second"}}}
+	events <- runtimeStreamItem{terminal: true}
+	var got []string
+	if err := runtime.Handle(result.RunID).follow(context.Background(), events, func(event StreamEvent) {
+		got = append(got, event.ToolCall.ID)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0] != "first" || got[1] != "second" {
+		t.Fatalf("delivered %v, want [first second]", got)
+	}
+}
+
 // A fault on the hook-delivery marker leaves no hook invoked, so recovery
 // delivers each hook exactly once and commits the terminal result.
 func TestRuntimeRecoveryDeliversHookNeverStarted(t *testing.T) {

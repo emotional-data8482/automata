@@ -110,8 +110,14 @@ func (h *RunHandle) follow(ctx context.Context, events <-chan runtimeStreamItem,
 		}
 		if read || view.gone || view.closed || mayHaveSettled(view.state) {
 			_, settled, err := h.settledState(ctx)
-			if err != nil || settled {
+			if err != nil {
 				return err
+			}
+			if settled {
+				// The run published these events before it settled; deliver
+				// what is already buffered instead of dropping it.
+				drainLiveEvents(events, onEvent)
+				return nil
 			}
 			if view.closed {
 				return ErrRuntimeClosed
@@ -134,6 +140,24 @@ func (h *RunHandle) follow(ctx context.Context, events <-chan runtimeStreamItem,
 			case <-changed:
 				break wait
 			}
+		}
+	}
+}
+
+// drainLiveEvents delivers the events already buffered for a view, up to its
+// terminal marker, without waiting for more.
+func drainLiveEvents(events <-chan runtimeStreamItem, onEvent func(StreamEvent)) {
+	for {
+		select {
+		case item := <-events:
+			if item.terminal {
+				return
+			}
+			if onEvent != nil {
+				onEvent(item.event)
+			}
+		default:
+			return
 		}
 	}
 }
