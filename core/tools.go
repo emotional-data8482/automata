@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"github.com/emotional-data8482/automata/retry"
 	"reflect"
 	"strings"
@@ -20,8 +19,13 @@ func (t *funcTool[P]) Definition() ToolDefinition { return cloneToolDefinition(t
 func (t *funcTool[P]) Execute(ctx context.Context, args json.RawMessage) (ToolResult, error) {
 	var params P
 	if len(args) > 0 && string(args) != "null" {
-		if err := json.Unmarshal(args, &params); err != nil {
-			return ToolResult{}, fmt.Errorf("invalid args: %w", err)
+		if err := json.Unmarshal(canonicalIntegralNumbers(args), &params); err != nil {
+			// The handler never ran: a model argument mistake the schema
+			// check could not catch (such as an int64 overflow) is
+			// recoverable, not fatal.
+			result := ErrorResult("invalid args: " + err.Error())
+			result.Effect = EffectReport{Status: EffectNotApplied}
+			return result, nil
 		}
 	}
 	return t.handler(ctx, params)
@@ -38,7 +42,9 @@ func Func[P any](name, description string, handler func(context.Context, P) (str
 
 // FuncResult wraps a typed rich handler with a root input schema derived from P.
 // Its single Execute method preserves blocks through registration and wrappers.
-// ErrorResult is recoverable; a non-nil Go error aborts execution.
+// ErrorResult is recoverable; a non-nil Go error aborts execution. Arguments
+// that fail to decode into P (for example an integer that overflows its field)
+// return a recoverable not-applied error result without calling handler.
 func FuncResult[P any](name, description string, handler func(context.Context, P) (ToolResult, error)) Tool {
 	return &funcTool[P]{definition: buildDefinition(name, description, reflect.TypeFor[P]()), handler: handler}
 }

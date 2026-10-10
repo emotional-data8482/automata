@@ -379,7 +379,7 @@ func firstJSONObject(text string) (int, int, bool) {
 
 func decodeTyped[T any](raw json.RawMessage) (T, error) {
 	var v T
-	if err := json.Unmarshal(raw, &v); err != nil {
+	if err := json.Unmarshal(canonicalIntegralNumbers(raw), &v); err != nil {
 		return v, fmt.Errorf("decode structured output: %w", err)
 	}
 	return v, nil

@@ -1,6 +1,7 @@
 package core
 
 import (
+	"context"
 	"encoding/json"
 	"reflect"
 	"strings"
@@ -473,5 +474,41 @@ func TestRegisterToolsSchemaEnforcement(t *testing.T) {
 	}
 	if len(defs) != 1 || len(registry) != 1 {
 		t.Fatalf("registration result = %d defs, %d registry", len(defs), len(registry))
+	}
+}
+
+// Integral numbers written as 2.0 or 1e3 satisfy "integer" and must decode into
+// Go integer fields; values a Go integer kind cannot hold are violations on the
+// typed path and recoverable results on the tool path (bug review E3).
+func TestGoIntegerArgumentsMatchDecoding(t *testing.T) {
+	type args struct {
+		N int   `json:"n"`
+		U uint8 `json:"u"`
+	}
+	var got args
+	tool := FuncResult("count", "count", func(_ context.Context, a args) (ToolResult, error) {
+		got = a
+		return TextResult("ok"), nil
+	})
+	for _, input := range []string{`{"n":2.0,"u":1e2}`, `{"n":2E0,"u":100.000}`} {
+		out, err := tool.Execute(context.Background(), json.RawMessage(input))
+		if err != nil || out.IsError || got.N != 2 || got.U != 100 {
+			t.Fatalf("Execute(%s) = %#v, %v; decoded %+v", input, out, err, got)
+		}
+	}
+	out, err := tool.Execute(context.Background(), json.RawMessage(`{"n":1e30,"u":1}`))
+	if err != nil || !out.IsError || out.Effect.Status != EffectNotApplied {
+		t.Fatalf("overflow = %#v, %v; want a recoverable error result", out, err)
+	}
+
+	if violations := validateTypedPayload[args]([]byte(`{"n":3,"u":-1}`)); len(violations) != 1 || !strings.Contains(violations[0], "out of range") {
+		t.Fatalf("negative uint8 violations = %v", violations)
+	}
+	if violations := validateTypedPayload[args]([]byte(`{"n":3,"u":256}`)); len(violations) != 1 {
+		t.Fatalf("uint8 overflow violations = %v", violations)
+	}
+	decoded, err := Decode[args](RunResult{StructuredOutput: json.RawMessage(`{"n":2.0,"u":7}`)})
+	if err != nil || decoded.N != 2 || decoded.U != 7 {
+		t.Fatalf("Decode = %+v, %v", decoded, err)
 	}
 }

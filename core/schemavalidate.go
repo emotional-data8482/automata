@@ -82,7 +82,7 @@ func typeContract(t reflect.Type, visiting map[reflect.Type]bool) schemaContract
 		return schemaContract{typ: "boolean", display: "boolean", nullable: nullable}
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
 		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		return schemaContract{typ: "integer", display: "integer", nullable: nullable}
+		return schemaContract{typ: "integer", display: "integer", nullable: nullable, goInt: t.Kind()}
 	case reflect.Float32, reflect.Float64:
 		return schemaContract{typ: "number", display: "number", nullable: nullable}
 	case reflect.Slice, reflect.Array:
