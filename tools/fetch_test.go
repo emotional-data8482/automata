@@ -143,6 +143,12 @@ func TestExtractTextHeadBoundaryIgnoresLiterals(t *testing.T) {
 		"head close in script":        `<script>const markup = "</head><body>";</script>`,
 		"head close in comment":       `<!-- </head><body> hidden -->`,
 		"unicode":                     `<title>İ Hidden title</title><!-- <BODY> -->`,
+		"script in template":          `<template><script>const markup = "</template><body>"; const secret = "hidden";</script></template>`,
+		"nested templates":            `<template><template>inner</template><body>hidden</body></template>`,
+		"comment in template":         `<template><!-- </template></head><body> -->hidden</template>`,
+		"attribute in template":       `<template><div data-html="</template><body>">hidden</div></template>`,
+		"style in template":           `<template><style>p::before { content: "</template><body>"; }</style></template>`,
+		"nested template script":      `<template><template><script>const markup = "</template></head><body>";</script></template><body>hidden</body></template>`,
 	} {
 		for _, closeHead := range []string{"</head>", ""} {
 			t.Run(name+"/"+closeHead, func(t *testing.T) {
@@ -162,6 +168,8 @@ func TestExtractTextUnclosedHeadContent(t *testing.T) {
 		`<meta content='<body>`,
 		`<title>hidden <body>`,
 		`<meta charset="utf-8">`,
+		`<template><script>const markup = "</template><body>";</script><body>hidden`,
+		`<template><template>inner</template><body>hidden`,
 	} {
 		if got := extractText("<p>before</p><head>" + head); got != "before" {
 			t.Errorf("head %q: got %q, want before", head, got)

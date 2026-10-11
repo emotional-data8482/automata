@@ -192,6 +192,7 @@ func extractText(doc string) string {
 // supply a head boundary. A missing boundary returns -1.
 func headEnd(doc string) int {
 	container := ""
+	templateDepth := 0
 	for i := 0; i < len(doc); {
 		needle := "<"
 		if container != "" {
@@ -239,10 +240,21 @@ func headEnd(doc string) int {
 			}
 			continue
 		}
-		if (closing && name == "head") || (!closing && name == "body") {
+		// Templates contain markup, not raw text. Track nesting while
+		// continuing to recognize comments, attributes and raw containers
+		// inside them; their contents cannot end the surrounding head.
+		if name == "template" {
+			if !closing {
+				templateDepth++
+			} else if templateDepth > 0 {
+				templateDepth--
+			}
+			continue
+		}
+		if templateDepth == 0 && ((closing && name == "head") || (!closing && name == "body")) {
 			return i
 		}
-		if !closing && (skipContainers[name] || name == "title") {
+		if !closing && name != "head" && (skipContainers[name] || name == "title") {
 			container = name
 		}
 	}
