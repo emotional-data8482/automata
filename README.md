@@ -31,7 +31,7 @@ It is built for agents inside web servers and job workers, not notebooks.
 | `agents` | Typed shorthand over `core`: `Define[I, O]` builds and registers a definition, then runs it or exposes it as a child tool |
 | `core/storetest` | Conformance suite for `core.Store` adapters |
 | `core/coretest` | Test kit: a scripted provider (`NewProvider`, `NewStreamProvider`) that replays turns and records requests, plus `Runtime` fixtures |
-| `tools` (module) | First-party tools: `HTTPFetch`, `ReadFile`/`WriteFile` (sandboxed), `Shell` (allow-listed), `WebSearch`; `LoadAgentsMD` and `LoadSkills` for AGENTS.md instructions and Agent Skills |
+| `tools` (module) | First-party tools: `HTTPFetch`, `ReadFile`/`WriteFile` (rooted), `Shell` (allow-listed), with pluggable `FileSystem` and `Executor` backends for sandboxes, `WebSearch`; `LoadAgentsMD` and `LoadSkills` for AGENTS.md instructions and Agent Skills |
 | `extensions/sqlite` (module) | The supported persistent store: one exclusive local owner, WAL, `synchronous=FULL` |
 | `extensions/claude` (module) | Anthropic provider; thinking, images, prompt caching, native structured output |
 | `extensions/openai` (module) | OpenAI Chat Completions provider (stdlib-only); any OpenAI-compatible base URL |
@@ -259,6 +259,34 @@ core.AgentConfig{ToolPolicy: core.ToolPolicy{
 Policy timeouts and budget denials are recoverable tool results. Tools and
 limiters must honor context cancellation, because Go cannot stop a function
 that ignores its context.
+
+### Sandboxed file and shell tools
+
+`tools.ReadFile(root)`, `tools.WriteFile(root)` and `tools.Shell(cfg)` act on
+the host by default. To run the same tools inside a container, a VM or a
+remote workspace, implement `tools.FileSystem` and `tools.Executor` for the
+sandbox and pass them in:
+
+```go
+// Fragment
+fsys := sandboxFS{}       // implements tools.FileSystem
+executor := sandboxExec{}    // implements tools.Executor
+agentTools := []core.Tool{
+	tools.ReadFileFS(fsys),
+	tools.WriteFileFS(fsys),
+	tools.Shell(tools.ShellConfig{Allow: []string{"go", "git"}, Executor: executor}),
+}
+```
+
+The tools keep their validation, limits and effect reports whatever the
+backend: paths are checked before they reach the filesystem, the allow-list
+is checked before a command reaches the executor, output and reads stay
+bounded, and the shell timeout stays recoverable. Both interfaces receive
+the tool call's context, so one durable definition can resolve each run's
+sandbox from `core.ToolOperationFromContext`. A `WriteFile` error that wraps
+`tools.ErrNotWritten` reports `EffectNotApplied`; any other error reports
+`EffectUnknown`. A filesystem with an `EffectScope() string` method sets the
+write tool's effect scope.
 
 ### MCP servers
 
