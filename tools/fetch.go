@@ -154,17 +154,19 @@ func extractText(doc string) string {
 		i += end + 1
 
 		if !closing && skipContainers[name] {
-			// Drop everything through the matching close tag; an unclosed
-			// container swallows the rest of the document. </head> is
-			// optional in HTML, so a head without one ends at <body:
-			// otherwise the entire page would be dropped with the head.
+			// </head> is optional: stop at a real body start tag, not a
+			// body literal inside head content or an attribute.
+			if name == "head" {
+				end := headEnd(lower[i:])
+				if end < 0 {
+					break
+				}
+				i += end
+				continue
+			}
+			// Other unclosed containers swallow the rest of the document.
 			rest := lower[i:]
 			j := strings.Index(rest, "</"+name)
-			if name == "head" {
-				if k := strings.Index(rest, "<body"); k >= 0 && (j < 0 || k < j) {
-					j = k
-				}
-			}
 			if j < 0 {
 				break
 			}
@@ -182,6 +184,69 @@ func extractText(doc string) string {
 		}
 	}
 	return normalizeText(html.UnescapeString(b.String()))
+}
+
+// headEnd returns the offset after </head> or the opening <body> tag in
+// ASCII-lowercased HTML. Like extractText, this is a bounded, lightweight scan,
+// not a DOM parser. Comments, quoted attributes and skipped containers cannot
+// supply a head boundary. A missing boundary returns -1.
+func headEnd(doc string) int {
+	container := ""
+	for i := 0; i < len(doc); {
+		needle := "<"
+		if container != "" {
+			// Raw content may contain arbitrary '<' and quotes. Only a
+			// matching close tag can end the container.
+			needle = "</" + container
+		}
+		next := strings.Index(doc[i:], needle)
+		if next < 0 {
+			return -1
+		}
+		i += next
+		if container == "" && strings.HasPrefix(doc[i:], "<!--") {
+			end := strings.Index(doc[i+4:], "-->")
+			if end < 0 {
+				return -1
+			}
+			i += 4 + end + 3
+			continue
+		}
+
+		// A '>' inside a quoted attribute does not end the tag.
+		end := i + 1
+		var quote byte
+		for ; end < len(doc); end++ {
+			c := doc[end]
+			if quote != 0 {
+				if c == quote {
+					quote = 0
+				}
+			} else if c == '\'' || c == '"' {
+				quote = c
+			} else if c == '>' {
+				break
+			}
+		}
+		if end == len(doc) {
+			return -1
+		}
+		name, closing := tagName(doc[i+1 : end])
+		i = end + 1
+		if container != "" {
+			if closing && name == container {
+				container = ""
+			}
+			continue
+		}
+		if (closing && name == "head") || (!closing && name == "body") {
+			return i
+		}
+		if !closing && (skipContainers[name] || name == "title") {
+			container = name
+		}
+	}
+	return -1
 }
 
 // asciiLower lowercases ASCII letters, leaving every other byte
