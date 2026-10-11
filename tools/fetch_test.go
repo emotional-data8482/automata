@@ -130,3 +130,58 @@ func TestExtractTextUnclosedSkipContainer(t *testing.T) {
 		t.Errorf("got %q, want %q", got, "before")
 	}
 }
+
+func TestExtractTextHeadBoundaryIgnoresLiterals(t *testing.T) {
+	for name, head := range map[string]string{
+		"script":                      `<script>const markup = "<body>"; const secret = "hidden";</script>`,
+		"comment":                     `<!-- <body> hidden comment -->`,
+		"style":                       `<style>p::before { content: "<body>"; }</style>`,
+		"title":                       `<title>Literal <body> title</title>`,
+		"attribute":                   `<meta content='<body> hidden'>`,
+		"attribute with greater-than": `<meta content='> <body> hidden'>`,
+		"tag prefix":                  `<bodyguard>hidden`,
+		"head close in script":        `<script>const markup = "</head><body>";</script>`,
+		"head close in comment":       `<!-- </head><body> hidden -->`,
+		"unicode":                     `<title>İ Hidden title</title><!-- <BODY> -->`,
+		"script in template":          `<template><script>const markup = "</template><body>"; const secret = "hidden";</script></template>`,
+		"nested templates":            `<template><template>inner</template><body>hidden</body></template>`,
+		"comment in template":         `<template><!-- </template></head><body> -->hidden</template>`,
+		"attribute in template":       `<template><div data-html="</template><body>">hidden</div></template>`,
+		"style in template":           `<template><style>p::before { content: "</template><body>"; }</style></template>`,
+		"nested template script":      `<template><template><script>const markup = "</template></head><body>";</script></template><body>hidden</body></template>`,
+	} {
+		for _, closeHead := range []string{"</head>", ""} {
+			t.Run(name+"/"+closeHead, func(t *testing.T) {
+				doc := "<html><head>" + head + "<title>Hidden title</title>" + closeHead + "<BODY class='page'><p>hello</p></BODY></html>"
+				if got := extractText(doc); got != "hello" {
+					t.Fatalf("got %q, want hello", got)
+				}
+			})
+		}
+	}
+}
+
+func TestExtractTextUnclosedHeadContent(t *testing.T) {
+	for _, head := range []string{
+		`<script>const markup = "<body>";`,
+		`<!-- <body>`,
+		`<meta content='<body>`,
+		`<title>hidden <body>`,
+		`<meta charset="utf-8">`,
+		`<template><script>const markup = "</template><body>";</script><body>hidden`,
+		`<template><template>inner</template><body>hidden`,
+	} {
+		if got := extractText("<p>before</p><head>" + head); got != "before" {
+			t.Errorf("head %q: got %q, want before", head, got)
+		}
+	}
+}
+
+func TestExtractTextHeadWithoutCloseTag(t *testing.T) {
+	// </head> is optional in HTML; the head skip must stop at <body> so the
+	// page text is not swallowed along with the head.
+	doc := "<html><head><title>t</title><body><p>hello</p></body></html>"
+	if got := extractText(doc); got != "hello" {
+		t.Errorf("got %q, want %q", got, "hello")
+	}
+}

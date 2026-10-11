@@ -6,6 +6,11 @@
 // AGENTS.md instruction files for an agent's system prompt, and [LoadSkills]
 // loads Agent Skills as a prompt catalog plus a read-only load_skill tool.
 //
+// The file and shell tools run on the host by default. [ReadFileFS],
+// [WriteFileFS] and [ShellConfig.Executor] run the same tools, with the same
+// validation, limits and effect reports, against a [FileSystem] and an
+// [Executor] that a sandbox backend implements.
+//
 // Everything composes with the existing core.Func schema machinery; the module
 // adds no dependencies beyond core itself.
 //

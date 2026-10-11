@@ -273,6 +273,78 @@ func ExampleWithConversation() {
 	// 4 messages in the conversation
 }
 
+// A schedule names each occurrence (a slot) and uses that name as the
+// run's idempotency key. Persistent storage preserves slots across restarts;
+// competing clients must submit through the same store owner.
+func ExampleWithIdempotencyKey_schedule() {
+	ctx := context.Background()
+	runtime, _ := core.NewEphemeralRuntime()
+	defer runtime.Close()
+	provider := script(say("Report sent."), say("Report sent."), say("Report sent."))
+	today := time.Date(2026, 10, 11, 2, 0, 0, 0, time.UTC) // time.Now() in a host
+	// README: schedule
+	report, err := runtime.Register("nightly-report", "v1", must(core.New(provider, core.AgentConfig{})))
+	if err != nil {
+		panic(err)
+	}
+	// submitSlot admits the nightly report for one UTC day. Everything it
+	// submits derives from the slot, so a retry is exact, not a conflict.
+	submitSlot := func(day time.Time) (*core.RunHandle, error) {
+		slot := day.UTC().Format("2006-01-02")
+		return runtime.Submit(ctx, report, "Send the report for "+slot+".",
+			core.WithIdempotencyKey("schedule/nightly-report", slot),
+			core.WithLabels(map[string]string{"schedule": "nightly-report", "slot": slot}))
+	}
+	// A tick that fires twice admits the slot once.
+	first, err := submitSlot(today)
+	if err != nil {
+		panic(err)
+	}
+	again, err := submitSlot(today)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println(first.ID() == again.ID())
+	// After downtime, submit every slot since the last one you know was
+	// admitted. Report conflicts: a deploy may explain them, but drift may too.
+	onConflict := func(day time.Time, err error) {
+		slog.Warn("schedule slot admission conflict; verify revision or input drift",
+			"slot", day.UTC().Format("2006-01-02"), "err", err)
+	}
+	if err := catchUpSlots(today.AddDate(0, 0, -2), today, submitSlot, onConflict); err != nil {
+		panic(err)
+	}
+	// The schedule's history, oldest admission first.
+	page, err := runtime.Runs(ctx, core.RunFilter{Labels: map[string]string{"schedule": "nightly-report"}})
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println(len(page.Runs), "nightly reports")
+	// README end
+
+	// Output:
+	// true
+	// 3 nightly reports
+}
+
+// catchUpSlots is host-side scheduling code, not part of core. Reporting a
+// conflict lets the host diagnose input drift without blocking later slots.
+func catchUpSlots(first, last time.Time, submitSlot func(time.Time) (*core.RunHandle, error), onConflict func(time.Time, error)) error {
+	for day := first; !day.After(last); day = day.AddDate(0, 0, 1) {
+		_, err := submitSlot(day)
+		switch {
+		case errors.Is(err, core.ErrRunPruned):
+			continue // The admission survives retention; never resubmit with a new key.
+		case errors.Is(err, core.ErrAdmissionConflict):
+			onConflict(day, err)
+			continue // This identity already exists; still admit later missing slots.
+		case err != nil:
+			return err
+		}
+	}
+	return nil
+}
+
 type RefundInput struct {
 	Order  string `json:"order"`
 	Amount int    `json:"amount"`

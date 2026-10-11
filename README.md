@@ -31,7 +31,7 @@ It is built for agents inside web servers and job workers, not notebooks.
 | `agents` | Typed shorthand over `core`: `Define[I, O]` builds and registers a definition, then runs it or exposes it as a child tool |
 | `core/storetest` | Conformance suite for `core.Store` adapters |
 | `core/coretest` | Test kit: a scripted provider (`NewProvider`, `NewStreamProvider`) that replays turns and records requests, plus `Runtime` fixtures |
-| `tools` (module) | First-party tools: `HTTPFetch`, `ReadFile`/`WriteFile` (sandboxed), `Shell` (allow-listed), `WebSearch`; `LoadAgentsMD` and `LoadSkills` for AGENTS.md instructions and Agent Skills |
+| `tools` (module) | First-party tools: `HTTPFetch`, `ReadFile`/`WriteFile` (rooted), `Shell` (allow-listed), with pluggable `FileSystem` and `Executor` backends for sandboxes, `WebSearch`; `LoadAgentsMD` and `LoadSkills` for AGENTS.md instructions and Agent Skills |
 | `extensions/sqlite` (module) | The supported persistent store: one exclusive local owner, WAL, `synchronous=FULL` |
 | `extensions/claude` (module) | Anthropic provider; thinking, images, prompt caching, native structured output |
 | `extensions/openai` (module) | OpenAI Chat Completions provider (stdlib-only); any OpenAI-compatible base URL |
@@ -259,6 +259,34 @@ core.AgentConfig{ToolPolicy: core.ToolPolicy{
 Policy timeouts and budget denials are recoverable tool results. Tools and
 limiters must honor context cancellation, because Go cannot stop a function
 that ignores its context.
+
+### Sandboxed file and shell tools
+
+`tools.ReadFile(root)`, `tools.WriteFile(root)` and `tools.Shell(cfg)` act on
+the host by default. To run the same tools inside a container, a VM or a
+remote workspace, implement `tools.FileSystem` and `tools.Executor` for the
+sandbox and pass them in:
+
+```go
+// Fragment
+fsys := sandboxFS{}       // implements tools.FileSystem
+executor := sandboxExec{}    // implements tools.Executor
+agentTools := []core.Tool{
+	tools.ReadFileFS(fsys),
+	tools.WriteFileFS(fsys),
+	tools.Shell(tools.ShellConfig{Allow: []string{"go", "git"}, Executor: executor}),
+}
+```
+
+The tools keep their validation, limits and effect reports whatever the
+backend: paths are checked before they reach the filesystem, the allow-list
+is checked before a command reaches the executor, output and reads stay
+bounded, and the shell timeout stays recoverable. Both interfaces receive
+the tool call's context, so one durable definition can resolve each run's
+sandbox from `core.ToolOperationFromContext`. A `WriteFile` error that wraps
+`tools.ErrNotWritten` reports `EffectNotApplied`; any other error reports
+`EffectUnknown`. A filesystem with an `EffectScope() string` method sets the
+write tool's effect scope.
 
 ### MCP servers
 
@@ -549,6 +577,123 @@ consulted when the approval is accepted and again immediately before
 dispatch. Repeating the same resolution returns the stored outcome, while a
 different one returns `ErrWaitConflict`. A `WaitQuestion` wait makes the
 host's JSON answer the tool result.
+
+## Scheduled runs
+
+Automata has no built-in scheduler. A host supplies the timer and uses
+idempotent admission to deduplicate each occurrence (a slot), such as the
+nightly report for 2026-10-11. Use the slot name as the run's idempotency key.
+
+For restart deduplication, use a persistent runtime and reopen the same
+store; the ephemeral runtime in the compiled example is only for testing.
+SQLite supports one exclusive owner process, not competing runtime owners.
+Multiple scheduler processes should submit through that owner's HTTP API,
+using the same idempotency scope and key. Independent stores do not deduplicate
+one another. Register stored definition revisions and call `Recover` before
+catching up; admission deduplication does not guarantee a run completed.
+
+```go
+// ExampleWithIdempotencyKey_schedule in core/example_test.go
+report, err := runtime.Register("nightly-report", "v1", must(core.New(provider, core.AgentConfig{})))
+if err != nil {
+	panic(err)
+}
+// submitSlot admits the nightly report for one UTC day. Everything it
+// submits derives from the slot, so a retry is exact, not a conflict.
+submitSlot := func(day time.Time) (*core.RunHandle, error) {
+	slot := day.UTC().Format("2006-01-02")
+	return runtime.Submit(ctx, report, "Send the report for "+slot+".",
+		core.WithIdempotencyKey("schedule/nightly-report", slot),
+		core.WithLabels(map[string]string{"schedule": "nightly-report", "slot": slot}))
+}
+// A tick that fires twice admits the slot once.
+first, err := submitSlot(today)
+if err != nil {
+	panic(err)
+}
+again, err := submitSlot(today)
+if err != nil {
+	panic(err)
+}
+fmt.Println(first.ID() == again.ID())
+// After downtime, submit every slot since the last one you know was
+// admitted. Report conflicts: a deploy may explain them, but drift may too.
+onConflict := func(day time.Time, err error) {
+	slog.Warn("schedule slot admission conflict; verify revision or input drift",
+		"slot", day.UTC().Format("2006-01-02"), "err", err)
+}
+if err := catchUpSlots(today.AddDate(0, 0, -2), today, submitSlot, onConflict); err != nil {
+	panic(err)
+}
+// The schedule's history, oldest admission first.
+page, err := runtime.Runs(ctx, core.RunFilter{Labels: map[string]string{"schedule": "nightly-report"}})
+if err != nil {
+	panic(err)
+}
+fmt.Println(len(page.Runs), "nightly reports")
+```
+
+The host-side helper below continues past retained admission identities,
+including pruned runs and conflicts, so an old slot does not block later
+missing slots. Every conflict is reported: verify whether it is explained
+by a known revision change, and investigate unexpected task/deadline drift.
+Do not change a slot's key to bypass a conflict. Other admission errors stop
+catch-up and must be retried or surfaced by the host.
+
+```go
+// Fragment
+func catchUpSlots(first, last time.Time, submitSlot func(time.Time) (*core.RunHandle, error), onConflict func(time.Time, error)) error {
+	for day := first; !day.After(last); day = day.AddDate(0, 0, 1) {
+		_, err := submitSlot(day)
+		switch {
+		case errors.Is(err, core.ErrRunPruned):
+			continue // The admission survives retention; never resubmit with a new key.
+		case errors.Is(err, core.ErrAdmissionConflict):
+			onConflict(day, err)
+			continue // This identity already exists; still admit later missing slots.
+		case err != nil:
+			return err
+		}
+	}
+	return nil
+}
+```
+
+Drive `submitSlot` from any timer, using the same helper for each tick. Run
+catch-up at startup from the last slot you know was admitted (or from a fixed
+look-back window):
+
+```go
+// Fragment
+for now := range time.Tick(time.Minute) {
+	if err := catchUpSlots(now, now, submitSlot, onConflict); err != nil {
+		slog.Error("schedule tick failed", "err", err)
+	}
+}
+```
+
+Choose slots with care:
+
+- **Derive everything from the slot.** An exact retry must repeat the task,
+  definition revision, and deadline. A task built from `time.Now()` instead
+  of the slot makes the second tick return `ErrAdmissionConflict`.
+- **Use UTC and one slot width per schedule.** The slot's format is its
+  width: a date for a daily job, `2006-01-02T15` for an hourly one. In local
+  time, a daylight-saving change merges two hourly slots into one or skips
+  one.
+- **A deploy does not re-run a slot.** A slot admitted under the old
+  revision returns `ErrAdmissionConflict` when the new revision submits it,
+  and a slot whose run retention pruned returns `ErrRunPruned`, because
+  admission records outlive their runs. Both mean the slot already has a
+  run. The new revision starts with the next slot. A conflict on a slot you
+  have not redeployed means the submission drifted (see the first point).
+
+Labels make retained schedule history a `Runtime.Runs` query; follow
+`RunPage.Next` while `More` is true and use `RootsOnly: true` if reports have
+child runs. Retention can remove entries from this query, but not their
+admission identities. Keep a separate audit log if permanent history is
+required. `httpserver` serves the query at
+`GET /v1/runs?label=schedule:nightly-report&roots=true`.
 
 ## Observing runs
 

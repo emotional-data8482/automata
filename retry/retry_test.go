@@ -255,6 +255,36 @@ func TestBackoffCapAndJitterBounds(t *testing.T) {
 	}
 }
 
+// TestBackoffZeroMaxDelayMeansNoCap pins that leaving MaxDelay at its zero
+// value disables the cap instead of clamping every delay to zero (which would
+// make retries fire back to back).
+func TestBackoffZeroMaxDelayMeansNoCap(t *testing.T) {
+	cfg := Config{InitialDelay: time.Second, MaxDelay: 0, Multiplier: 2}
+	// Nominal delays grow exponentially: 1s, 2s, 4s, 8s. With no cap the
+	// jittered result must stay in [0.5*nominal, nominal).
+	for attempt := range 4 {
+		nominal := time.Second << attempt
+		for range 200 {
+			d := backoff(cfg, attempt)
+			if d < nominal/2 || d >= nominal {
+				t.Fatalf("attempt %d: backoff %v outside [%v, %v)",
+					attempt, d, nominal/2, nominal)
+			}
+		}
+	}
+}
+
+// TestBackoffNegativeMaxDelayMeansNoCap pins that a negative MaxDelay is
+// likewise treated as "no cap" rather than a zero ceiling.
+func TestBackoffNegativeMaxDelayMeansNoCap(t *testing.T) {
+	cfg := Config{InitialDelay: time.Second, MaxDelay: -time.Minute, Multiplier: 2}
+	d := backoff(cfg, 3)
+	nominal := 8 * time.Second
+	if d < nominal/2 || d >= nominal {
+		t.Errorf("backoff = %v, want within [%v, %v)", d, nominal/2, nominal)
+	}
+}
+
 // TestBackoffZeroMultiplierDefaultsToOne pins the guard that a zero multiplier
 // is treated as 1 (constant backoff) rather than collapsing the delay to zero.
 func TestBackoffZeroMultiplierDefaultsToOne(t *testing.T) {

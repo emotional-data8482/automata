@@ -220,7 +220,7 @@ func (s *Skills) Tool() core.Tool {
 			if p.Path == "" {
 				return skill.Body, nil
 			}
-			return readRootFile(skill.Dir, p.Path)
+			return readText(ctx, LocalFS(skill.Dir), p.Path)
 		}), core.ToolEffectPolicy{Kind: core.ToolEffectReadOnly})
 }
 
