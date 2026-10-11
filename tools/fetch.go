@@ -155,9 +155,16 @@ func extractText(doc string) string {
 
 		if !closing && skipContainers[name] {
 			// Drop everything through the matching close tag; an unclosed
-			// container swallows the rest of the document.
+			// container swallows the rest of the document. </head> is
+			// optional in HTML, so a head without one ends at <body:
+			// otherwise the entire page would be dropped with the head.
 			rest := lower[i:]
 			j := strings.Index(rest, "</"+name)
+			if name == "head" {
+				if k := strings.Index(rest, "<body"); k >= 0 && (j < 0 || k < j) {
+					j = k
+				}
+			}
 			if j < 0 {
 				break
 			}

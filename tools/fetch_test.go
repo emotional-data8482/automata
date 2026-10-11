@@ -130,3 +130,12 @@ func TestExtractTextUnclosedSkipContainer(t *testing.T) {
 		t.Errorf("got %q, want %q", got, "before")
 	}
 }
+
+func TestExtractTextHeadWithoutCloseTag(t *testing.T) {
+	// </head> is optional in HTML; the head skip must stop at <body> so the
+	// page text is not swallowed along with the head.
+	doc := "<html><head><title>t</title><body><p>hello</p></body></html>"
+	if got := extractText(doc); got != "hello" {
+		t.Errorf("got %q, want %q", got, "hello")
+	}
+}
