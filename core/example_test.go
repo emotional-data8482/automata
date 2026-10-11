@@ -273,6 +273,58 @@ func ExampleWithConversation() {
 	// 4 messages in the conversation
 }
 
+// A schedule names each occurrence (a slot) and uses that name as the
+// run's idempotency key, so a duplicate tick, a restart, or a second process
+// admits each slot once, and catching up after downtime is a plain loop.
+func ExampleWithIdempotencyKey_schedule() {
+	ctx := context.Background()
+	runtime, _ := core.NewEphemeralRuntime()
+	defer runtime.Close()
+	provider := script(say("Report sent."), say("Report sent."), say("Report sent."))
+	today := time.Date(2026, 10, 11, 2, 0, 0, 0, time.UTC) // time.Now() in a host
+	// README: schedule
+	report, err := runtime.Register("nightly-report", "v1", must(core.New(provider, core.AgentConfig{})))
+	if err != nil {
+		panic(err)
+	}
+	// submitSlot admits the nightly report for one UTC day. Everything it
+	// submits derives from the slot, so a retry is exact, not a conflict.
+	submitSlot := func(day time.Time) (*core.RunHandle, error) {
+		slot := day.UTC().Format("2006-01-02")
+		return runtime.Submit(ctx, report, "Send the report for "+slot+".",
+			core.WithIdempotencyKey("schedule/nightly-report", slot),
+			core.WithLabels(map[string]string{"schedule": "nightly-report", "slot": slot}))
+	}
+	// A tick that fires twice admits the slot once.
+	first, err := submitSlot(today)
+	if err != nil {
+		panic(err)
+	}
+	again, err := submitSlot(today)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println(first.ID() == again.ID())
+	// After downtime, submit every slot since the last one you know ran;
+	// slots that already have a run are returned, not run again.
+	for day := today.AddDate(0, 0, -2); !day.After(today); day = day.AddDate(0, 0, 1) {
+		if _, err := submitSlot(day); err != nil {
+			panic(err)
+		}
+	}
+	// The schedule's history, oldest admission first.
+	page, err := runtime.Runs(ctx, core.RunFilter{Labels: map[string]string{"schedule": "nightly-report"}})
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println(len(page.Runs), "nightly reports")
+	// README end
+
+	// Output:
+	// true
+	// 3 nightly reports
+}
+
 type RefundInput struct {
 	Order  string `json:"order"`
 	Amount int    `json:"amount"`

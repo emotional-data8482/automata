@@ -550,6 +550,92 @@ dispatch. Repeating the same resolution returns the stored outcome, while a
 different one returns `ErrWaitConflict`. A `WaitQuestion` wait makes the
 host's JSON answer the tool result.
 
+## Scheduled runs
+
+Automata has no built-in scheduler, because idempotent admission already
+gives a host one. Name each occurrence of a schedule (a slot), such as the
+nightly report for 2026-10-11, and use that name as the run's idempotency
+key. A tick that fires twice, a restart in the middle of a tick, or two
+processes racing all admit the slot once, and catching up after downtime is
+a plain loop:
+
+```go
+// ExampleWithIdempotencyKey_schedule in core/example_test.go
+report, err := runtime.Register("nightly-report", "v1", must(core.New(provider, core.AgentConfig{})))
+if err != nil {
+	panic(err)
+}
+// submitSlot admits the nightly report for one UTC day. Everything it
+// submits derives from the slot, so a retry is exact, not a conflict.
+submitSlot := func(day time.Time) (*core.RunHandle, error) {
+	slot := day.UTC().Format("2006-01-02")
+	return runtime.Submit(ctx, report, "Send the report for "+slot+".",
+		core.WithIdempotencyKey("schedule/nightly-report", slot),
+		core.WithLabels(map[string]string{"schedule": "nightly-report", "slot": slot}))
+}
+// A tick that fires twice admits the slot once.
+first, err := submitSlot(today)
+if err != nil {
+	panic(err)
+}
+again, err := submitSlot(today)
+if err != nil {
+	panic(err)
+}
+fmt.Println(first.ID() == again.ID())
+// After downtime, submit every slot since the last one you know ran;
+// slots that already have a run are returned, not run again.
+for day := today.AddDate(0, 0, -2); !day.After(today); day = day.AddDate(0, 0, 1) {
+	if _, err := submitSlot(day); err != nil {
+		panic(err)
+	}
+}
+// The schedule's history, oldest admission first.
+page, err := runtime.Runs(ctx, core.RunFilter{Labels: map[string]string{"schedule": "nightly-report"}})
+if err != nil {
+	panic(err)
+}
+fmt.Println(len(page.Runs), "nightly reports")
+```
+
+Drive `submitSlot` from any timer, and run the catch-up loop at startup from
+the last slot you know was admitted (or from a fixed look-back window):
+
+```go
+// Fragment
+for now := range time.Tick(time.Minute) {
+	_, err := submitSlot(now)
+	// The slot already has a run: one admitted under an earlier revision,
+	// or one retention has since pruned. Neither runs again.
+	if errors.Is(err, core.ErrAdmissionConflict) || errors.Is(err, core.ErrRunPruned) {
+		continue
+	}
+	if err != nil {
+		slog.Error("schedule tick failed", "err", err)
+	}
+}
+```
+
+Choose slots with care:
+
+- **Derive everything from the slot.** An exact retry must repeat the task,
+  definition revision, and deadline. A task built from `time.Now()` instead
+  of the slot makes the second tick return `ErrAdmissionConflict`.
+- **Use UTC and one slot width per schedule.** The slot's format is its
+  width: a date for a daily job, `2006-01-02T15` for an hourly one. In local
+  time, a daylight-saving change merges two hourly slots into one or skips
+  one.
+- **A deploy does not re-run a slot.** A slot admitted under the old
+  revision returns `ErrAdmissionConflict` when the new revision submits it,
+  and a slot whose run retention pruned returns `ErrRunPruned`, because
+  admission records outlive their runs. Both mean the slot already has a
+  run. The new revision starts with the next slot. A conflict on a slot you
+  have not redeployed means the submission drifted (see the first point).
+
+Labels make the schedule's history a `Runtime.Runs` query, which replaces
+a hand-kept cycle log; `httpserver` serves the same query at
+`GET /v1/runs?label=schedule:nightly-report`.
+
 ## Observing runs
 
 `Runtime.RunStream` and `RunHandle.Observe` deliver provisional live events:
