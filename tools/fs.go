@@ -172,13 +172,15 @@ func WriteFileFS(fsys FileSystem) core.Tool {
 				return effectError(fmt.Errorf("path %q must be relative and stay inside the working directory", p.Path), core.EffectNotApplied), nil
 			}
 			if err := fsys.WriteFile(ctx, p.Path, []byte(p.Content)); err != nil {
+				status := core.EffectUnknown
 				if errors.Is(err, ErrNotWritten) {
-					return effectError(err, core.EffectNotApplied), nil
+					status = core.EffectNotApplied
 				}
+				// Effect evidence does not make parent cancellation recoverable.
 				if ctx.Err() != nil {
-					return core.ToolResult{Effect: core.EffectReport{Status: core.EffectUnknown}}, ctx.Err()
+					return core.ToolResult{Effect: core.EffectReport{Status: status}}, ctx.Err()
 				}
-				return effectError(err, core.EffectUnknown), nil
+				return effectError(err, status), nil
 			}
 			digest := sha256.Sum256([]byte(p.Content))
 			result := core.TextResult(fmt.Sprintf("wrote %d bytes to %s", len(p.Content), p.Path))

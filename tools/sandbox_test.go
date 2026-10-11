@@ -193,6 +193,49 @@ func TestWriteFileFSEffectStatus(t *testing.T) {
 	}
 }
 
+type interruptedWriteFS struct {
+	FileSystem
+	interrupt  func()
+	notWritten bool
+}
+
+func (f interruptedWriteFS) WriteFile(ctx context.Context, _ string, _ []byte) error {
+	f.interrupt()
+	<-ctx.Done()
+	if f.notWritten {
+		return fmt.Errorf("write interrupted: %w: %w", ErrNotWritten, ctx.Err())
+	}
+	return ctx.Err()
+}
+
+func TestWriteFileFSParentCancellationPreservesEffect(t *testing.T) {
+	for _, deadline := range []bool{false, true} {
+		for _, notWritten := range []bool{false, true} {
+			t.Run(fmt.Sprintf("deadline=%t/notWritten=%t", deadline, notWritten), func(t *testing.T) {
+				ctx, cancel := context.WithCancel(context.Background())
+				interrupt := cancel
+				wantErr := context.Canceled
+				if deadline {
+					cancel()
+					ctx, cancel = context.WithTimeout(context.Background(), 20*time.Millisecond)
+					interrupt = func() {}
+					wantErr = context.DeadlineExceeded
+				}
+				defer cancel()
+				fsys := interruptedWriteFS{interrupt: interrupt, notWritten: notWritten}
+				result, err := WriteFileFS(fsys).Execute(ctx, json.RawMessage(`{"path":"a.txt","content":"x"}`))
+				wantStatus := core.EffectUnknown
+				if notWritten {
+					wantStatus = core.EffectNotApplied
+				}
+				if !errors.Is(err, wantErr) || result.Effect.Status != wantStatus {
+					t.Fatalf("result = %#v, err = %v; want %s and %v", result, err, wantStatus, wantErr)
+				}
+			})
+		}
+	}
+}
+
 // WriteFileFS declares a filesystem's EffectScope; LocalFS keeps the scope
 // WriteFile declared before filesystems were pluggable.
 func TestLocalFSEffectScope(t *testing.T) {
