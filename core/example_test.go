@@ -274,8 +274,8 @@ func ExampleWithConversation() {
 }
 
 // A schedule names each occurrence (a slot) and uses that name as the
-// run's idempotency key, so a duplicate tick, a restart, or a second process
-// admits each slot once, and catching up after downtime is a plain loop.
+// run's idempotency key. Persistent storage preserves slots across restarts;
+// competing clients must submit through the same store owner.
 func ExampleWithIdempotencyKey_schedule() {
 	ctx := context.Background()
 	runtime, _ := core.NewEphemeralRuntime()
@@ -305,12 +305,14 @@ func ExampleWithIdempotencyKey_schedule() {
 		panic(err)
 	}
 	fmt.Println(first.ID() == again.ID())
-	// After downtime, submit every slot since the last one you know ran;
-	// slots that already have a run are returned, not run again.
-	for day := today.AddDate(0, 0, -2); !day.After(today); day = day.AddDate(0, 0, 1) {
-		if _, err := submitSlot(day); err != nil {
-			panic(err)
-		}
+	// After downtime, submit every slot since the last one you know was
+	// admitted. Report conflicts: a deploy may explain them, but drift may too.
+	onConflict := func(day time.Time, err error) {
+		slog.Warn("schedule slot admission conflict; verify revision or input drift",
+			"slot", day.UTC().Format("2006-01-02"), "err", err)
+	}
+	if err := catchUpSlots(today.AddDate(0, 0, -2), today, submitSlot, onConflict); err != nil {
+		panic(err)
 	}
 	// The schedule's history, oldest admission first.
 	page, err := runtime.Runs(ctx, core.RunFilter{Labels: map[string]string{"schedule": "nightly-report"}})
@@ -323,6 +325,24 @@ func ExampleWithIdempotencyKey_schedule() {
 	// Output:
 	// true
 	// 3 nightly reports
+}
+
+// catchUpSlots is host-side scheduling code, not part of core. Reporting a
+// conflict lets the host diagnose input drift without blocking later slots.
+func catchUpSlots(first, last time.Time, submitSlot func(time.Time) (*core.RunHandle, error), onConflict func(time.Time, error)) error {
+	for day := first; !day.After(last); day = day.AddDate(0, 0, 1) {
+		_, err := submitSlot(day)
+		switch {
+		case errors.Is(err, core.ErrRunPruned):
+			continue // The admission survives retention; never resubmit with a new key.
+		case errors.Is(err, core.ErrAdmissionConflict):
+			onConflict(day, err)
+			continue // This identity already exists; still admit later missing slots.
+		case err != nil:
+			return err
+		}
+	}
+	return nil
 }
 
 type RefundInput struct {
