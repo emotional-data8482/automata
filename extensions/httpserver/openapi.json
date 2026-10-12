@@ -594,6 +594,60 @@
         }
       }
     },
+    "/v1/conversations/{id}": {
+      "get": {
+        "operationId": "getConversation",
+        "summary": "Conversation head and active turn",
+        "description": "Returns a conversation's committed state. Pass head as conversation.expected_head to admit the next turn; active_run_id is set while a turn runs. On a server with a tenant Scope, only the requesting tenant's conversations are found.",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Conversation ID."
+          }
+        ],
+        "responses": {
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "410": {
+            "$ref": "#/components/responses/Error"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error"
+          },
+          "200": {
+            "description": "The conversation.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Conversation"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/changes": {
       "get": {
         "operationId": "changes",
@@ -1188,6 +1242,37 @@
           },
           "more": {
             "type": "boolean"
+          }
+        }
+      },
+      "Conversation": {
+        "type": "object",
+        "required": [
+          "id",
+          "definition",
+          "turns"
+        ],
+        "properties": {
+          "scope": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "definition": {
+            "$ref": "#/components/schemas/Definition"
+          },
+          "head": {
+            "type": "string",
+            "description": "Run ID of the last ended turn; the next turn's expected_head. Empty before the first turn ends."
+          },
+          "active_run_id": {
+            "type": "string",
+            "description": "The turn in progress, if any."
+          },
+          "turns": {
+            "type": "integer",
+            "description": "Ended turns."
           }
         }
       },

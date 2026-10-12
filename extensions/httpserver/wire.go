@@ -93,6 +93,19 @@ type ConversationView struct {
 	ID    string `json:"id"`
 }
 
+// ConversationStateView is the committed state of a conversation, the body
+// of GET /v1/conversations/{id}. Head is the run ID the next turn continues
+// (its expected_head), empty before the first turn ends; ActiveRunID is the
+// turn in progress, if any.
+type ConversationStateView struct {
+	Scope       string         `json:"scope,omitempty"`
+	ID          string         `json:"id"`
+	Definition  DefinitionView `json:"definition"`
+	Head        string         `json:"head,omitempty"`
+	ActiveRunID string         `json:"active_run_id,omitempty"`
+	Turns       int            `json:"turns"`
+}
+
 // RunView is a run's status. Content fields are set only when the server
 // exposes content.
 type RunView struct {

@@ -33,7 +33,7 @@ func TestOpenAPIDocumentIsServedWithoutAuthorization(t *testing.T) {
 	}
 	slices.Sort(got)
 	want := []string{
-		"GET /v1/changes", "GET /v1/definitions/{id}/{revision}", "GET /v1/openapi.json",
+		"GET /v1/changes", "GET /v1/conversations/{id}", "GET /v1/definitions/{id}/{revision}", "GET /v1/openapi.json",
 		"GET /v1/runs", "GET /v1/runs/{id}", "GET /v1/runs/{id}/events",
 		"POST /v1/runs", "POST /v1/runs/{id}/cancel", "POST /v1/runs/{id}/hooks/acknowledge",
 		"POST /v1/runs/{id}/operations/{op}/reconcile", "POST /v1/runs/{id}/waits/{wait}",
@@ -58,7 +58,7 @@ func TestOpenAPISchemasCoverWireTypes(t *testing.T) {
 	}
 	for schema, value := range map[string]any{
 		"SubmitRequest": SubmitRequest{}, "ResolveWaitRequest": ResolveWaitRequest{}, "ReconcileRequest": ReconcileRequest{},
-		"Run": RunView{}, "Wait": WaitView{}, "Operation": OperationView{}, "RunPage": RunPageView{},
+		"Run": RunView{}, "Conversation": ConversationStateView{}, "Wait": WaitView{}, "Operation": OperationView{}, "RunPage": RunPageView{},
 		"Event": EventView{}, "EventPage": EventPageView{}, "Change": ChangeView{}, "ChangePage": ChangePageView{},
 	} {
 		properties := doc.Components.Schemas[schema].Properties

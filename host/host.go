@@ -1,7 +1,8 @@
 // Package host is the entry point of a durable agent server: it opens the
 // store, registers the definitions stored runs may pin, recovers work a
-// previous process left, applies retention, and serves the Runtime over HTTP
-// until it is asked to stop. The same program runs on a laptop, a single
+// previous process left, applies retention, serves the Runtime over HTTP, and
+// runs host-owned background work such as a scheduler until it is asked to
+// stop. The same program runs on a laptop, a single
 // server, or a hosted platform.
 //
 //	func main() {
@@ -76,6 +77,13 @@ type Options struct {
 	// Ready, when set, is called with the bound address once the host
 	// serves requests.
 	Ready func(addr net.Addr)
+	// Background, when set, runs host-owned work beside the server, such as
+	// a scheduler that admits runs. It starts once the Runtime has recovered
+	// and the host serves; its context ends when the host stops, and the
+	// host waits for it to return before closing the Runtime. Returning nil
+	// early leaves the host serving; an error stops the host and is
+	// returned from Run.
+	Background func(ctx context.Context, runtime *core.Runtime) error
 	// Logger receives lifecycle logs. Nil selects slog.Default.
 	Logger *slog.Logger
 }
@@ -99,9 +107,10 @@ func logger(opts Options) *slog.Logger {
 	return slog.Default()
 }
 
-// Run opens the store, registers definitions, recovers, and serves until ctx
-// ends; then it drains HTTP requests and closes the Runtime, which stops
-// workers at a safe boundary. Work left unfinished resumes on the next Run.
+// Run opens the store, registers definitions, recovers, and serves (and
+// runs Background) until ctx ends; then it drains HTTP requests, waits for
+// Background, and closes the Runtime, which stops workers at a safe
+// boundary. Work left unfinished resumes on the next Run.
 func Run(ctx context.Context, opts Options) error {
 	log := logger(opts)
 	if opts.Register == nil {
@@ -193,13 +202,38 @@ func Run(ctx context.Context, opts Options) error {
 		defer close(retentionDone)
 		applyRetention(base, runtime, opts, log)
 	}()
+	// background stays nil (never ready) without Background or once it has
+	// returned; backgroundDone is closed when it is not running.
+	var background chan error
+	backgroundDone := make(chan struct{})
+	if opts.Background != nil {
+		background = make(chan error, 1)
+		go func() {
+			defer close(backgroundDone)
+			background <- opts.Background(base, runtime)
+		}()
+	} else {
+		close(backgroundDone)
+	}
 
-	select {
-	case err = <-served:
-		cancelBase()
-		<-retentionDone
-		return fmt.Errorf("host: serve: %w", err)
-	case <-ctx.Done():
+	var stopErr error
+wait:
+	for {
+		select {
+		case err = <-served:
+			cancelBase()
+			<-retentionDone
+			<-backgroundDone
+			return fmt.Errorf("host: serve: %w", err)
+		case err := <-background:
+			background = nil
+			if err != nil {
+				stopErr = fmt.Errorf("host: background: %w", err)
+				break wait
+			}
+		case <-ctx.Done():
+			break wait
+		}
 	}
 	log.Info("host stopping")
 	cancelBase()
@@ -212,6 +246,10 @@ func Run(ctx context.Context, opts Options) error {
 	shutdownErr := httpServer.Shutdown(drain)
 	<-served
 	<-retentionDone
+	<-backgroundDone
+	if stopErr != nil {
+		return stopErr
+	}
 	if shutdownErr != nil {
 		return fmt.Errorf("host: drain: %w", shutdownErr)
 	}

@@ -39,7 +39,7 @@ It is built for agents inside web servers and job workers, not notebooks.
 | `extensions/tavily` (module) | Tavily backend for `tools.WebSearch` |
 | `extensions/mcp` (module) | Model Context Protocol through the official Go SDK: `mcpclient` turns a server's tools into `core.Tool`s, `mcpserver` serves `core.Tool`s |
 | `extensions/httpserver` (module) | `net/http` and SSE API over a `Runtime`: admission, listing, status, resumable event and change streams, cancellation, wait answers, manifests |
-| `host` (module) | `host.Main`: opens the store, registers definitions, recovers, applies retention, and serves the HTTP API |
+| `host` (module) | `host.Main`: opens the store, registers definitions, recovers, applies retention, serves the HTTP API, and runs host-owned background work such as a scheduler |
 | `retry`, `tracing` | Backoff policy and span interfaces used by core |
 | `examples/*` (modules) | Runnable demos (see [Examples](#examples)) |
 
@@ -670,6 +670,31 @@ for now := range time.Tick(time.Minute) {
 		slog.Error("schedule tick failed", "err", err)
 	}
 }
+```
+
+Under `host.Main`, run the timer in `host.Options.Background`. It starts
+after registration and recovery, its context ends when the host stops, and
+the host waits for it before closing the Runtime:
+
+```go
+// Fragment
+host.Main(host.Options{
+	Register: register,
+	Background: func(ctx context.Context, runtime *core.Runtime) error {
+		ticks := time.NewTicker(time.Minute)
+		defer ticks.Stop()
+		for {
+			if err := catchUpSlots(time.Now(), time.Now(), submitSlot, onConflict); err != nil {
+				slog.Error("schedule tick failed", "err", err)
+			}
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-ticks.C:
+			}
+		}
+	},
+})
 ```
 
 Choose slots with care:

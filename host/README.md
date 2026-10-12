@@ -19,6 +19,11 @@ func main() {
 }
 ```
 
+Work the host owns beside the API, such as a scheduler that admits runs,
+goes in `Options.Background`. It starts after recovery with the Runtime,
+its context ends when the host stops, and the host waits for it before
+closing the Runtime. An error it returns stops the host.
+
 Unset options come from the environment: `AUTOMATA_ADDR` (default `:8080`),
 `AUTOMATA_DB` (default `automata.db`), and `AUTOMATA_TOKEN`, a bearer token
 every request must present when `Options.Server.Authorize` is not set. The

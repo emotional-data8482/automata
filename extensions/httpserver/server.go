@@ -1,5 +1,5 @@
 // Package httpserver serves a core.Runtime over net/http: durable run
-// admission, listing and status, committed events and the runtime-wide change
+// admission, listing and status, conversation state, committed events and the runtime-wide change
 // feed as JSON pages or server-sent events, cancellation, durable wait
 // answers, and definition manifests.
 //
@@ -33,6 +33,8 @@ const (
 	ActionResolve  Action = "resolve_wait"
 	ActionChanges  Action = "changes"
 	ActionDescribe Action = "describe"
+	// ActionConversation reads a conversation's head and active turn.
+	ActionConversation Action = "read_conversation"
 	// ActionReconcile settles an uncertain tool operation; ActionAcknowledge
 	// acknowledges interrupted hook delivery. Both are operator decisions
 	// about external effects.
@@ -42,13 +44,15 @@ const (
 
 // Request describes an authorized operation. RunID is set for operations on
 // one run, Definition for submissions and manifests, WaitID for wait
-// answers, and OperationID for reconciliation.
+// answers, OperationID for reconciliation, and Conversation for
+// conversation reads.
 type Request struct {
-	Action      Action
-	RunID       string
-	WaitID      string
-	OperationID string
-	Definition  core.DefinitionRef
+	Action       Action
+	RunID        string
+	WaitID       string
+	OperationID  string
+	Definition   core.DefinitionRef
+	Conversation string
 }
 
 // ErrUnauthenticated is returned by an Authorize function to answer 401
@@ -116,6 +120,7 @@ func AllowAll(*http.Request, Request) error { return nil }
 //	                                   settle an uncertain tool operation
 //	POST /v1/runs/{id}/hooks/acknowledge
 //	                                   acknowledge interrupted hook delivery
+//	GET  /v1/conversations/{id}        conversation head and active turn
 //	GET  /v1/changes                   runtime-wide change feed (JSON or SSE)
 //	GET  /v1/definitions/{id}/{rev}    definition manifest
 type Server struct {
@@ -153,6 +158,7 @@ func New(config Config) (*Server, error) {
 	s.mux.HandleFunc("POST /v1/runs/{id}/waits/{wait}", s.resolveWait)
 	s.mux.HandleFunc("POST /v1/runs/{id}/operations/{op}/reconcile", s.reconcile)
 	s.mux.HandleFunc("POST /v1/runs/{id}/hooks/acknowledge", s.acknowledgeHooks)
+	s.mux.HandleFunc("GET /v1/conversations/{id}", s.conversation)
 	s.mux.HandleFunc("GET /v1/changes", s.changes)
 	s.mux.HandleFunc("GET /v1/definitions/{id}/{revision}", s.describe)
 	s.mux.HandleFunc("GET /v1/openapi.json", s.openAPI)

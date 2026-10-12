@@ -272,6 +272,28 @@ func isWaitError(err error) bool {
 	return false
 }
 
+// conversation serves a conversation's committed head, so a client can
+// continue it without having kept the last run ID.
+func (s *Server) conversation(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	scope, ok := s.authorize(w, r, Request{Action: ActionConversation, Conversation: id})
+	if !ok {
+		return
+	}
+	// Submissions admit conversations under the tenant scope ("" on a
+	// single-tenant server), so another tenant's conversation is not found.
+	conversation, err := s.config.Runtime.Conversation(r.Context(), core.ConversationRef{Scope: scope, ID: id})
+	if err != nil {
+		writeRuntimeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, ConversationStateView{
+		Scope: conversation.Conversation.Scope, ID: conversation.Conversation.ID,
+		Definition: definitionView(conversation.Definition), Head: conversation.Head,
+		ActiveRunID: conversation.ActiveRunID, Turns: conversation.Turns,
+	})
+}
+
 func (s *Server) describe(w http.ResponseWriter, r *http.Request) {
 	ref := core.DefinitionRef{ID: r.PathValue("id"), Revision: r.PathValue("revision")}
 	if _, ok := s.authorize(w, r, Request{Action: ActionDescribe, Definition: ref}); !ok {
