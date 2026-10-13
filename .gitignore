@@ -33,6 +33,7 @@ profile.cov
 # .vscode/
 
 # Binary files
+examples/browser/browser
 examples/claude/claude
 examples/deep_research/deep_research
 examples/durable_host/durable_host
