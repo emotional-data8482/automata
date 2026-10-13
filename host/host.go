@@ -216,6 +216,20 @@ func Run(ctx context.Context, opts Options) error {
 		close(backgroundDone)
 	}
 
+	// Shutdown may win the select before Background returns. Join it and
+	// collect any unread result before closing the Runtime.
+	waitBackground := func() error {
+		<-backgroundDone
+		select {
+		case err := <-background:
+			if err != nil {
+				return fmt.Errorf("host: background: %w", err)
+			}
+		default:
+		}
+		return nil
+	}
+
 	var stopErr error
 wait:
 	for {
@@ -223,8 +237,7 @@ wait:
 		case err = <-served:
 			cancelBase()
 			<-retentionDone
-			<-backgroundDone
-			return fmt.Errorf("host: serve: %w", err)
+			return errors.Join(fmt.Errorf("host: serve: %w", err), waitBackground())
 		case err := <-background:
 			background = nil
 			if err != nil {
@@ -246,7 +259,9 @@ wait:
 	shutdownErr := httpServer.Shutdown(drain)
 	<-served
 	<-retentionDone
-	<-backgroundDone
+	if backgroundErr := waitBackground(); backgroundErr != nil {
+		stopErr = backgroundErr
+	}
 	if stopErr != nil {
 		return stopErr
 	}

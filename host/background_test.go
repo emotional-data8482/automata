@@ -3,6 +3,7 @@ package host
 import (
 	"context"
 	"errors"
+	"net"
 	"net/http"
 	"path/filepath"
 	"sync/atomic"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/emotional-data8482/automata/core"
+	"github.com/emotional-data8482/automata/extensions/httpserver"
 )
 
 // Background runs beside the server on the recovered Runtime, sees its
@@ -91,3 +93,59 @@ func TestBackgroundErrorStopsHost(t *testing.T) {
 	}
 	done.shutdown(t)
 }
+
+// Background may fail after shutdown starts. Run must collect that error
+// even when cancellation or a serve failure wins the lifecycle select.
+func TestBackgroundErrorDuringShutdown(t *testing.T) {
+	for _, phase := range []string{"cancel", "serve"} {
+		t.Run(phase, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			listener, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer listener.Close()
+			backgroundErr := errors.New("background cleanup failed")
+			serveErr := errors.New("listener failed")
+			opts := Options{
+				Register: func(*core.Runtime) error { return nil },
+				Store: func(context.Context) (core.Store, error) {
+					return core.NewMemoryStore(), nil
+				},
+				Server:   httpserver.Config{Authorize: httpserver.AllowAll},
+				Listener: listener,
+				Background: func(backgroundCtx context.Context, _ *core.Runtime) error {
+					if phase == "cancel" {
+						cancel()
+					}
+					<-backgroundCtx.Done()
+					return backgroundErr
+				},
+			}
+			if phase == "serve" {
+				opts.Listener = failingListener{Listener: listener, err: serveErr}
+			}
+			done := make(chan error, 1)
+			go func() { done <- Run(ctx, opts) }()
+			select {
+			case err := <-done:
+				if !errors.Is(err, backgroundErr) {
+					t.Fatalf("Run = %v, want background error", err)
+				}
+				if phase == "serve" && !errors.Is(err, serveErr) {
+					t.Fatalf("Run = %v, want serve error too", err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("host did not stop")
+			}
+		})
+	}
+}
+
+type failingListener struct {
+	net.Listener
+	err error
+}
+
+func (l failingListener) Accept() (net.Conn, error) { return nil, l.err }
