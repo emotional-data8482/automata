@@ -39,6 +39,12 @@
 // outside Runtime without AskAccess, the tool refuses rather than granting
 // access nobody approved. examples/browser shows a terminal approval. Navigation never accepts non-http(s) URLs such as file://.
 // Popups and out-of-process iframes are not intercepted.
+//
+// With [Config.HumanCheckpoint], the model can also call
+// browser_checkpoint: a durable approval that pauses the run at a CAPTCHA
+// or similar challenge until the user solves it in the visible browser
+// window and approves. Simple text challenges can instead be answered
+// through browser_screenshot and browser_act.
 package browser
 
 import (
@@ -103,6 +109,12 @@ type Config struct {
 	// ([core.WithDurableWait]), so the Runtime must have an approval
 	// Authorizer; registering the agent fails otherwise.
 	RequestAccess bool
+	// HumanCheckpoint adds the browser_checkpoint tool, which lets the model
+	// pause the run at a CAPTCHA or similar challenge: a Runtime durable
+	// approval whose prompt asks the user to solve the challenge in the
+	// visible browser window, then approve to continue. Requires Headed;
+	// needs a Runtime with an approval Authorizer.
+	HumanCheckpoint bool
 	// AskAccess, when set, enables browser_request_access and answers it
 	// inline instead of through a Runtime durable approval: it is called
 	// with the host and the model's reason and reports whether the user
@@ -168,6 +180,9 @@ func normalize(cfg Config) (Config, error) {
 	}
 	if cfg.ActionTimeout <= 0 {
 		cfg.ActionTimeout = DefaultActionTimeout
+	}
+	if cfg.HumanCheckpoint && !cfg.Headed {
+		return cfg, errors.New("browser: HumanCheckpoint needs Config.Headed so a user can see and solve the challenge in the browser window")
 	}
 	for _, h := range cfg.AllowedHosts {
 		if strings.TrimSpace(h) == "" {

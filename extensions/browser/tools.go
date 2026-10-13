@@ -21,7 +21,8 @@ const (
 
 // Tools returns the session's tools: browser_navigate, browser_snapshot,
 // browser_act and browser_screenshot, plus browser_request_access when
-// Config.RequestAccess or Config.AskAccess is set.
+// Config.RequestAccess or Config.AskAccess is set, and browser_checkpoint
+// when Config.HumanCheckpoint is set.
 func (s *Session) Tools() []core.Tool {
 	readOnly := core.ToolEffectPolicy{Kind: core.ToolEffectReadOnly}
 	tools := []core.Tool{
@@ -40,6 +41,9 @@ func (s *Session) Tools() []core.Tool {
 	}
 	if s.requestsEnabled() {
 		tools = append(tools, s.requestAccess())
+	}
+	if s.cfg.HumanCheckpoint {
+		tools = append(tools, s.checkpoint())
 	}
 	return tools
 }
