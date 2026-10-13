@@ -10,11 +10,13 @@
     {"path": "extensions/tavily", "kind": "published", "race": false, "smoke": "."},
     {"path": "extensions/sqlite", "kind": "published", "race": true, "smoke": "."},
     {"path": "extensions/httpserver", "kind": "published", "race": true, "smoke": "."},
+    {"path": "extensions/browser", "kind": "published", "race": true, "smoke": "."},
     {"path": "host", "kind": "published", "race": true, "smoke": "."},
     {"path": "examples/claude", "kind": "example", "race": false, "smoke": "."},
     {"path": "examples/openai", "kind": "example", "race": false, "smoke": "."},
     {"path": "examples/deep_research", "kind": "example", "race": false, "smoke": "."},
     {"path": "examples/durable_typed", "kind": "example", "race": false, "smoke": "."},
-    {"path": "examples/durable_host", "kind": "example", "race": false, "smoke": "."}
+    {"path": "examples/durable_host", "kind": "example", "race": false, "smoke": "."},
+    {"path": "examples/browser", "kind": "example", "race": false, "smoke": "."}
   ]
 }

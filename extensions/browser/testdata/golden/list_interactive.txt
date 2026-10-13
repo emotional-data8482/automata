@@ -1,0 +1,11 @@
+title: Results
+url: http://fixture/list.html
+
+heading "Results" (level 1)
+list
+  [e13] link "Result 1"
+  [e14] link "Result 2"
+  [e15] link "Result 3"
+  [e16] link "Result 4"
+  [e17] link "Result 5"
+  … (30 items, showing 5)

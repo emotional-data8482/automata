@@ -1,0 +1,9 @@
+title: Long page
+url: http://fixture/long.html
+
+main
+  heading "Top of the page" (level 1)
+  text "Intro text that is visible in the first viewport."
+  [e10] link "First link"
+  image "A pixel"
+-- below the viewport: 2 interactive elements; headings: "Pricing", "FAQ" (scroll down to reveal)

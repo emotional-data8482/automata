@@ -1,0 +1,15 @@
+<!doctype html>
+<html><head><title>Results</title><style>body{margin:0;font:14px sans-serif} li{height:20px}</style></head>
+<body>
+<h1>Results</h1>
+<ul id="results"></ul>
+<script>
+const ul = document.getElementById('results');
+for (let i = 1; i <= 30; i++) {
+  const li = document.createElement('li');
+  const a = document.createElement('a');
+  a.href = '#r' + i; a.textContent = 'Result ' + i;
+  li.appendChild(a); ul.appendChild(li);
+}
+</script>
+</body></html>

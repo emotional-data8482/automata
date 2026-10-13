@@ -32,6 +32,7 @@ It is built for agents inside web servers and job workers, not notebooks.
 | `core/storetest` | Conformance suite for `core.Store` adapters |
 | `core/coretest` | Test kit: a scripted provider (`NewProvider`, `NewStreamProvider`) that replays turns and records requests, plus `Runtime` fixtures |
 | `tools` (module) | First-party tools: `HTTPFetch`, `ReadFile`/`WriteFile` (rooted), `Shell` (allow-listed), with pluggable `FileSystem` and `Executor` backends for sandboxes, `WebSearch`; `LoadAgentsMD` and `LoadSkills` for AGENTS.md instructions and Agent Skills |
+| `extensions/browser` (module) | Chromium page tools through go-rod: navigate (fail-closed host allowlist; optional user approval for new hosts), accessibility snapshots with element refs, batched actions, screenshots |
 | `extensions/sqlite` (module) | The supported persistent store: one exclusive local owner, WAL, `synchronous=FULL` |
 | `extensions/claude` (module) | Anthropic provider; thinking, images, prompt caching, native structured output |
 | `extensions/openai` (module) | OpenAI Chat Completions provider (stdlib-only); any OpenAI-compatible base URL |

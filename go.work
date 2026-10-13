@@ -2,11 +2,13 @@ go 1.26.2
 
 use (
 	.
+	./examples/browser
 	./examples/claude
 	./examples/deep_research
 	./examples/durable_host
 	./examples/durable_typed
 	./examples/openai
+	./extensions/browser
 	./extensions/claude
 	./extensions/httpserver
 	./extensions/mcp

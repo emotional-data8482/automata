@@ -1,0 +1,31 @@
+<!doctype html>
+<html><head><title>Sign up</title>
+<style>body{margin:0;font:16px sans-serif} .gone{display:none} .zero{width:0;height:0;overflow:hidden;padding:0;border:0}</style>
+</head><body>
+<header><nav aria-label="Main"><a href="/">Home</a> <a href="/about">About us</a></nav></header>
+<main>
+  <h1>Create an account</h1>
+  <div><div><div><form aria-label="Sign up">
+    <label>Email <input type="email" name="email" required></label>
+    <label>Name <input type="text" name="name" value="Ada"></label>
+    <label><input type="checkbox" checked> Subscribe to the newsletter</label>
+    <label>Plan <select name="plan"><option>Free</option><option>Pro</option></select></label>
+    <button type="button" id="save" disabled>Save</button>
+    <button type="button" id="go">Continue with a deliberately very long label that keeps going well past eighty characters</button>
+    <button type="button" class="gone">Hidden by display</button>
+    <button type="button" aria-hidden="true">Hidden from AT</button>
+    <button type="button" class="zero">Zero size</button>
+    <button type="button" style="visibility:hidden">Invisible</button>
+  </form></div></div></div>
+  <p id="out">Nothing yet.</p>
+  <button type="button" id="remove">Remove continue</button>
+</main>
+<script>
+document.getElementById('go').onclick = () => {
+  const email = document.querySelector('[name=email]').value;
+  const plan = document.querySelector('[name=plan]').value;
+  document.getElementById('out').textContent = 'Clicked with ' + email + ' on ' + plan;
+};
+document.getElementById('remove').onclick = () => document.getElementById('go').remove();
+</script>
+</body></html>
