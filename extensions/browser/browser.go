@@ -44,6 +44,7 @@ import (
 
 	"github.com/go-rod/rod"
 	"github.com/go-rod/rod/lib/launcher"
+	"github.com/go-rod/rod/lib/launcher/flags"
 	"github.com/go-rod/rod/lib/proto"
 )
 
@@ -91,19 +92,37 @@ type Config struct {
 // Session owns one browser process and one page. Its tools serialize their
 // calls, so it is safe for an agent's concurrent tool batches.
 type Session struct {
-	cfg      Config
-	launcher *launcher.Launcher
-	browser  *rod.Browser
-	page     *rod.Page
+	cfg  Config
+	proc *process // nil when the session borrows a shared process (tests)
+	page *rod.Page
 
 	mu     sync.Mutex
 	refs   *refRegistry
 	closed bool
 }
 
-// New launches a browser and opens a blank page. ctx bounds the launch only;
+// New launches one browser and opens a blank page. It makes exactly one
+// launch attempt and never downloads a browser. ctx bounds the launch only;
 // call [Session.Close] to stop the browser.
 func New(ctx context.Context, cfg Config) (*Session, error) {
+	cfg, err := normalize(cfg)
+	if err != nil {
+		return nil, err
+	}
+	proc, err := launch(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	s, err := attach(ctx, proc.browser, cfg)
+	if err != nil {
+		_ = proc.close()
+		return nil, err
+	}
+	s.proc = proc
+	return s, nil
+}
+
+func normalize(cfg Config) (Config, error) {
 	if cfg.Viewport.Width <= 0 || cfg.Viewport.Height <= 0 {
 		cfg.Viewport = Viewport{DefaultViewportWidth, DefaultViewportHeight}
 	}
@@ -118,11 +137,21 @@ func New(ctx context.Context, cfg Config) (*Session, error) {
 	}
 	for _, h := range cfg.AllowedHosts {
 		if strings.TrimSpace(h) == "" {
-			return nil, errors.New("browser: AllowedHosts contains an empty entry")
+			return cfg, errors.New("browser: AllowedHosts contains an empty entry")
 		}
 	}
 	cfg.AllowedHosts = append([]string(nil), cfg.AllowedHosts...)
+	return cfg, nil
+}
 
+// process is one launched browser.
+type process struct {
+	launcher *launcher.Launcher
+	browser  *rod.Browser
+}
+
+// launch starts the configured or installed browser once.
+func launch(ctx context.Context, cfg Config) (*process, error) {
 	bin := cfg.BrowserPath
 	if bin == "" {
 		found, ok := launcher.LookPath()
@@ -134,44 +163,74 @@ func New(ctx context.Context, cfg Config) (*Session, error) {
 		return nil, fmt.Errorf("%w: %v", ErrNoBrowser, err)
 	}
 
-	l := launcher.New().Context(ctx).Bin(bin).Headless(!cfg.Headed)
+	l := launcher.New().Context(ctx).Bin(bin).Headless(!cfg.Headed).
+		// No leakless helper: Close stops the process, and the helper is an
+		// extra unsigned executable extracted to the temp dir.
+		Leakless(false).
+		// rod disables site isolation and popup blocking by default; pages
+		// here are untrusted, so keep Chrome's protections.
+		Delete("disable-site-isolation-trials").
+		Delete("disable-popup-blocking").
+		Set("disable-features", "TranslateUI")
 	controlURL, err := l.Launch()
 	if err != nil {
-		l.Cleanup()
+		// Cleanup would wait for a process that may never have started.
+		l.Kill()
+		_ = os.RemoveAll(l.Get(flags.UserDataDir))
 		return nil, fmt.Errorf("browser: launch %s: %w", bin, err)
 	}
-	s := &Session{cfg: cfg, launcher: l, refs: newRefRegistry()}
-	if err := s.connect(ctx, controlURL); err != nil {
-		s.Close()
-		return nil, err
-	}
-	return s, nil
-}
-
-func (s *Session) connect(ctx context.Context, controlURL string) error {
+	proc := &process{launcher: l}
 	b := rod.New().ControlURL(controlURL).Context(ctx)
 	if err := b.Connect(); err != nil {
-		return fmt.Errorf("browser: connect: %w", err)
+		_ = proc.close()
+		return nil, fmt.Errorf("browser: connect: %w", err)
 	}
 	// Detach from the launch context: it only bounds startup.
-	s.browser = b.Context(context.Background())
-	page, err := s.browser.Page(proto.TargetCreateTarget{URL: "about:blank"})
-	if err != nil {
-		return fmt.Errorf("browser: open page: %w", err)
+	proc.browser = b.Context(context.Background())
+	return proc, nil
+}
+
+// close asks the browser to exit, kills it if it has not exited within a
+// few seconds, and removes its temporary profile.
+func (p *process) close() error {
+	var err error
+	if p.browser != nil {
+		err = p.browser.Close()
 	}
-	s.page = page
+	done := make(chan struct{})
+	go func() {
+		p.launcher.Cleanup()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		p.launcher.Kill()
+		<-done
+	}
+	return err
+}
+
+// attach opens a page with cfg's viewport and host filter on a running
+// browser.
+func attach(ctx context.Context, b *rod.Browser, cfg Config) (*Session, error) {
+	page, err := b.Context(ctx).Page(proto.TargetCreateTarget{URL: "about:blank"})
+	if err != nil {
+		return nil, fmt.Errorf("browser: open page: %w", err)
+	}
+	page = page.Context(context.Background())
+	s := &Session{cfg: cfg, page: page, refs: newRefRegistry()}
 	err = page.SetViewport(&proto.EmulationSetDeviceMetricsOverride{
-		Width: s.cfg.Viewport.Width, Height: s.cfg.Viewport.Height, DeviceScaleFactor: 1,
+		Width: cfg.Viewport.Width, Height: cfg.Viewport.Height, DeviceScaleFactor: 1,
 	})
+	if err == nil && len(cfg.AllowedHosts) > 0 {
+		err = s.interceptDocuments()
+	}
 	if err != nil {
-		return fmt.Errorf("browser: set viewport: %w", err)
+		_ = page.Close()
+		return nil, fmt.Errorf("browser: prepare page: %w", err)
 	}
-	if len(s.cfg.AllowedHosts) > 0 {
-		if err := s.interceptDocuments(); err != nil {
-			return fmt.Errorf("browser: enable host filter: %w", err)
-		}
-	}
-	return nil
+	return s, nil
 }
 
 // interceptDocuments fails document requests (navigations, redirects,
@@ -204,15 +263,10 @@ func (s *Session) Close() error {
 		return nil
 	}
 	s.closed = true
-	var err error
-	if s.browser != nil {
-		err = s.browser.Close()
+	if s.proc == nil {
+		return s.page.Close()
 	}
-	if s.launcher != nil {
-		s.launcher.Kill()
-		s.launcher.Cleanup()
-	}
-	return err
+	return s.proc.close()
 }
 
 // checkURL validates a navigation target against the scheme rule and

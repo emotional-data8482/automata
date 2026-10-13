@@ -17,7 +17,10 @@ This module drives one Chromium page through go-rod and exposes it as
   uncertain and stops for reconciliation).
 - Validate URLs (http/https only, `AllowedHosts`) before navigation, and keep
   the in-browser document filter in place for redirects and link clicks.
-- Never download a browser. Tests skip with a clear message when no Chrome or
+- Never download a browser or use rod's default launcher (it may download an
+  unsigned Chromium that macOS Gatekeeper blocks). Launch once per test run
+  through the shared process in `browser_test.go`; tests skip with a clear
+  message, without retrying, when no Chrome or
   Chromium is installed; `AUTOMATA_BROWSER_PATH` selects one.
 - Parent cancellation is fatal; page, action, and capture failures are
   recoverable `ErrorResult`s.

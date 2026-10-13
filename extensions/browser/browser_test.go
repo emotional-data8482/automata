@@ -2,6 +2,7 @@ package browser
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -22,22 +23,47 @@ import (
 
 var update = flag.Bool("update", false, "rewrite golden snapshot files")
 
-// newSession launches a browser for one test, skipping when none is
-// installed. AUTOMATA_BROWSER_PATH selects a specific executable.
+// shared is the one browser process a test run launches. Each test gets its
+// own page and Session on it.
+var shared struct {
+	once sync.Once
+	proc *process
+	err  error
+}
+
+func TestMain(m *testing.M) {
+	code := m.Run()
+	if shared.proc != nil {
+		_ = shared.proc.close()
+	}
+	os.Exit(code)
+}
+
+// newSession opens a page on the run's shared headless browser. The browser
+// is launched at most once per run; if that launch fails, every browser test
+// skips instead of retrying. AUTOMATA_BROWSER_PATH selects the executable.
 func newSession(t *testing.T, cfg Config) *Session {
 	t.Helper()
 	if testing.Short() {
 		t.Skip("browser tests launch Chrome; skipped in -short mode")
 	}
-	if cfg.BrowserPath == "" {
-		cfg.BrowserPath = os.Getenv("AUTOMATA_BROWSER_PATH")
-	}
-	s, err := New(t.Context(), cfg)
-	if errors.Is(err, ErrNoBrowser) {
+	shared.once.Do(func() {
+		launchCfg, _ := normalize(Config{BrowserPath: os.Getenv("AUTOMATA_BROWSER_PATH")})
+		shared.proc, shared.err = launch(context.Background(), launchCfg)
+	})
+	if errors.Is(shared.err, ErrNoBrowser) {
 		t.Skip("browser tests need Chrome or Chromium and none was found; install one or set AUTOMATA_BROWSER_PATH")
 	}
+	if shared.err != nil {
+		t.Skipf("browser tests skipped: the browser failed to start (one attempt per run, no retry): %v", shared.err)
+	}
+	cfg, err := normalize(cfg)
 	if err != nil {
-		t.Fatalf("New: %v", err)
+		t.Fatal(err)
+	}
+	s, err := attach(t.Context(), shared.proc.browser, cfg)
+	if err != nil {
+		t.Fatalf("attach: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Close() })
 	return s
