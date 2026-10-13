@@ -1,0 +1,7 @@
+title: Long page
+url: http://fixture/long.html
+
+main
+  heading "Top of the page" (level 1)
+  [e10] link "First link"
+-- below the viewport: 2 interactive elements; headings: "Pricing", "FAQ" (scroll down to reveal)

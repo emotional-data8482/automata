@@ -1,0 +1,16 @@
+title: Sign up
+url: http://fixture/form.html
+
+navigation "Main"
+  [e1] link "Home"
+  [e2] link "About us"
+main
+  heading "Create an account" (level 1)
+  form "Sign up"
+    [e3] textbox "Email" (required)
+    [e4] textbox "Name" value="Ada"
+    [e5] checkbox "Subscribe to the newsletter" (checked)
+    [e6] combobox "Plan" value="Free" (collapsed)
+    [e7] button "Save" (disabled)
+    [e8] button "Continue with a deliberately very long label that keeps going well past eighty …"
+  [e9] button "Remove continue"
