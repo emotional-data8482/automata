@@ -8,4 +8,4 @@ list
   [e15] link "Result 3"
   [e16] link "Result 4"
   [e17] link "Result 5"
-  … (30 items, showing 5)
+  … (30 items, showing 5; use mode=full to see all)

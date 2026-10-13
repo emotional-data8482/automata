@@ -30,7 +30,7 @@ func (s *Session) Tools() []core.Tool {
 			"Open an http(s) URL in the browser page and return its title, final URL, and an interactive snapshot of the viewport. Refs like [e6] in the snapshot identify elements for browser_act.",
 			guard(s, s.navigate)), readOnly),
 		core.WithToolEffectPolicy(core.FuncResult("browser_snapshot",
-			"Return an accessibility snapshot of the current page. mode interactive (default) lists controls in the viewport; content adds visible text and images; full covers the whole page. within limits output to one ref's subtree. Long snapshots are paged.",
+			"Return an accessibility snapshot of the current page. mode interactive (default) lists controls in the viewport and hides page text; use content when you need to read text such as prices or paragraphs; full covers the whole page. within limits output to one ref's subtree. Long snapshots are paged.",
 			guard(s, s.snapshot)), readOnly),
 		core.WithToolEffectPolicy(core.FuncResult("browser_act",
 			"Perform a batch of actions on snapshot refs, in order, then return a new snapshot. Ops: click, type (replaces the field's text), select (an option by its visible text), press (a key such as Enter, Tab, ArrowDown or Control+a; ref optional), hover, scroll (to a ref, or text up/down for the page). Stops at the first failing action and reports its index.",

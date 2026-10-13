@@ -320,7 +320,7 @@ func (r *renderer) pruneChildren(n *axNode, ancestorName string) []*outNode {
 		}
 	}
 	shown := out[:groups[repeatShow]]
-	marker := &outNode{text: fmt.Sprintf("… (%d items, showing %d)", len(roles), repeatShow)}
+	marker := &outNode{text: fmt.Sprintf("… (%d items, showing %d; use mode=full to see all)", len(roles), repeatShow)}
 	return append(shown[:len(shown):len(shown)], marker)
 }
 

@@ -133,7 +133,7 @@ func TestRenderCollapsesRepeatedSiblings(t *testing.T) {
 	list := &axNode{Role: "list", Children: items(repeatThreshold + 2)}
 	got := renderText(t, &axNode{Role: "RootWebArea", Children: []*axNode{list}}, renderOptions{Viewport: rect{0, 0, 1000, 10000}})
 	if !strings.Contains(got, `[e5] link "Item 5"`) || strings.Contains(got, "Item 6") ||
-		!strings.Contains(got, "  … (22 items, showing 5)") {
+		!strings.Contains(got, "  … (22 items, showing 5; use mode=full to see all)") {
 		t.Fatalf("got:\n%s", got)
 	}
 
