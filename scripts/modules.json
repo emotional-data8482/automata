@@ -16,6 +16,7 @@
     {"path": "examples/openai", "kind": "example", "race": false, "smoke": "."},
     {"path": "examples/deep_research", "kind": "example", "race": false, "smoke": "."},
     {"path": "examples/durable_typed", "kind": "example", "race": false, "smoke": "."},
-    {"path": "examples/durable_host", "kind": "example", "race": false, "smoke": "."}
+    {"path": "examples/durable_host", "kind": "example", "race": false, "smoke": "."},
+    {"path": "examples/browser", "kind": "example", "race": false, "smoke": "."}
   ]
 }

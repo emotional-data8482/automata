@@ -296,7 +296,7 @@ func TestNavigationPolicy(t *testing.T) {
 	other := newFixtures(t, "")
 	otherURL := strings.Replace(other.URL, "127.0.0.1", "localhost", 1)
 	srv := newFixtures(t, otherURL)
-	s := newSession(t, Config{AllowedHosts: []string{"127.0.0.1"}})
+	s := newSession(t, Config{AllowedHosts: []string{"127.0.0.1"}, RequestAccess: true})
 
 	for _, url := range []string{"file:///etc/passwd", "javascript:alert(1)", "data:text/html,hi", otherURL + "/secret", "http://"} {
 		r := run(t, s, "browser_navigate", map[string]any{"url": url})
@@ -305,14 +305,17 @@ func TestNavigationPolicy(t *testing.T) {
 		}
 	}
 
-	if r := run(t, s, "browser_navigate", map[string]any{"url": srv.URL + "/redirect"}); !r.IsError || !strings.Contains(r.Text(), "blocked") {
+	if r := run(t, s, "browser_navigate", map[string]any{"url": srv.URL + "/redirect"}); !r.IsError || !strings.Contains(r.Text(), `navigation blocked: host "localhost" is not allowed; call browser_request_access`) {
 		t.Errorf("redirect to a disallowed host: %s", r.Text())
 	}
 
 	snap := navigate(t, s, srv.URL+"/links.html")
-	run(t, s, "browser_act", map[string]any{"actions": []map[string]string{{"op": "click", "ref": refFor(t, snap, "Leave the allowed hosts")}}})
+	click := run(t, s, "browser_act", map[string]any{"actions": []map[string]string{{"op": "click", "ref": refFor(t, snap, "Leave the allowed hosts")}}})
 	if n := other.hits.Load(); n != 0 {
 		t.Fatalf("disallowed host received %d request(s)", n)
+	}
+	if !strings.Contains(click.Text(), `navigation blocked: host "localhost" is not allowed; call browser_request_access`) {
+		t.Errorf("blocked link click should tell the model how to ask for access:\n%s", click.Text())
 	}
 
 	snap = navigate(t, s, srv.URL+"/links.html")
@@ -426,7 +429,7 @@ func TestEmptyAllowedHostsBlocksNavigation(t *testing.T) {
 	s := newSession(t, Config{AllowedHosts: []string{}})
 	srv := newFixtures(t, "http://unused.invalid")
 	r := run(t, s, "browser_navigate", map[string]any{"url": srv.URL + "/form.html"})
-	if !r.IsError || r.Effect.Status != core.EffectNotApplied || !strings.Contains(r.Text(), "AllowedHosts") {
+	if !r.IsError || r.Effect.Status != core.EffectNotApplied || !strings.Contains(r.Text(), "browser.Config.AllowedHosts") || strings.Contains(r.Text(), "browser_request_access") {
 		t.Fatalf("navigate with no allowed hosts: effect=%q %s", r.Effect.Status, r.Text())
 	}
 }

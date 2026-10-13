@@ -87,6 +87,10 @@ func (s *Session) act(ctx context.Context, page *rod.Page, p actParams) (core.To
 	if status != core.EffectNotApplied {
 		s.settle(page)
 	}
+	if note := s.blockedNote(s.takeBlocked()); note != "" {
+		b.WriteString("\n")
+		b.WriteString(strings.TrimSpace(note))
+	}
 	if snap, err := s.renderPage(page, modeInteractive, "", 1); err != nil {
 		if ctx.Err() != nil {
 			return core.ToolResult{Effect: core.EffectReport{Status: status}}, ctx.Err()

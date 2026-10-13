@@ -28,7 +28,16 @@
 // [Config.AllowedHosts] must list the hosts the page may open, and with it
 // empty every navigation is rejected. Document requests (including
 // redirects, link clicks and same-process iframes) to other hosts are also
-// blocked inside the browser. Navigation never accepts non-http(s) URLs such as file://.
+// blocked inside the browser.
+//
+// To let the user extend the list at run time, set [Config.RequestAccess]:
+// the model can then call browser_request_access(host, reason), a Runtime
+// durable approval whose prompt reads "Allow the browser to visit <host>?
+// Reason: …". An allowed host stays allowed for the rest of the session; a
+// denial reaches the model as an ordinary error. Set [Config.AskAccess] to
+// answer the request inline instead (for example outside Runtime). Called
+// outside Runtime without AskAccess, the tool refuses rather than granting
+// access nobody approved. examples/browser shows a terminal approval. Navigation never accepts non-http(s) URLs such as file://.
 // Popups and out-of-process iframes are not intercepted.
 package browser
 
@@ -88,6 +97,18 @@ type Config struct {
 	// ActionTimeout bounds each browser_act action and each snapshot or
 	// screenshot capture. Defaults to 10s.
 	ActionTimeout time.Duration
+	// RequestAccess adds the browser_request_access tool, which lets the
+	// model ask the user to allow a host outside AllowedHosts for the rest of
+	// the session. Without AskAccess it is a Runtime durable approval
+	// ([core.WithDurableWait]), so the Runtime must have an approval
+	// Authorizer; registering the agent fails otherwise.
+	RequestAccess bool
+	// AskAccess, when set, enables browser_request_access and answers it
+	// inline instead of through a Runtime durable approval: it is called
+	// with the host and the model's reason and reports whether the user
+	// allowed the host. Use it when tools run outside Runtime (for example
+	// behind an MCP server) or when the application prompts the user itself.
+	AskAccess func(ctx context.Context, host, reason string) (bool, error)
 }
 
 // Session owns one browser process and one page. Its tools serialize their
@@ -100,6 +121,16 @@ type Session struct {
 	mu     sync.Mutex
 	refs   *refRegistry
 	closed bool
+
+	// hosts is the allowed set: Config.AllowedHosts plus hosts the user
+	// approved through browser_request_access. The document filter reads it
+	// from Chrome's event goroutines.
+	hostsMu sync.RWMutex
+	hosts   []string
+	// blocked records hosts the document filter refused since the current
+	// tool call began, so the call can tell the model why a page failed.
+	blockedMu sync.Mutex
+	blocked   []string
 }
 
 // New launches one browser and opens a blank page. It makes exactly one
@@ -220,7 +251,7 @@ func attach(ctx context.Context, b *rod.Browser, cfg Config) (*Session, error) {
 		return nil, fmt.Errorf("browser: open page: %w", err)
 	}
 	page = page.Context(context.Background())
-	s := &Session{cfg: cfg, page: page, refs: newRefRegistry()}
+	s := &Session{cfg: cfg, page: page, refs: newRefRegistry(), hosts: cfg.AllowedHosts}
 	err = page.SetViewport(&proto.EmulationSetDeviceMetricsOverride{
 		Width: cfg.Viewport.Width, Height: cfg.Viewport.Height, DeviceScaleFactor: 1,
 	})
@@ -245,6 +276,7 @@ func (s *Session) interceptDocuments() error {
 				_ = proto.FetchContinueRequest{RequestID: e.RequestID}.Call(page)
 				return
 			}
+			s.recordBlocked(e.Request.URL)
 			_ = proto.FetchFailRequest{RequestID: e.RequestID, ErrorReason: proto.NetworkErrorReasonBlockedByClient}.Call(page)
 		}()
 	})()
@@ -284,11 +316,11 @@ func (s *Session) checkURL(raw string) error {
 	if host == "" {
 		return fmt.Errorf("invalid url %q: missing host", raw)
 	}
-	if len(s.cfg.AllowedHosts) == 0 {
-		return errors.New("navigation is disabled: no hosts are allowed; the application must set browser.Config.AllowedHosts")
-	}
-	if !hostAllowed(s.cfg.AllowedHosts, host) {
-		return fmt.Errorf("host %q is not in the allowed hosts", host)
+	s.hostsMu.RLock()
+	allowed := hostAllowed(s.hosts, host)
+	s.hostsMu.RUnlock()
+	if !allowed {
+		return s.notAllowedError(host)
 	}
 	return nil
 }

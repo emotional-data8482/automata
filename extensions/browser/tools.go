@@ -20,10 +20,11 @@ const (
 )
 
 // Tools returns the session's tools: browser_navigate, browser_snapshot,
-// browser_act and browser_screenshot.
+// browser_act and browser_screenshot, plus browser_request_access when
+// Config.RequestAccess or Config.AskAccess is set.
 func (s *Session) Tools() []core.Tool {
 	readOnly := core.ToolEffectPolicy{Kind: core.ToolEffectReadOnly}
-	return []core.Tool{
+	tools := []core.Tool{
 		core.WithToolEffectPolicy(core.FuncResult("browser_navigate",
 			"Open an http(s) URL in the browser page and return its title, final URL, and an interactive snapshot of the viewport. Refs like [e6] in the snapshot identify elements for browser_act.",
 			guard(s, s.navigate)), readOnly),
@@ -37,6 +38,10 @@ func (s *Session) Tools() []core.Tool {
 			"Capture a PNG screenshot of the viewport, the full page, or one element ref. The long edge is scaled down to max_px (default 1024).",
 			guard(s, s.screenshot)), readOnly),
 	}
+	if s.requestsEnabled() {
+		tools = append(tools, s.requestAccess())
+	}
+	return tools
 }
 
 // guard serializes tool calls, rejects calls after Close, and keeps parent
@@ -51,6 +56,7 @@ func guard[P any](s *Session, fn func(context.Context, *rod.Page, P) (core.ToolR
 		if s.closed {
 			return notApplied("browser session is closed"), nil
 		}
+		s.takeBlocked() // report only what this call's navigations hit
 		result, err := fn(ctx, s.page.Context(ctx), p)
 		if ctx.Err() != nil {
 			return result, ctx.Err()
@@ -83,6 +89,9 @@ func (s *Session) navigate(ctx context.Context, page *rod.Page, p navigateParams
 	if err := nav.Navigate(strings.TrimSpace(p.URL)); err != nil {
 		var navErr *rod.NavigationError
 		if errors.As(err, &navErr) && strings.Contains(navErr.Reason, "BLOCKED_BY_CLIENT") {
+			if note := s.blockedNote(s.takeBlocked()); note != "" {
+				return core.ToolResult{}, errors.New(strings.TrimSpace(note))
+			}
 			return core.ToolResult{}, errors.New("navigation blocked: a redirect left the allowed hosts")
 		}
 		return core.ToolResult{}, fmt.Errorf("navigate: %w", err)
@@ -98,7 +107,7 @@ func (s *Session) navigate(ctx context.Context, page *rod.Page, p navigateParams
 	if err != nil {
 		return core.ToolResult{}, err
 	}
-	return core.TextResult(loadNote + text), nil
+	return core.TextResult(s.blockedNote(s.takeBlocked()) + loadNote + text), nil
 }
 
 type snapshotParams struct {

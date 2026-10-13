@@ -15,7 +15,13 @@ This module drives one Chromium page through go-rod and exposes it as
   input was dispatched, `EffectApplied` once input reached the page, and
   `EffectUnknown` only when a dispatch itself failed (Runtime treats Unknown as
   uncertain and stops for reconciliation).
-- Navigation fails closed: an empty `AllowedHosts` rejects every URL. Validate
+- Navigation fails closed: an empty `AllowedHosts` rejects every URL.
+  `browser_request_access` is opt-in (`RequestAccess` or `AskAccess`). Its
+  body may grant a host only after a decision: `AskAccess` returned true, or
+  Runtime dispatched it (an approval tool only dispatches after Allow), so
+  keep the `ToolOperationFromContext` check. Approval prompts and targets
+  must never fail: Runtime treats those errors as fatal. The allowed set is
+  read from Chrome's event goroutines; keep it under `hostsMu`. Validate
   URLs (http/https only, `AllowedHosts`) before navigation, and keep
   the in-browser document filter in place for redirects and link clicks.
 - Never download a browser or use rod's default launcher (it may download an

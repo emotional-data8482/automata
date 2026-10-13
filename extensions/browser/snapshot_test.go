@@ -208,7 +208,7 @@ func TestRefRegistry(t *testing.T) {
 }
 
 func TestCheckURL(t *testing.T) {
-	s := &Session{cfg: Config{AllowedHosts: []string{"example.com", "*.docs.example.org", "LOCALHOST:8080"}}}
+	s := &Session{hosts: []string{"example.com", "*.docs.example.org", "LOCALHOST:8080"}}
 	for raw, ok := range map[string]bool{
 		"https://example.com/a":          true,
 		"http://EXAMPLE.com.:8443/":      true,
@@ -228,8 +228,12 @@ func TestCheckURL(t *testing.T) {
 		}
 	}
 	closed := &Session{}
-	if err := closed.checkURL("https://anything.test/"); err == nil || !strings.Contains(err.Error(), "AllowedHosts") {
+	if err := closed.checkURL("https://anything.test/"); err == nil || !strings.Contains(err.Error(), "browser.Config.AllowedHosts") {
 		t.Errorf("empty AllowedHosts must block navigation and name the setting: %v", err)
+	}
+	asking := &Session{cfg: Config{RequestAccess: true}}
+	if err := asking.checkURL("https://anything.test/"); err == nil || !strings.Contains(err.Error(), "call browser_request_access") {
+		t.Errorf("with RequestAccess the error must point the model to browser_request_access: %v", err)
 	}
 	if err := closed.checkURL("file:///tmp/x"); err == nil {
 		t.Error("file URLs must be rejected")
