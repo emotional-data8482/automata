@@ -24,10 +24,11 @@
 // [core.EffectNotApplied] when it failed before dispatching any input, and
 // [core.EffectUnknown] when an input dispatch itself failed midway.
 //
-// Security: page content is untrusted model input. Restrict navigation with
-// [Config.AllowedHosts]; when set, document requests (including redirects,
-// link clicks and same-process iframes) to other hosts are blocked inside
-// the browser. Navigation never accepts non-http(s) URLs such as file://.
+// Security: page content is untrusted model input. Navigation fails closed:
+// [Config.AllowedHosts] must list the hosts the page may open, and with it
+// empty every navigation is rejected. Document requests (including
+// redirects, link clicks and same-process iframes) to other hosts are also
+// blocked inside the browser. Navigation never accepts non-http(s) URLs such as file://.
 // Popups and out-of-process iframes are not intercepted.
 package browser
 
@@ -67,11 +68,11 @@ type Viewport struct {
 }
 
 // Config configures a [Session]. The zero value launches a headless browser
-// with no host restriction.
+// that refuses every navigation until AllowedHosts is set.
 type Config struct {
 	// AllowedHosts restricts which hosts the page may load documents from.
 	// An entry matches the host exactly, or any subdomain when written as
-	// "*.example.com". Ports are ignored. Empty means any http(s) host.
+	// "*.example.com". Ports are ignored. Empty blocks all navigation.
 	AllowedHosts []string
 	// Headed shows the browser window. The default is headless.
 	Headed bool
@@ -223,7 +224,7 @@ func attach(ctx context.Context, b *rod.Browser, cfg Config) (*Session, error) {
 	err = page.SetViewport(&proto.EmulationSetDeviceMetricsOverride{
 		Width: cfg.Viewport.Width, Height: cfg.Viewport.Height, DeviceScaleFactor: 1,
 	})
-	if err == nil && len(cfg.AllowedHosts) > 0 {
+	if err == nil {
 		err = s.interceptDocuments()
 	}
 	if err != nil {
@@ -283,6 +284,9 @@ func (s *Session) checkURL(raw string) error {
 	if host == "" {
 		return fmt.Errorf("invalid url %q: missing host", raw)
 	}
+	if len(s.cfg.AllowedHosts) == 0 {
+		return errors.New("navigation is disabled: no hosts are allowed; the application must set browser.Config.AllowedHosts")
+	}
 	if !hostAllowed(s.cfg.AllowedHosts, host) {
 		return fmt.Errorf("host %q is not in the allowed hosts", host)
 	}
@@ -290,9 +294,6 @@ func (s *Session) checkURL(raw string) error {
 }
 
 func hostAllowed(allowed []string, host string) bool {
-	if len(allowed) == 0 {
-		return true
-	}
 	host = strings.TrimSuffix(strings.ToLower(host), ".")
 	for _, entry := range allowed {
 		entry = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(entry)), ".")

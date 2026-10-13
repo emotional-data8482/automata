@@ -57,6 +57,9 @@ func newSession(t *testing.T, cfg Config) *Session {
 	if shared.err != nil {
 		t.Skipf("browser tests skipped: the browser failed to start (one attempt per run, no retry): %v", shared.err)
 	}
+	if cfg.AllowedHosts == nil {
+		cfg.AllowedHosts = []string{"127.0.0.1"} // the httptest fixtures' host
+	}
 	cfg, err := normalize(cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -415,5 +418,15 @@ func TestConcurrentCalls(t *testing.T) {
 	}
 	if r := run(t, s, "browser_snapshot", nil); !r.IsError || r.Effect.Status != core.EffectNotApplied {
 		t.Fatalf("call after Close: %+v", r)
+	}
+}
+
+// TestEmptyAllowedHostsBlocksNavigation checks that navigation fails closed.
+func TestEmptyAllowedHostsBlocksNavigation(t *testing.T) {
+	s := newSession(t, Config{AllowedHosts: []string{}})
+	srv := newFixtures(t, "http://unused.invalid")
+	r := run(t, s, "browser_navigate", map[string]any{"url": srv.URL + "/form.html"})
+	if !r.IsError || r.Effect.Status != core.EffectNotApplied || !strings.Contains(r.Text(), "AllowedHosts") {
+		t.Fatalf("navigate with no allowed hosts: effect=%q %s", r.Effect.Status, r.Text())
 	}
 }

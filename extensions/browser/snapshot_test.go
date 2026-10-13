@@ -227,12 +227,12 @@ func TestCheckURL(t *testing.T) {
 			t.Errorf("checkURL(%q) = %v, want allowed=%v", raw, err, ok)
 		}
 	}
-	open := &Session{}
-	if err := open.checkURL("https://anything.test/"); err != nil {
-		t.Errorf("empty AllowedHosts should allow any http(s) host: %v", err)
+	closed := &Session{}
+	if err := closed.checkURL("https://anything.test/"); err == nil || !strings.Contains(err.Error(), "AllowedHosts") {
+		t.Errorf("empty AllowedHosts must block navigation and name the setting: %v", err)
 	}
-	if err := open.checkURL("file:///tmp/x"); err == nil {
-		t.Error("file URLs must be rejected even without AllowedHosts")
+	if err := closed.checkURL("file:///tmp/x"); err == nil {
+		t.Error("file URLs must be rejected")
 	}
 }
 
