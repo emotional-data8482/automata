@@ -248,7 +248,17 @@ func TestParseKey(t *testing.T) {
 	if _, key, err := parseKey("enter"); err != nil || key != input.Enter {
 		t.Fatalf("enter = %q %v", key, err)
 	}
-	for _, bad := range []string{"", "Control+", "Hyper+a", "NotAKey", "é"} {
+	for spec, want := range map[string]input.Key{"F5": input.F5, "insert": input.Insert, "Plus": input.NumpadAdd, "+": input.NumpadAdd} {
+		if mods, key, err := parseKey(spec); err != nil || len(mods) != 0 || key != want {
+			t.Errorf("%s = %v %q %v", spec, mods, key, err)
+		}
+	}
+	for _, spec := range []string{"Control++", "Control+Plus", "Control+Shift++"} {
+		if mods, key, err := parseKey(spec); err != nil || len(mods) == 0 || mods[0] != input.ControlLeft || key != input.NumpadAdd {
+			t.Errorf("%s = %v %q %v", spec, mods, key, err)
+		}
+	}
+	for _, bad := range []string{"", "Control+", "Hyper+a", "NotAKey", "é", "Hyper++"} {
 		if _, _, err := parseKey(bad); err == nil {
 			t.Errorf("parseKey(%q) should fail", bad)
 		}
@@ -265,6 +275,10 @@ func TestValidateRejectsBeforeDispatch(t *testing.T) {
 		{Op: "scroll", Text: "sideways"},
 		{Op: "drag", Ref: ref},
 		{Op: "hover", Ref: "e42"},
+		{Op: "type"},
+		{Op: "press", Text: "Tab", Count: maxPressCount + 1},
+		{Op: "press", Text: "Tab", Count: -1},
+		{Op: "click", Ref: ref, Count: 2},
 	} {
 		if err := s.validate(a); err == nil {
 			t.Errorf("validate(%+v) should fail", a)
@@ -273,6 +287,7 @@ func TestValidateRejectsBeforeDispatch(t *testing.T) {
 	for _, a := range []action{
 		{Op: "click", Ref: ref}, {Op: "type", Ref: ref}, {Op: "press", Text: "Tab"},
 		{Op: "scroll"}, {Op: "scroll", Text: "Up"}, {Op: "select", Ref: ref, Text: "Pro"},
+		{Op: "type", Text: "hi"}, {Op: "press", Text: "ArrowDown", Count: maxPressCount},
 	} {
 		if err := s.validate(a); err != nil {
 			t.Errorf("validate(%+v): %v", a, err)

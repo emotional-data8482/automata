@@ -251,6 +251,17 @@ func TestActTypeSelectClick(t *testing.T) {
 	if press.IsError || !strings.Contains(press.Text(), `textbox "Name" value="A" (focused)`) {
 		t.Fatalf("clear + press: %s", press.Text())
 	}
+
+	// type without a ref sends keys to the focused element; press count repeats.
+	focused := run(t, s, "browser_act", map[string]any{"actions": []map[string]any{
+		{"op": "type", "text": "b+cé"},
+		{"op": "press", "text": "Backspace", "count": 2},
+		{"op": "press", "text": "Plus"},
+	}})
+	if focused.IsError || focused.Effect.Status != core.EffectApplied ||
+		!strings.Contains(focused.Text(), `textbox "Name" value="Ab++" (focused)`) {
+		t.Fatalf("type into focus: effect=%q %s", focused.Effect.Status, focused.Text())
+	}
 }
 
 func TestActStaleAndInvalidRefs(t *testing.T) {

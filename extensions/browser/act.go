@@ -15,10 +15,14 @@ import (
 )
 
 type action struct {
-	Op   string `json:"op" enum:"click,type,select,press,hover,scroll"`
-	Ref  string `json:"ref,omitempty" desc:"snapshot ref of the target element, such as e6"`
-	Text string `json:"text,omitempty" desc:"type: the text to enter; select: the option's visible text; press: a key such as Enter or Control+a; scroll without ref: up or down"`
+	Op    string `json:"op" enum:"click,type,select,press,hover,scroll"`
+	Ref   string `json:"ref,omitempty" desc:"snapshot ref of the target element, such as e6"`
+	Text  string `json:"text,omitempty" desc:"type: the text to enter; select: the option's visible text; press: a key such as Enter, Control+a or Control+Plus; scroll without ref: up or down"`
+	Count int    `json:"count,omitempty" desc:"press: how many times to press the key (default 1, at most 50)"`
 }
+
+// maxPressCount caps a press action's repeat count.
+const maxPressCount = 50
 
 func (a action) String() string {
 	parts := []string{a.Op}
@@ -27,6 +31,9 @@ func (a action) String() string {
 	}
 	if a.Text != "" {
 		parts = append(parts, fmt.Sprintf("%q", clip(a.Text)))
+	}
+	if a.Count > 1 {
+		parts = append(parts, fmt.Sprintf("x%d", a.Count))
 	}
 	return strings.Join(parts, " ")
 }
@@ -108,16 +115,26 @@ func (s *Session) act(ctx context.Context, page *rod.Page, p actParams) (core.To
 
 // validate checks an action's shape and ref before anything is dispatched.
 func (s *Session) validate(a action) error {
+	if a.Count != 0 && a.Op != "press" {
+		return errors.New("count applies only to press")
+	}
 	switch a.Op {
-	case "click", "hover", "type":
+	case "click", "hover":
 		if a.Ref == "" {
 			return errors.New("ref is required")
+		}
+	case "type":
+		if a.Ref == "" && a.Text == "" {
+			return errors.New("type without a ref needs text")
 		}
 	case "select":
 		if a.Ref == "" || a.Text == "" {
 			return errors.New("ref and text are required")
 		}
 	case "press":
+		if a.Count < 0 || a.Count > maxPressCount {
+			return fmt.Errorf("count must be between 1 and %d", maxPressCount)
+		}
 		if _, _, err := parseKey(a.Text); err != nil {
 			return err
 		}
@@ -167,6 +184,9 @@ func (s *Session) do(page *rod.Page, a action) (dispatched bool, err error) {
 		return true, nil
 
 	case "type":
+		if el == nil {
+			return typeKeys(page, a.Text)
+		}
 		editable, err := el.Eval(`() => this.isContentEditable ||
 			((this.tagName === 'INPUT' || this.tagName === 'TEXTAREA') && !this.disabled && !this.readOnly)`)
 		if err != nil {
@@ -214,7 +234,11 @@ func (s *Session) do(page *rod.Page, a action) (dispatched bool, err error) {
 				return false, err
 			}
 		}
-		return true, page.KeyActions().Press(mods...).Type(key).Do()
+		keys := make([]input.Key, max(a.Count, 1))
+		for i := range keys {
+			keys[i] = key
+		}
+		return true, page.KeyActions().Press(mods...).Type(keys...).Do()
 
 	case "scroll":
 		if el != nil {
@@ -304,12 +328,34 @@ func (s *Session) settle(page *rod.Page) {
 	}
 }
 
+// typeKeys types text into the focused element one key at a time, so custom
+// widgets receive real key events. Characters without a key are inserted as
+// text. Every key is a dispatch, so any failure is reported as dispatched.
+func typeKeys(page *rod.Page, text string) (dispatched bool, err error) {
+	for _, r := range text {
+		switch k := input.Key(r); {
+		case r == '\n':
+			err = page.Keyboard.Type(input.Enter)
+		case keyDefined(k):
+			err = page.Keyboard.Type(k)
+		default:
+			err = page.InsertText(string(r))
+		}
+		if err != nil {
+			return true, err
+		}
+	}
+	return true, nil
+}
+
 var namedKeys = map[string]input.Key{
 	"enter": input.Enter, "tab": input.Tab, "escape": input.Escape, "esc": input.Escape,
-	"backspace": input.Backspace, "delete": input.Delete, "space": input.Space,
-	"arrowup": input.ArrowUp, "arrowdown": input.ArrowDown,
+	"backspace": input.Backspace, "delete": input.Delete, "insert": input.Insert, "space": input.Space,
+	"plus": input.NumpadAdd, "arrowup": input.ArrowUp, "arrowdown": input.ArrowDown,
 	"arrowleft": input.ArrowLeft, "arrowright": input.ArrowRight,
 	"home": input.Home, "end": input.End, "pageup": input.PageUp, "pagedown": input.PageDown,
+	"f1": input.F1, "f2": input.F2, "f3": input.F3, "f4": input.F4, "f5": input.F5, "f6": input.F6,
+	"f7": input.F7, "f8": input.F8, "f9": input.F9, "f10": input.F10, "f11": input.F11, "f12": input.F12,
 }
 
 var modifierKeys = map[string]input.Key{
@@ -318,20 +364,31 @@ var modifierKeys = map[string]input.Key{
 	"meta": input.MetaLeft, "cmd": input.MetaLeft, "command": input.MetaLeft,
 }
 
-// parseKey parses "Enter", "a", or "Control+Shift+a".
+// parseKey parses "Enter", "a", "Control+Shift+a", or a plus key written as
+// "Plus", "+", or a trailing "++" ("Control++").
 func parseKey(spec string) (mods []input.Key, key input.Key, err error) {
-	parts := strings.Split(strings.TrimSpace(spec), "+")
-	if spec == "" || parts[len(parts)-1] == "" {
+	spec = strings.TrimSpace(spec)
+	modSpec, last := "", spec
+	switch {
+	case spec == "+":
+	case strings.HasSuffix(spec, "++"):
+		modSpec, last = spec[:len(spec)-2], "+"
+	case strings.Contains(spec, "+"):
+		i := strings.LastIndex(spec, "+")
+		modSpec, last = spec[:i], strings.TrimSpace(spec[i+1:])
+	}
+	if last == "" {
 		return nil, 0, errors.New("press needs a key in text, such as Enter or Control+a")
 	}
-	for _, m := range parts[:len(parts)-1] {
-		k, ok := modifierKeys[strings.ToLower(strings.TrimSpace(m))]
-		if !ok {
-			return nil, 0, fmt.Errorf("unknown modifier %q", m)
+	if modSpec != "" {
+		for m := range strings.SplitSeq(modSpec, "+") {
+			k, ok := modifierKeys[strings.ToLower(strings.TrimSpace(m))]
+			if !ok {
+				return nil, 0, fmt.Errorf("unknown modifier %q", m)
+			}
+			mods = append(mods, k)
 		}
-		mods = append(mods, k)
 	}
-	last := strings.TrimSpace(parts[len(parts)-1])
 	if k, ok := namedKeys[strings.ToLower(last)]; ok {
 		return mods, k, nil
 	}
