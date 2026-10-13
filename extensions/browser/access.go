@@ -53,6 +53,18 @@ func (s *Session) requestAccess() core.Tool {
 	const description = "Ask the user to allow the browser to visit a host that is not allowed yet. Call it when a navigation or link fails because the host is not allowed. If the user allows it, the host stays allowed for the rest of the session; if not, continue without it."
 	tool := core.WithToolEffectPolicy(core.FuncResult(requestAccessTool, description,
 		func(ctx context.Context, p accessParams) (core.ToolResult, error) {
+			if err := ctx.Err(); err != nil {
+				return core.ToolResult{}, err
+			}
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			// Cancellation may have happened while another tool held the lock.
+			if err := ctx.Err(); err != nil {
+				return core.ToolResult{}, err
+			}
+			if s.closed {
+				return notApplied("browser session is closed"), nil
+			}
 			host, err := normalizeHost(p.Host)
 			if err != nil {
 				return notApplied(err.Error()), nil

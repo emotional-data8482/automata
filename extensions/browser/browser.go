@@ -108,6 +108,8 @@ type Config struct {
 	// with the host and the model's reason and reports whether the user
 	// allowed the host. Use it when tools run outside Runtime (for example
 	// behind an MCP server) or when the application prompts the user itself.
+	// Calls are serialized with the session's other tools. The callback must
+	// respect ctx cancellation and must not call the session's tools or Close.
 	AskAccess func(ctx context.Context, host, reason string) (bool, error)
 }
 
@@ -176,9 +178,16 @@ func normalize(cfg Config) (Config, error) {
 	return cfg, nil
 }
 
+// processLauncher is the shutdown boundary, also used by lifecycle tests
+// that must not launch another browser.
+type processLauncher interface {
+	Cleanup()
+	Kill()
+}
+
 // process is one launched browser.
 type process struct {
-	launcher *launcher.Launcher
+	launcher processLauncher
 	browser  *rod.Browser
 }
 
@@ -225,9 +234,13 @@ func launch(ctx context.Context, cfg Config) (*process, error) {
 // close asks the browser to exit, kills it if it has not exited within a
 // few seconds, and removes its temporary profile.
 func (p *process) close() error {
+	// Bound both the CDP close request and the wait for process exit. The
+	// kill fallback must remain reachable when Chrome stops answering CDP.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 	var err error
 	if p.browser != nil {
-		err = p.browser.Close()
+		err = p.browser.Context(ctx).Close()
 	}
 	done := make(chan struct{})
 	go func() {
@@ -236,7 +249,7 @@ func (p *process) close() error {
 	}()
 	select {
 	case <-done:
-	case <-time.After(5 * time.Second):
+	case <-ctx.Done():
 		p.launcher.Kill()
 		<-done
 	}

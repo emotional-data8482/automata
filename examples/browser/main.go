@@ -30,6 +30,13 @@ import (
 const defaultTask = "Open https://example.com, follow its link to learn more about example domains, and tell me the title of the page it leads to."
 
 func main() {
+	// run returns only after its deferred runtime and browser cleanup.
+	if err := run(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func run() error {
 	allow := flag.String("allow", "example.com", "comma-separated hosts the browser may visit without asking")
 	headed := flag.Bool("headed", false, "show the browser window")
 	flag.Parse()
@@ -52,7 +59,7 @@ func main() {
 		BrowserPath:   os.Getenv("AUTOMATA_BROWSER_PATH"),
 	})
 	if err != nil {
-		log.Fatalf("start browser: %v", err)
+		return fmt.Errorf("start browser: %w", err)
 	}
 	defer session.Close()
 
@@ -62,7 +69,7 @@ func main() {
 		Tools:        session.Tools(),
 	})
 	if err != nil {
-		log.Fatalf("configure agent: %v", err)
+		return fmt.Errorf("configure agent: %w", err)
 	}
 
 	runtime, err := core.NewRuntime(ctx, core.RuntimeConfig{
@@ -71,26 +78,28 @@ func main() {
 		Authorizer: core.ApprovalAuthorizerFunc(func(context.Context, core.ApprovalAuthorization) error { return nil }),
 	})
 	if err != nil {
-		log.Fatalf("open runtime: %v", err)
+		return fmt.Errorf("open runtime: %w", err)
 	}
 	defer runtime.Close()
 	def, err := runtime.Register("browser", "v1", agent)
 	if err != nil {
-		log.Fatalf("register agent: %v", err)
+		return fmt.Errorf("register agent: %w", err)
 	}
 
-	handle, err := runtime.Submit(ctx, def, task)
+	deadline, _ := ctx.Deadline()
+	handle, err := runtime.Submit(ctx, def, task, core.WithDeadline(deadline))
 	if err != nil {
-		log.Fatalf("submit: %v", err)
+		return fmt.Errorf("submit: %w", err)
 	}
 	if err := follow(ctx, handle, bufio.NewReader(os.Stdin)); err != nil {
-		log.Fatal(err)
+		return fmt.Errorf("follow run: %w", err)
 	}
 	res, err := handle.Await(ctx)
 	if err != nil {
-		log.Fatalf("run failed after %d turns (partial output %q): %v", res.Turns, res.Output, err)
+		return fmt.Errorf("run failed after %d turns (partial output %q): %w", res.Turns, res.Output, err)
 	}
 	fmt.Printf("\n%s\n\n[%d turns]\n", res.Output, res.Turns)
+	return nil
 }
 
 // follow prints each tool call and asks at the terminal for every pending

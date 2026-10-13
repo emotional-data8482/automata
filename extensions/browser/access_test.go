@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -85,6 +86,70 @@ func TestRequestAccessCallback(t *testing.T) {
 	want := []string{"docs.example.com: read the guide", "evil.example.com: why not", "broken.example.com: x"}
 	if fmt.Sprint(asked) != fmt.Sprint(want) {
 		t.Errorf("asked %q, want %q", asked, want)
+	}
+}
+
+func TestRequestAccessCallbackSerialized(t *testing.T) {
+	var active, peak atomic.Int32
+	var asked []string // application-owned callback state, not synchronized
+	s := accessSession(Config{AskAccess: func(_ context.Context, host, _ string) (bool, error) {
+		n := active.Add(1)
+		for old := peak.Load(); n > old && !peak.CompareAndSwap(old, n); old = peak.Load() {
+		}
+		asked = append(asked, host)
+		time.Sleep(time.Millisecond)
+		active.Add(-1)
+		return true, nil
+	}})
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := range 16 {
+		wg.Go(func() {
+			<-start
+			r := execAccess(t, s, fmt.Sprintf("h%d.test", i), "read")
+			if r.IsError {
+				t.Errorf("access request: %s", r.Text())
+			}
+		})
+	}
+	close(start)
+	wg.Wait()
+	if peak.Load() != 1 || len(asked) != 16 {
+		t.Fatalf("concurrent callbacks = %d, calls = %d; want 1 and 16", peak.Load(), len(asked))
+	}
+}
+
+func TestRequestAccessClosedOrCanceled(t *testing.T) {
+	for _, name := range []string{"closed", "canceled", "canceled during callback"} {
+		t.Run(name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			asked := false
+			s := accessSession(Config{AskAccess: func(context.Context, string, string) (bool, error) {
+				asked = true
+				cancel()
+				return true, nil
+			}})
+			s.closed = name == "closed"
+			if name == "canceled" {
+				cancel()
+			}
+			raw, _ := json.Marshal(accessParams{Host: "example.com"})
+			r, err := s.requestAccess().Execute(ctx, raw)
+			if name == "closed" {
+				if err != nil || !r.IsError || r.Effect.Status != core.EffectNotApplied || !strings.Contains(r.Text(), "closed") {
+					t.Fatalf("closed session: result=%+v error=%v", r, err)
+				}
+			} else if !errors.Is(err, context.Canceled) {
+				t.Fatalf("cancellation error = %v", err)
+			}
+			if asked != (name == "canceled during callback") {
+				t.Fatalf("asked = %v for %s", asked, name)
+			}
+			if hostAllowed(s.hosts, "example.com") {
+				t.Fatal("closed or canceled request granted access")
+			}
+		})
 	}
 }
 
