@@ -1,15 +1,16 @@
-// Command browser-example lets Claude browse a fixed list of hosts and asks
+// Command browser-example uses OpenRouter to browse a fixed list of hosts and asks
 // you in the terminal before it visits any other host. The approval is a
 // Runtime durable approval (browser_request_access): the run pauses until you
 // answer y or n.
 //
-// It needs ANTHROPIC_API_KEY and an installed Chrome or Chromium (set
-// AUTOMATA_BROWSER_PATH to pick one). The model defaults to claude-sonnet-4-6
-// and can be overridden with ANTHROPIC_MODEL.
+// It needs OPENROUTER_API_KEY and an installed Chrome or Chromium (set
+// AUTOMATA_BROWSER_PATH to pick one). The model defaults to openai/gpt-5.2
+// and can be overridden with OPENROUTER_MODEL. The browser is visible by default.
+// Run from examples/browser:
 //
-//	export ANTHROPIC_API_KEY=sk-ant-...
-//	go run ./examples/browser
-//	go run ./examples/browser -allow example.com -headed "Open example.com and follow its link"
+//	export OPENROUTER_API_KEY=sk-or-...
+//	go run .
+//	go run . -headed=false "Search Wikipedia for the Go programming language and summarize the article"
 package main
 
 import (
@@ -24,10 +25,10 @@ import (
 
 	"github.com/emotional-data8482/automata/core"
 	"github.com/emotional-data8482/automata/extensions/browser"
-	"github.com/emotional-data8482/automata/extensions/claude"
+	"github.com/emotional-data8482/automata/extensions/openrouter"
 )
 
-const defaultTask = "Open https://example.com, follow its link to learn more about example domains, and tell me the title of the page it leads to."
+const defaultTask = "Visit https://en.wikipedia.org and choose a harmless, interesting topic to learn about. Use Wikipedia's search field and submit your query, then open a matching article if search results appear. Read the article and follow one internal Wikipedia link to a related article. Report the exact search query, the titles and final URLs of both articles you actually visited, and three interesting facts you observed, identifying which article each fact came from. Briefly explain why you chose the topic. If you encounter a CAPTCHA or an access block, follow your captcha instructions rather than bypassing it, and never invent facts."
 
 func main() {
 	// run returns only after its deferred runtime and browser cleanup.
@@ -37,36 +38,58 @@ func main() {
 }
 
 func run() error {
-	allow := flag.String("allow", "example.com", "comma-separated hosts the browser may visit without asking")
-	headed := flag.Bool("headed", false, "show the browser window")
+	allow := flag.String("allow", "wikipedia.org,www.wikipedia.org,en.wikipedia.org", "comma-separated hosts the browser may visit without asking")
+	headed := flag.Bool("headed", true, "show the browser window (use -headed=false for headless)")
+	checkpoint := flag.Bool("checkpoint", true, "offer browser_checkpoint so you can solve CAPTCHAs in the visible browser (needs -headed=true)")
+	minutes := flag.Int("minutes", 10, "run deadline in minutes")
 	flag.Parse()
+	hosts := parseHosts(*allow)
+	if len(hosts) == 0 && strings.TrimSpace(*allow) != "" {
+		return fmt.Errorf("-allow %q names no usable host", *allow)
+	}
 	task := strings.Join(flag.Args(), " ")
 	if task == "" {
 		task = defaultTask
 	}
-	model := os.Getenv("ANTHROPIC_MODEL")
+	apiKey := strings.TrimSpace(os.Getenv("OPENROUTER_API_KEY"))
+	if apiKey == "" {
+		return fmt.Errorf("set OPENROUTER_API_KEY before running this example")
+	}
+	model := strings.TrimSpace(os.Getenv("OPENROUTER_MODEL"))
 	if model == "" {
-		model = "claude-sonnet-4-6"
+		model = "openai/gpt-5.2"
+	}
+	fmt.Printf("Model: %s\nTask: %s\n\n", model, task)
+
+	if *checkpoint && !*headed {
+		return fmt.Errorf("-checkpoint needs -headed=true: a CAPTCHA must be solved in a visible browser window")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(*minutes)*time.Minute)
 	defer cancel()
 
 	session, err := browser.New(ctx, browser.Config{
-		AllowedHosts:  strings.Split(*allow, ","),
-		RequestAccess: true,
-		Headed:        *headed,
-		BrowserPath:   os.Getenv("AUTOMATA_BROWSER_PATH"),
+		AllowedHosts:    hosts,
+		RequestAccess:   true,
+		Headed:          *headed,
+		BrowserPath:     os.Getenv("AUTOMATA_BROWSER_PATH"),
+		HumanCheckpoint: *checkpoint,
 	})
 	if err != nil {
 		return fmt.Errorf("start browser: %w", err)
 	}
 	defer session.Close()
 
-	agent, err := core.New(claude.New(model, os.Getenv("ANTHROPIC_API_KEY")), core.AgentConfig{
-		SystemPrompt: "You operate a web browser through tools. Prefer snapshots over screenshots. If a host is not allowed, ask for access with browser_request_access and explain why.",
-		MaxTurns:     20,
+	systemPrompt := "You operate a web browser through tools. Prefer snapshots over screenshots. If a host is not allowed, ask for access with browser_request_access and explain why."
+	if *checkpoint {
+		systemPrompt += " If a page shows a CAPTCHA or similar challenge: when it is simple text or a question you can read from a screenshot, answer it through browser_act; otherwise call browser_checkpoint with a short note describing the challenge and wait for the user to solve it in the browser window. Never try to bypass a challenge."
+	}
+	agent, err := core.New(openrouter.New(model, openrouter.WithAPIKey(apiKey)), core.AgentConfig{
+		SystemPrompt: systemPrompt,
+		MaxTurns:     50,
 		Tools:        session.Tools(),
+		// Keep browser actions sequential and bound the total tool requests.
+		ToolPolicy: core.ToolPolicy{MaxCalls: 40, MaxParallel: 1},
 	})
 	if err != nil {
 		return fmt.Errorf("configure agent: %w", err)
@@ -100,6 +123,19 @@ func run() error {
 	}
 	fmt.Printf("\n%s\n\n[%d turns]\n", res.Output, res.Turns)
 	return nil
+}
+
+// parseHosts splits a comma-separated host list, trimming whitespace and
+// dropping empty entries so a trailing comma is not an error. An empty
+// result ("-allow ”") is valid: the browser then refuses every navigation.
+func parseHosts(list string) []string {
+	var hosts []string
+	for _, h := range strings.Split(list, ",") {
+		if h = strings.TrimSpace(h); h != "" {
+			hosts = append(hosts, h)
+		}
+	}
+	return hosts
 }
 
 // follow prints each tool call and asks at the terminal for every pending
@@ -136,6 +172,16 @@ func follow(ctx context.Context, handle *core.RunHandle, in *bufio.Reader) error
 			}
 		}
 		if snap.State == core.RuntimeTerminal || snap.State == core.RuntimeNeedsAttention {
+			if snap.State == core.RuntimeNeedsAttention {
+				// The run stopped outside the ordinary flow; say why instead of
+				// leaving a quiet terminal.
+				fmt.Println("\nthe run stopped and needs attention; unresolved prompts below, the run result follows")
+				for _, wait := range snap.Waits {
+					if wait.State == core.WaitPending {
+						fmt.Printf("  pending: %s\n", wait.Prompt)
+					}
+				}
+			}
 			return nil
 		}
 		page, err := handle.WaitEvents(ctx, cursor, 64)
