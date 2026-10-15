@@ -58,6 +58,10 @@ func (s *Session) act(ctx context.Context, page *rod.Page, p actParams) (core.To
 		}
 	}
 
+	timed := page.Timeout(s.cfg.ActionTimeout)
+	watchDOM(timed)
+	timed.CancelTimeout()
+
 	status := core.EffectNotApplied
 	failure := ""
 	for i, a := range p.Actions {
@@ -204,7 +208,23 @@ func (s *Session) do(page *rod.Page, a action) (dispatched bool, err error) {
 		if a.Text == "" {
 			return true, page.Keyboard.Type(input.Backspace)
 		}
-		return true, page.InsertText(a.Text)
+		before, hasValue := fieldValue(el)
+		if err := page.InsertText(a.Text); err != nil {
+			return true, err
+		}
+		// Some controlled inputs ignore insertText, which sends no key events.
+		// Retype key by key only when the value did not change at all, so
+		// fields that reformat what they are given (masks) are left alone.
+		if after, ok := fieldValue(el); !hasValue || !ok || after != before || after == a.Text {
+			return true, nil
+		}
+		if err := el.SelectAllText(); err != nil {
+			return true, err
+		}
+		if err := page.Keyboard.Type(input.Backspace); err != nil {
+			return true, err
+		}
+		return typeKeys(page, a.Text)
 
 	case "select":
 		res, err := el.Eval(`(text) => {
@@ -298,7 +318,9 @@ func interactError(err error) error {
 	return err
 }
 
-// settle waits briefly for a navigation an action may have started.
+// settle waits briefly for a navigation an action may have started, then for
+// the DOM to stop changing, so single-page apps that render after a fetch are
+// not captured in their loading state.
 func (s *Session) settle(page *rod.Page) {
 	ctx := page.GetContext()
 	wait := func(d time.Duration) bool {
@@ -320,12 +342,74 @@ func (s *Session) settle(page *rod.Page) {
 		res, err := timed.Eval(`() => document.readyState`)
 		timed.CancelTimeout()
 		if err == nil && res.Value.Str() == "complete" {
-			return
+			break
 		}
 		if !wait(100 * time.Millisecond) {
 			return
 		}
 	}
+	// Wait only when the batch changed the DOM: until settleQuiet has passed
+	// since the last change and nothing is aria-busy, at most settleQuietCap.
+	// A page the batch left untouched adds no wait. A new document has no
+	// watcher yet and counts as changed. Pages that never stop changing hit
+	// the cap; the model can snapshot again. Errors, such as a navigation
+	// replacing the document mid-wait, leave the snapshot to report what it
+	// finds.
+	timed := page.Timeout(settleQuietCap + time.Second)
+	defer timed.CancelTimeout()
+	_, _ = timed.Eval(`(quiet, cap) => new Promise(resolve => {
+		const k = '__automataSettle';
+		let st = window[k];
+		if (!st) {
+			(`+watchDOMJS+`)();
+			st = window[k];
+			st.last = performance.now();
+		}
+		const start = performance.now();
+		const check = () => {
+			const now = performance.now();
+			const changed = st.last > 0;
+			const busy = changed && document.querySelector('[aria-busy="true"]');
+			if (!changed || (now - st.last >= quiet && !busy) || now - start >= cap) {
+				st.obs.disconnect();
+				delete window[k];
+				resolve();
+				return;
+			}
+			setTimeout(check, 25);
+		};
+		check();
+	})`, settleQuiet.Milliseconds(), settleQuietCap.Milliseconds())
+}
+
+// watchDOMJS installs a watcher that records the time of the latest DOM
+// change, replacing any earlier watcher. Changes to classes and styles are
+// ignored so CSS animations do not count.
+const watchDOMJS = `() => {
+	const k = '__automataSettle';
+	if (window[k]) window[k].obs.disconnect();
+	const st = {last: 0};
+	st.obs = new MutationObserver(() => { st.last = performance.now(); });
+	st.obs.observe(document, {subtree: true, childList: true, characterData: true,
+		attributes: true, attributeFilter: ['hidden', 'open', 'disabled', 'aria-hidden', 'aria-busy', 'aria-expanded']});
+	Object.defineProperty(window, k, {value: st, configurable: true});
+}`
+
+// watchDOM starts recording DOM changes before a batch dispatches input, so
+// settle can tell whether the batch changed anything. Failures only make
+// settle treat the page as changed.
+func watchDOM(page *rod.Page) {
+	_, _ = page.Eval(watchDOMJS)
+}
+
+// fieldValue reads an input or textarea's value. ok is false for other
+// elements and when the read fails.
+func fieldValue(el *rod.Element) (value string, ok bool) {
+	res, err := el.Eval(`() => (this.tagName === 'INPUT' || this.tagName === 'TEXTAREA') ? this.value : null`)
+	if err != nil || res.Value.Nil() {
+		return "", false
+	}
+	return res.Value.Str(), true
 }
 
 // typeKeys types text into the focused element one key at a time, so custom

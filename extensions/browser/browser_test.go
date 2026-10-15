@@ -444,3 +444,58 @@ func TestEmptyAllowedHostsBlocksNavigation(t *testing.T) {
 		t.Fatalf("navigate with no allowed hosts: effect=%q %s", r.Effect.Status, r.Text())
 	}
 }
+
+func TestFocusableGenericGetsRef(t *testing.T) {
+	s := newSession(t, Config{})
+	srv := newFixtures(t, "http://unused.invalid")
+	snap := navigate(t, s, srv.URL+"/widgets.html")
+	for _, want := range []string{`generic "Save draft"`, `generic "Open settings"`, `generic "Close panel"`} {
+		refFor(t, snap, want)
+	}
+	if strings.Contains(snap, "Click-only div") {
+		t.Errorf("a div that is not focusable must not get a ref:\n%s", snap)
+	}
+
+	result := run(t, s, "browser_act", map[string]any{"actions": []map[string]string{
+		{"op": "click", "ref": refFor(t, snap, `generic "Save draft"`)},
+	}})
+	if result.IsError {
+		t.Fatalf("click: %s", result.Text())
+	}
+	content := run(t, s, "browser_snapshot", map[string]any{"mode": "content"}).Text()
+	if !strings.Contains(content, `text "Draft saved"`) {
+		t.Fatalf("click on custom control did not run its handler:\n%s", content)
+	}
+}
+
+func TestTypeRetypesIgnoredInsert(t *testing.T) {
+	s := newSession(t, Config{})
+	srv := newFixtures(t, "http://unused.invalid")
+	snap := navigate(t, s, srv.URL+"/widgets.html")
+
+	result := run(t, s, "browser_act", map[string]any{"actions": []map[string]string{
+		{"op": "type", "ref": refFor(t, snap, `textbox "Keyed"`), "text": "hello"},
+		{"op": "type", "ref": refFor(t, snap, `textbox "Phone"`), "text": "5551234567"},
+	}})
+	if result.IsError || result.Effect.Status != core.EffectApplied {
+		t.Fatalf("type: effect=%q %s", result.Effect.Status, result.Text())
+	}
+	for _, want := range []string{`textbox "Keyed" value="hello"`, `textbox "Phone" value="(555) 123-4567"`} {
+		if !strings.Contains(result.Text(), want) {
+			t.Errorf("missing %q:\n%s", want, result.Text())
+		}
+	}
+}
+
+func TestActWaitsForDOMToSettle(t *testing.T) {
+	s := newSession(t, Config{})
+	srv := newFixtures(t, "http://unused.invalid")
+	snap := navigate(t, s, srv.URL+"/widgets.html")
+
+	result := run(t, s, "browser_act", map[string]any{"actions": []map[string]string{
+		{"op": "click", "ref": refFor(t, snap, `button "Load results"`)},
+	}})
+	if result.IsError || !strings.Contains(result.Text(), `link "Second result"`) {
+		t.Fatalf("snapshot shows the loading state:\n%s", result.Text())
+	}
+}

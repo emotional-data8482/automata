@@ -1,0 +1,59 @@
+<!doctype html>
+<html><head><title>Widgets</title>
+<style>body{margin:0;font:16px sans-serif} .card{padding:4px;border:1px solid #ccc}</style>
+</head><body>
+<main>
+  <h1>Widgets</h1>
+  <div tabindex="0" id="custom" class="card">Save draft</div>
+  <div tabindex="0" class="card"><span>Open </span><b>settings</b></div>
+  <div tabindex="0" class="card" aria-label="Close panel"></div>
+  <div tabindex="0" class="card"></div>
+  <div tabindex="-1" class="card">Not in tab order</div>
+  <div class="card" onclick="void 0">Click-only div</div>
+  <label>Keyed <input id="keyed" type="text"></label>
+  <label>Phone <input id="phone" type="text"></label>
+  <button type="button" id="load">Load results</button>
+  <div id="results"></div>
+  <p id="out">Nothing yet.</p>
+</main>
+<script>
+document.getElementById('custom').onclick = () => {
+  document.getElementById('out').textContent = 'Draft saved';
+};
+document.getElementById('custom').onkeydown = (e) => {
+  if (e.key === 'Enter') document.getElementById('out').textContent = 'Draft saved by key';
+};
+
+// keyed accepts text only from real key events, like a controlled input that
+// ignores Input.insertText.
+const keyed = document.getElementById('keyed');
+let keyDown = false;
+keyed.addEventListener('keydown', () => { keyDown = true; });
+keyed.addEventListener('keyup', () => { keyDown = false; });
+keyed.addEventListener('beforeinput', (e) => {
+  if (!keyDown) e.preventDefault();
+});
+
+// phone formats its digits as (555) 123-4567.
+const phone = document.getElementById('phone');
+phone.addEventListener('input', () => {
+  const d = phone.value.replace(/\D/g, '').slice(0, 10);
+  let v = d;
+  if (d.length > 6) v = '(' + d.slice(0, 3) + ') ' + d.slice(3, 6) + '-' + d.slice(6);
+  else if (d.length > 3) v = '(' + d.slice(0, 3) + ') ' + d.slice(3);
+  phone.value = v;
+});
+
+// load shows a loading state, then renders results after a short delay, as an
+// SPA does after a fetch.
+document.getElementById('load').onclick = () => {
+  const results = document.getElementById('results');
+  results.setAttribute('aria-busy', 'true');
+  results.textContent = 'Loading…';
+  setTimeout(() => {
+    results.innerHTML = '<a href="#r1">First result</a> <a href="#r2">Second result</a>';
+    results.removeAttribute('aria-busy');
+  }, 400);
+};
+</script>
+</body></html>

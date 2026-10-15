@@ -61,6 +61,29 @@ navigation "Site"
 	}
 }
 
+func TestRenderFocusableGeneric(t *testing.T) {
+	focusable := func(n *axNode) *axNode { n.Props = map[string]string{"focusable": "true"}; return n }
+	text := func(s string, y float64) *axNode { return &axNode{Role: "StaticText", Name: s, Bounds: box(y)} }
+	root := &axNode{Role: "RootWebArea", Children: []*axNode{
+		focusable(el("generic", "", 0, text("Save", 0), el("generic", "", 0, text("draft", 0)))),
+		focusable(el("generic", "Close panel", 30)),
+		focusable(el("generic", "", 60)),                              // no name: no ref
+		el("generic", "", 90, text("Not focusable", 90)),              // no ref
+		focusable(el("generic", "", 120, el("button", "Inner", 120))), // wrapper: only the button
+		focusable(el("generic", "", 900, text("Below", 900))),         // off screen
+	}}
+	got := renderText(t, root, renderOptions{Mode: modeContent})
+	want := `[e1] generic "Save draft"
+[e2] generic "Close panel"
+text "Not focusable"
+[e3] button "Inner"
+-- below the viewport: 1 interactive element (scroll down to reveal)
+`
+	if got != want {
+		t.Fatalf("got:\n%s\nwant:\n%s", got, want)
+	}
+}
+
 func TestRenderDropsInvisible(t *testing.T) {
 	root := &axNode{Role: "RootWebArea", Children: []*axNode{
 		{Role: "button", Name: "No layout"},

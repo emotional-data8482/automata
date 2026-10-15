@@ -92,6 +92,7 @@ type renderOptions struct {
 type outNode struct {
 	n    *axNode
 	ref  string
+	name string // overrides n.Name when set
 	kids []*outNode
 	text string
 }
@@ -145,7 +146,11 @@ func formatLine(o *outNode) string {
 		role = "text"
 	}
 	b.WriteString(role)
-	if name := clip(n.Name); name != "" {
+	name := n.Name
+	if o.name != "" {
+		name = o.name
+	}
+	if name := clip(name); name != "" {
 		fmt.Fprintf(&b, " %q", name)
 	}
 	if valueRoles[n.Role] {
@@ -220,10 +225,11 @@ func (r *renderer) onScreen(n *axNode) bool {
 		return true
 	}
 	above := n.Bounds.Y+n.Bounds.H <= r.opts.Viewport.Y
+	control := interactiveRoles[n.Role] || n.Role == "generic" // generics get here only as focusable controls
 	switch {
-	case interactiveRoles[n.Role] && above:
+	case control && above:
 		r.res.AboveCount++
-	case interactiveRoles[n.Role]:
+	case control:
 		r.res.BelowCount++
 	case n.Role == "heading" && above:
 		r.res.AboveHeadings = append(r.res.AboveHeadings, clip(n.Name))
@@ -252,6 +258,22 @@ func (r *renderer) prune(n *axNode, ancestorName string) []*outNode {
 		}
 		ref := r.refs.ref(n.BackendID)
 		return []*outNode{{n: n, ref: ref, kids: r.pruneChildren(n, n.Name)}}
+
+	case n.Role == "generic" && n.prop("focusable") == "true" && !hasControl(n.Children):
+		// A custom control such as <div tabindex=0>Save</div>. Chrome gives a
+		// generic no name from its content, so use its visible text.
+		name := n.Name
+		if strings.TrimSpace(name) == "" {
+			name = visibleText(n)
+		}
+		if name == "" {
+			return r.pruneChildren(n, ancestorName)
+		}
+		if !n.visible() || !r.onScreen(n) {
+			return nil
+		}
+		ref := r.refs.ref(n.BackendID)
+		return []*outNode{{n: n, ref: ref, name: name, kids: r.pruneChildren(n, name)}}
 
 	case n.Role == "heading":
 		if !n.visible() || !r.onScreen(n) {
@@ -293,6 +315,38 @@ func (r *renderer) prune(n *axNode, ancestorName string) []*outNode {
 		return []*outNode{{n: n, kids: kids}}
 	}
 	return r.pruneChildren(n, ancestorName)
+}
+
+// hasControl reports whether any node in nodes or their subtrees is an
+// interactive role or focusable. A focusable wrapper around controls (such as
+// a tabindex=-1 app root) is not itself a control.
+func hasControl(nodes []*axNode) bool {
+	for _, c := range nodes {
+		if !c.Ignored && (interactiveRoles[c.Role] || c.prop("focusable") == "true") {
+			return true
+		}
+		if hasControl(c.Children) {
+			return true
+		}
+	}
+	return false
+}
+
+// visibleText joins the visible static text in n's subtree.
+func visibleText(n *axNode) string {
+	var parts []string
+	var walk func(*axNode)
+	walk = func(n *axNode) {
+		if n.Role == "StaticText" && n.visible() {
+			parts = append(parts, n.Name)
+			return
+		}
+		for _, c := range n.Children {
+			walk(c)
+		}
+	}
+	walk(n)
+	return strings.Join(strings.Fields(strings.Join(parts, " ")), " ")
 }
 
 // pruneChildren prunes each child and collapses long runs of same-role

@@ -17,6 +17,11 @@ const (
 	// settleDelay gives a click-triggered navigation time to start before
 	// the post-action load wait.
 	settleDelay = 150 * time.Millisecond
+	// settleQuiet is how long after its last change a DOM that an action
+	// changed must stay unchanged before the follow-up snapshot, waiting at
+	// most settleQuietCap.
+	settleQuiet    = 150 * time.Millisecond
+	settleQuietCap = time.Second
 )
 
 // Tools returns the session's tools: browser_navigate, browser_snapshot,
