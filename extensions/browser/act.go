@@ -15,7 +15,7 @@ import (
 )
 
 type action struct {
-	Op    string `json:"op" enum:"click,type,select,press,hover,scroll"`
+	Op    string `json:"op" enum:"click,type,select,press,hover,scroll,back"`
 	Ref   string `json:"ref,omitempty" desc:"snapshot ref of the target element, such as e6"`
 	Text  string `json:"text,omitempty" desc:"type: the text to enter; select: the option's visible text; press: a key such as Enter, Control+a or Control+Plus; scroll without ref: up or down"`
 	Count int    `json:"count,omitempty" desc:"press: how many times to press the key (default 1, at most 50)"`
@@ -123,6 +123,10 @@ func (s *Session) validate(a action) error {
 		return errors.New("count applies only to press")
 	}
 	switch a.Op {
+	case "back":
+		if a.Ref != "" || a.Text != "" {
+			return errors.New("back takes no ref or text")
+		}
 	case "click", "hover":
 		if a.Ref == "" {
 			return errors.New("ref is required")
@@ -270,8 +274,26 @@ func (s *Session) do(page *rod.Page, a action) (dispatched bool, err error) {
 		}
 		_, err := page.Eval(`(dir) => window.scrollBy(0, dir * window.innerHeight * 0.8)`, dir)
 		return true, err
+
+	case "back":
+		return goBack(page)
 	}
 	return false, fmt.Errorf("unknown op %q", a.Op)
+}
+
+// goBack moves the page to the previous entry in its session history, as the
+// browser's back button does. The about:blank entry the session starts on does
+// not count as a previous page.
+func goBack(page *rod.Page) (dispatched bool, err error) {
+	hist, err := proto.PageGetNavigationHistory{}.Call(page)
+	if err != nil {
+		return false, err
+	}
+	i := hist.CurrentIndex - 1
+	if i < 0 || i >= len(hist.Entries) || !strings.HasPrefix(hist.Entries[i].URL, "http") {
+		return false, errors.New("there is no previous page in the history")
+	}
+	return true, proto.PageNavigateToHistoryEntry{EntryID: hist.Entries[i].ID}.Call(page)
 }
 
 // element resolves a ref to a live element, reporting stale refs.

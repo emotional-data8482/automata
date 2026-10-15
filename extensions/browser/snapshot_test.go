@@ -302,6 +302,8 @@ func TestValidateRejectsBeforeDispatch(t *testing.T) {
 		{Op: "press", Text: "Tab", Count: maxPressCount + 1},
 		{Op: "press", Text: "Tab", Count: -1},
 		{Op: "click", Ref: ref, Count: 2},
+		{Op: "back", Ref: ref},
+		{Op: "back", Text: "1"},
 	} {
 		if err := s.validate(a); err == nil {
 			t.Errorf("validate(%+v) should fail", a)
@@ -311,6 +313,7 @@ func TestValidateRejectsBeforeDispatch(t *testing.T) {
 		{Op: "click", Ref: ref}, {Op: "type", Ref: ref}, {Op: "press", Text: "Tab"},
 		{Op: "scroll"}, {Op: "scroll", Text: "Up"}, {Op: "select", Ref: ref, Text: "Pro"},
 		{Op: "type", Text: "hi"}, {Op: "press", Text: "ArrowDown", Count: maxPressCount},
+		{Op: "back"},
 	} {
 		if err := s.validate(a); err != nil {
 			t.Errorf("validate(%+v): %v", a, err)

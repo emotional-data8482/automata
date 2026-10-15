@@ -264,6 +264,37 @@ func TestActTypeSelectClick(t *testing.T) {
 	}
 }
 
+func TestActBack(t *testing.T) {
+	s := newSession(t, Config{})
+	srv := newFixtures(t, "http://unused.invalid")
+
+	// The about:blank page the session starts on is not a previous page.
+	if r := run(t, s, "browser_act", map[string]any{"actions": []map[string]string{{"op": "back"}}}); !r.IsError ||
+		r.Effect.Status != core.EffectNotApplied || !strings.Contains(r.Text(), "no previous page") {
+		t.Fatalf("back from the start: effect=%q %s", r.Effect.Status, r.Text())
+	}
+	navigate(t, s, srv.URL+"/form.html")
+	if r := run(t, s, "browser_act", map[string]any{"actions": []map[string]string{{"op": "back"}}}); !r.IsError ||
+		r.Effect.Status != core.EffectNotApplied {
+		t.Fatalf("back from the first page: effect=%q %s", r.Effect.Status, r.Text())
+	}
+
+	list := navigate(t, s, srv.URL+"/list.html")
+	result := run(t, s, "browser_act", map[string]any{"actions": []map[string]string{{"op": "back"}}})
+	if result.IsError || result.Effect.Status != core.EffectApplied {
+		t.Fatalf("back: effect=%q %s", result.Effect.Status, result.Text())
+	}
+	if text := result.Text(); !strings.Contains(text, "url: "+srv.URL+"/form.html") || !strings.Contains(text, `textbox "Email"`) {
+		t.Fatalf("back did not return to the form:\n%s", text)
+	}
+	stale := run(t, s, "browser_act", map[string]any{"actions": []map[string]string{
+		{"op": "click", "ref": refFor(t, list, `link "Result 1"`)},
+	}})
+	if !stale.IsError || stale.Effect.Status != core.EffectNotApplied {
+		t.Fatalf("refs from the page left behind should be stale: effect=%q %s", stale.Effect.Status, stale.Text())
+	}
+}
+
 func TestActStaleAndInvalidRefs(t *testing.T) {
 	s := newSession(t, Config{})
 	srv := newFixtures(t, "http://unused.invalid")
