@@ -2,6 +2,7 @@ package openrouter
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/OpenRouterTeam/go-sdk/models/components"
@@ -133,16 +134,69 @@ func TestUserContentImages(t *testing.T) {
 	}
 }
 
-func TestToolResultTextDegradesNonText(t *testing.T) {
-	tr := core.ToolResultBlock{ToolUseID: "c1", Content: core.Blocks{
-		core.TextBlock{Text: "ok: "},
-		core.ImageBlock{MediaType: "image/png"},
-		core.RawBlock{Provider: "openrouter", Type: "weird"},
-	}}
-	got := toolResultText(tr)
-	want := "ok: [non-text tool result block: image/png][non-text tool result block omitted]"
-	if got != want {
-		t.Errorf("toolResultText = %q, want %q", got, want)
+func TestToolResultImagesBecomeContentParts(t *testing.T) {
+	msgs := []core.Message{{Role: "tool", Blocks: core.Blocks{
+		core.ToolResultBlock{ToolUseID: "c1", Content: core.Blocks{
+			core.TextBlock{Text: "shot: "},
+			core.ImageBlock{MediaType: "image/png", Data: []byte{1, 2, 3}},
+			core.RawBlock{Provider: "openrouter", Type: "weird"},
+			core.TextBlock{Text: " done"},
+		}},
+		core.ToolResultBlock{ToolUseID: "c2", IsError: true, Content: core.Blocks{
+			core.ImageBlock{URL: "https://example.com/pic.jpg"},
+		}},
+		core.ToolResultBlock{ToolUseID: "c3", Content: core.Blocks{core.TextBlock{Text: "plain"}}},
+	}}}
+	out, err := convertMessages(msgs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out) != 3 {
+		t.Fatalf("messages = %d, want 3", len(out))
+	}
+
+	// Text, then the image as a data: URL, then the remaining text with the
+	// unmappable block's placeholder, in block order.
+	items := out[0].ChatToolMessage.Content.ArrayOfChatContentItems
+	if len(items) != 3 {
+		t.Fatalf("c1 content parts = %d, want 3", len(items))
+	}
+	if items[0].ChatContentText == nil || items[0].ChatContentText.Text != "shot: " {
+		t.Errorf("c1 part 0 = %#v", items[0])
+	}
+	if img := items[1].ChatContentImage; img == nil || img.ImageURL.URL != "data:image/png;base64,AQID" {
+		t.Errorf("c1 part 1 = %#v", items[1])
+	}
+	if items[2].ChatContentText == nil || items[2].ChatContentText.Text != "[non-text tool result block omitted] done" {
+		t.Errorf("c1 part 2 = %#v", items[2])
+	}
+
+	// An error result keeps its prefix even when the result is only an image.
+	items = out[1].ChatToolMessage.Content.ArrayOfChatContentItems
+	if len(items) != 2 || items[0].ChatContentText == nil || items[0].ChatContentText.Text != "error: " {
+		t.Fatalf("c2 parts = %#v", items)
+	}
+	if img := items[1].ChatContentImage; img == nil || img.ImageURL.URL != "https://example.com/pic.jpg" {
+		t.Errorf("c2 part 1 = %#v", items[1])
+	}
+
+	// Text-only results stay plain strings.
+	if s := out[2].ChatToolMessage.Content.Str; s == nil || *s != "plain" {
+		t.Errorf("c3 content = %#v", out[2].ChatToolMessage.Content)
+	}
+
+	raw, err := json.Marshal(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		`"role":"tool","tool_call_id":"c1"`,
+		`{"image_url":{"url":"data:image/png;base64,AQID"},"type":"image_url"}`,
+		`"content":"plain"`,
+	} {
+		if !strings.Contains(string(raw), want) {
+			t.Errorf("wire form missing %s:\n%s", want, raw)
+		}
 	}
 }
 

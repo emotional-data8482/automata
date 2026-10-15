@@ -37,27 +37,60 @@ func convertTools(tools []core.ToolDefinition) ([]components.ChatFunctionTool, e
 	return out, nil
 }
 
-// toolResultText flattens a tool result's blocks into the text a Chat
-// Completions tool message can carry. Text blocks concatenate in order;
-// non-text blocks become a documented placeholder line so a rich result never
-// reaches the model as an empty string. OpenRouter has no native tool-result
-// image content, so degradation is by placeholder rather than a conversion
-// error.
-func toolResultText(tr core.ToolResultBlock) string {
-	var b strings.Builder
+// toolResultContent maps a tool result to tool message content. A result
+// with images becomes content parts: text runs, then each image as an
+// image_url part (a data: URL for inline bytes), in block order. Without
+// images it stays a plain string, so text-only requests are unchanged. Blocks
+// with no Chat Completions form become a documented placeholder so a rich
+// result never reaches the model as an empty string. An error result carries
+// an "error: " prefix, since there is no native error flag.
+func toolResultContent(tr core.ToolResultBlock) components.ChatToolMessageContent {
+	prefix := ""
+	if tr.IsError {
+		prefix = "error: "
+	}
+	hasImage := false
 	for _, blk := range tr.Content {
-		switch t := blk.(type) {
-		case core.TextBlock:
+		if _, ok := blk.(core.ImageBlock); ok {
+			hasImage = true
+			break
+		}
+	}
+	if !hasImage {
+		return components.CreateChatToolMessageContentStr(prefix + toolResultText(tr.Content))
+	}
+
+	var parts []components.ChatContentItems
+	var text strings.Builder
+	text.WriteString(prefix)
+	flush := func() {
+		if text.Len() > 0 {
+			parts = append(parts, components.CreateChatContentItemsText(components.ChatContentText{Text: text.String()}))
+			text.Reset()
+		}
+	}
+	for _, blk := range tr.Content {
+		if img, ok := blk.(core.ImageBlock); ok {
+			flush()
+			parts = append(parts, components.CreateChatContentItemsImageURL(components.ChatContentImage{
+				ImageURL: components.ChatContentImageImageURL{URL: imageDataURL(img)},
+			}))
+			continue
+		}
+		text.WriteString(toolResultText(core.Blocks{blk}))
+	}
+	flush()
+	return components.CreateChatToolMessageContentArrayOfChatContentItems(parts)
+}
+
+// toolResultText flattens non-image tool result blocks into text. Text
+// blocks concatenate in order; anything else becomes a documented placeholder.
+func toolResultText(blocks core.Blocks) string {
+	var b strings.Builder
+	for _, blk := range blocks {
+		if t, ok := blk.(core.TextBlock); ok {
 			b.WriteString(t.Text)
-		case core.ImageBlock:
-			kind := t.MediaType
-			if kind == "" {
-				kind = "image"
-			}
-			b.WriteString("[non-text tool result block: ")
-			b.WriteString(kind)
-			b.WriteString("]")
-		default:
+		} else {
 			b.WriteString("[non-text tool result block omitted]")
 		}
 	}
@@ -68,8 +101,8 @@ func toolResultText(tr core.ToolResultBlock) string {
 // Thinking blocks are dropped on send (Chat Completions-style input has no
 // thinking channel, and OpenRouter cannot preserve thinking signatures across
 // its normalization); raw blocks are dropped too — core keeps them for the
-// provider that produced them. Tool results map to role:"tool" messages with
-// an "error:" content prefix, since there is no native error flag.
+// provider that produced them. Tool results map to role:"tool" messages (see
+// toolResultContent).
 func convertMessages(msgs []core.Message) ([]components.ChatMessages, error) {
 	out := make([]components.ChatMessages, 0, len(msgs))
 	for i, m := range msgs {
@@ -115,12 +148,8 @@ func convertMessages(msgs []core.Message) ([]components.ChatMessages, error) {
 				if !ok {
 					return nil, fmt.Errorf("tool message at index %d has non-tool_result block %T", i, blk)
 				}
-				content := toolResultText(tr)
-				if tr.IsError {
-					content = "error: " + content
-				}
 				out = append(out, components.CreateChatMessagesTool(components.ChatToolMessage{
-					Content:    components.CreateChatToolMessageContentStr(content),
+					Content:    toolResultContent(tr),
 					ToolCallID: tr.ToolUseID,
 				}))
 			}
