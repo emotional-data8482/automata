@@ -276,6 +276,36 @@ func TestNoOutputSchemaMeansNoResponseFormat(t *testing.T) {
 	}
 }
 
+func TestAutomaticCachingSetsCacheControl(t *testing.T) {
+	for _, caching := range []bool{false, true} {
+		var captured map[string]any
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			raw, _ := io.ReadAll(r.Body)
+			json.Unmarshal(raw, &captured)
+			writeJSON(w, minimalResult)
+		}))
+		opts := []Option{WithAPIKey("test-key"), WithServerURL(ts.URL)}
+		if caching {
+			opts = append(opts, WithAutomaticCaching())
+		}
+		p := New("vendor/model", opts...)
+		if _, err := p.Invoke(context.Background(), core.Request{Messages: []core.Message{textMsg("user", "x")}}); err != nil {
+			t.Fatal(err)
+		}
+		ts.Close()
+		cc, present := captured["cache_control"]
+		if !caching {
+			if present {
+				t.Errorf("cache_control sent without WithAutomaticCaching: %#v", cc)
+			}
+			continue
+		}
+		if m, ok := cc.(map[string]any); !ok || m["type"] != "ephemeral" {
+			t.Errorf("cache_control = %#v, want {\"type\":\"ephemeral\"}", cc)
+		}
+	}
+}
+
 func TestProviderImplementsStructuredOutputCapability(t *testing.T) {
 	var p core.Provider = New("vendor/model")
 	so, ok := p.(core.StructuredOutputProvider)

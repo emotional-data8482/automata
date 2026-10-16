@@ -16,9 +16,10 @@
 // cannot preserve thinking signatures across its normalization); reasoning
 // returned by the model becomes a [core.ThinkingBlock] without a signature.
 // Tool results map to role:"tool" messages with an "error:" content prefix
-// when the result failed, and non-text tool-result blocks degrade to
-// placeholder text. Images map to image_url content parts (data: URLs for
-// inline bytes). CallOptions.ThinkingBudget is ignored (OpenRouter exposes
+// when the result failed; images in user messages and tool results map to
+// image_url content parts (data: URLs for inline bytes), and other non-text
+// tool-result blocks degrade to placeholder text. [WithAutomaticCaching]
+// turns on OpenRouter's automatic prompt caching. CallOptions.ThinkingBudget is ignored (OpenRouter exposes
 // reasoning effort levels, not token budgets).
 package openrouter
 
@@ -102,8 +103,9 @@ func (p *Provider) SupportsNativeStructuredOutput() bool { return true }
 
 // Provider is an OpenRouter-backed core.StreamProvider.
 type Provider struct {
-	model  string
-	client *orsdk.OpenRouter
+	model   string
+	client  *orsdk.OpenRouter
+	caching bool
 }
 
 // Option configures a [Provider] at construction.
@@ -115,6 +117,7 @@ type settings struct {
 	referer   string
 	title     string
 	client    *http.Client
+	caching   bool
 }
 
 // WithAPIKey sets the OpenRouter API key. When empty, requests are sent
@@ -138,6 +141,17 @@ func WithHTTPClient(c *http.Client) Option {
 // app attribution on its public rankings. Both are optional.
 func WithAppInfo(refererURL, title string) Option {
 	return func(s *settings) { s.referer, s.title = refererURL, title }
+}
+
+// WithAutomaticCaching sets OpenRouter's top-level cache_control on every
+// request, so the provider caches the request prefix and the next call that
+// repeats it, such as the next turn of an agent loop, reads it from cache.
+// Providers that cache on their own (OpenAI, DeepSeek) are unaffected;
+// Anthropic models cache only when asked. It is opt-in because Anthropic
+// bills a cache write above the base input price, which a one-shot call pays
+// without ever reading the cache back.
+func WithAutomaticCaching() Option {
+	return func(s *settings) { s.caching = true }
 }
 
 // New builds a Provider for the given OpenRouter model ID (for example
@@ -169,7 +183,7 @@ func New(model string, opts ...Option) *Provider {
 	if s.title != "" {
 		sdkOpts = append(sdkOpts, orsdk.WithXTitle(s.title))
 	}
-	return &Provider{model: model, client: orsdk.New(sdkOpts...)}
+	return &Provider{model: model, client: orsdk.New(sdkOpts...), caching: s.caching}
 }
 
 // buildRequest assembles the SDK ChatRequest from a core Request. stream is
@@ -183,6 +197,9 @@ func (p *Provider) buildRequest(req core.Request, stream bool) (components.ChatR
 		Model:    orsdk.Pointer(p.model),
 		Messages: msgs,
 		Stream:   orsdk.Pointer(stream),
+	}
+	if p.caching {
+		body.CacheControl = &components.AnthropicCacheControlDirective{Type: components.AnthropicCacheControlDirectiveTypeEphemeral}
 	}
 	if len(req.Tools) > 0 {
 		tools, err := convertTools(req.Tools)

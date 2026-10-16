@@ -11,6 +11,9 @@
   tokens. Tool-result images travel as `image_url` content parts on the tool
   message. Degrade unsupported input (thinking blocks, raw blocks) explicitly
   by placeholder or documented drop, never silently.
+- Prompt caching is opt-in through `WithAutomaticCaching`, which sets the
+  top-level `cache_control` directive. Do not turn it on by default: Anthropic
+  bills cache writes above the base input price.
 - Native structured output travels as a `json_schema` response format without
   the strict flag (OpenRouter routes to hundreds of models; strict subsets are
   provider-specific). Core still validates the payload.
