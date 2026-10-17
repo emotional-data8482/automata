@@ -190,6 +190,33 @@ func TestSnapshotGolden(t *testing.T) {
 	golden(t, "list_interactive", srv.URL, navigate(t, s, srv.URL+"/list.html"))
 }
 
+// TestSnapshotSemantics pins footer landmarks, field descriptions and error
+// messages, and live-region text across the actions that change them.
+func TestSnapshotSemantics(t *testing.T) {
+	s := newSession(t, Config{})
+	srv := newFixtures(t, "http://unused.invalid")
+
+	snap := navigate(t, s, srv.URL+"/semantics.html")
+	golden(t, "semantics_navigate", srv.URL, snap)
+	golden(t, "semantics_content", srv.URL, run(t, s, "browser_snapshot", map[string]any{"mode": "content"}).Text())
+
+	submitted := run(t, s, "browser_act", map[string]any{"actions": []map[string]string{
+		{"op": "click", "ref": refFor(t, snap, `button "Submit"`)},
+	}})
+	if submitted.IsError {
+		t.Fatalf("submit: %s", submitted.Text())
+	}
+	golden(t, "semantics_submitted", srv.URL, submitted.Text())
+
+	refreshed := run(t, s, "browser_act", map[string]any{"actions": []map[string]string{
+		{"op": "click", "ref": refFor(t, snap, `button "Refresh status"`)},
+	}})
+	if refreshed.IsError {
+		t.Fatalf("refresh: %s", refreshed.Text())
+	}
+	golden(t, "semantics_refreshed", srv.URL, refreshed.Text())
+}
+
 func TestSnapshotPagingAndWithin(t *testing.T) {
 	s := newSession(t, Config{MaxNodes: 10})
 	srv := newFixtures(t, "http://unused.invalid")

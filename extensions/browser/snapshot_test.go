@@ -320,3 +320,36 @@ func TestValidateRejectsBeforeDispatch(t *testing.T) {
 		}
 	}
 }
+
+func TestRenderLandmarksLiveRegionsAndDescriptions(t *testing.T) {
+	text := func(s string, y float64) *axNode { return &axNode{Role: "StaticText", Name: s, Bounds: box(y)} }
+	field := el("textbox", "Email", 10)
+	field.Description = "Email required"
+	field.Props = map[string]string{"invalid": "true", "errormessage": "Use name@example.com"}
+	live := el("generic", "", 70, text("Sync finished", 70))
+	live.Props = map[string]string{"live": "assertive"}
+	root := &axNode{Role: "RootWebArea", Children: []*axNode{
+		el("banner", "", 0, el("navigation", "Site", 0, el("link", "Home", 0))),
+		field,
+		el("status", "", 40, text("Updated 3 records", 40)),
+		live,
+		el("status", "", 100), // empty: dropped
+		el("contentinfo", "", 130, text("Benchmark v1", 130)),
+		{Role: "contentinfo"}, // empty and unlaid out: dropped
+	}}
+	got := renderText(t, root, renderOptions{})
+	want := `banner
+  navigation "Site"
+    [e1] link "Home"
+[e2] textbox "Email" description="Email required" error="Use name@example.com" (invalid)
+status "Updated 3 records"
+generic "Sync finished" (live assertive)
+contentinfo
+`
+	if got != want {
+		t.Fatalf("interactive got:\n%s\nwant:\n%s", got, want)
+	}
+	if got := renderText(t, root, renderOptions{Mode: modeContent}); !strings.Contains(got, "contentinfo\n  text \"Benchmark v1\"\n") || strings.Contains(got, `text "Updated 3 records"`) {
+		t.Fatalf("content mode should keep the footer text and not repeat live text:\n%s", got)
+	}
+}

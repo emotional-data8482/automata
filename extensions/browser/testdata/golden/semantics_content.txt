@@ -1,0 +1,18 @@
+title: Semantic lab
+url: http://fixture/semantics.html
+
+navigation "Primary"
+  [e1] link "Account"
+  [e2] link "Results"
+main
+  heading "Semantic lab" (level 1)
+  heading "Account" (level 2)
+  form
+    [e3] textbox "Email"
+    [e4] textbox "Code"
+    [e5] button "Submit"
+  heading "Results" (level 2)
+  [e6] button "Refresh status"
+  status "Ready" (live polite)
+contentinfo
+  text "Benchmark v1"

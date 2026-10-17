@@ -1,9 +1,10 @@
 title: Sign up
 url: http://fixture/form.html
 
-navigation "Main"
-  [e1] link "Home"
-  [e2] link "About us"
+banner
+  navigation "Main"
+    [e1] link "Home"
+    [e2] link "About us"
 main
   heading "Create an account" (level 1)
   form "Sign up"

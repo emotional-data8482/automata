@@ -36,12 +36,15 @@ func (r rect) intersects(o rect) bool {
 // The session builds it from Chrome's AX tree joined with DOM layout boxes;
 // tests build it directly.
 type axNode struct {
-	Role      string
-	Name      string
-	Value     string
-	Props     map[string]string
-	Ignored   bool
-	BackendID int
+	Role  string
+	Name  string
+	Value string
+	// Description is the computed accessible description, such as
+	// aria-describedby text.
+	Description string
+	Props       map[string]string
+	Ignored     bool
+	BackendID   int
 	// Bounds is nil when the DOM node has no layout box (display:none,
 	// detached, or a node without DOM backing).
 	Bounds   *rect
@@ -69,6 +72,27 @@ var structuralRoles = map[string]bool{
 	"row": true, "tablist": true, "menu": true, "menubar": true,
 	"radiogroup": true, "group": true, "tree": true, "grid": true,
 	"alert": true,
+}
+
+// landmarkRoles always print their own line when they contain anything, so
+// the model sees page regions such as a footer that holds only text.
+var landmarkRoles = map[string]bool{
+	"banner": true, "navigation": true, "main": true, "contentinfo": true,
+	"complementary": true, "search": true, "region": true,
+}
+
+// liveRoles are live regions by role. Any node with aria-live polite or
+// assertive is one too.
+var liveRoles = map[string]bool{
+	"status": true, "alert": true, "log": true, "timer": true, "marquee": true,
+}
+
+func (n *axNode) live() bool {
+	if liveRoles[n.Role] {
+		return true
+	}
+	l := n.prop("live")
+	return l == "polite" || l == "assertive"
 }
 
 // valueRoles render their current value.
@@ -158,6 +182,12 @@ func formatLine(o *outNode) string {
 			fmt.Fprintf(&b, " value=%q", v)
 		}
 	}
+	if d := clip(n.Description); d != "" && d != clip(name) {
+		fmt.Fprintf(&b, " description=%q", d)
+	}
+	if e := clip(n.prop("errormessage")); e != "" && e != clip(n.Description) {
+		fmt.Fprintf(&b, " error=%q", e)
+	}
 	if states := states(n); len(states) > 0 {
 		fmt.Fprintf(&b, " (%s)", strings.Join(states, ", "))
 	}
@@ -205,6 +235,9 @@ func states(n *axNode) []string {
 	}
 	if n.prop("focused") == "true" {
 		out = append(out, "focused")
+	}
+	if l := n.prop("live"); l == "polite" || l == "assertive" {
+		out = append(out, "live "+l)
 	}
 	return out
 }
@@ -303,12 +336,29 @@ func (r *renderer) prune(n *axNode, ancestorName string) []*outNode {
 		}
 		return []*outNode{{n: n}}
 
+	case n.live():
+		// A live region prints its current text as its name in every mode, so
+		// the snapshot an action returns carries what the page announced.
+		name := n.Name
+		if strings.TrimSpace(name) == "" {
+			name = visibleText(n)
+		}
+		kids := r.pruneChildren(n, name)
+		if len(kids) == 0 && (name == "" || !n.visible() || !r.onScreen(n)) {
+			return nil
+		}
+		return []*outNode{{n: n, name: name, kids: kids}}
+
 	case structuralRoles[n.Role]:
 		kids := r.pruneChildren(n, ancestorName)
 		if len(kids) == 0 {
+			if landmarkRoles[n.Role] && n.visible() && visibleText(n) != "" && r.onScreen(n) {
+				// Its text was pruned (interactive mode), but the region is there.
+				return []*outNode{{n: n}}
+			}
 			return nil
 		}
-		if strings.TrimSpace(n.Name) == "" && len(kids) == 1 {
+		if strings.TrimSpace(n.Name) == "" && len(kids) == 1 && !landmarkRoles[n.Role] {
 			// Collapse unnamed single-child chains.
 			return kids
 		}

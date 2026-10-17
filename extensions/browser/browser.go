@@ -463,11 +463,12 @@ func buildTree(nodes []*proto.AccessibilityAXNode, bounds map[int]rect) *axNode 
 	byID := make(map[proto.AccessibilityAXNodeID]*axNode, len(nodes))
 	for _, n := range nodes {
 		out := &axNode{
-			Role:      axString(n.Role),
-			Name:      axString(n.Name),
-			Value:     axString(n.Value),
-			Ignored:   n.Ignored,
-			BackendID: int(n.BackendDOMNodeID),
+			Role:        axString(n.Role),
+			Name:        axString(n.Name),
+			Value:       axString(n.Value),
+			Description: axString(n.Description),
+			Ignored:     n.Ignored,
+			BackendID:   int(n.BackendDOMNodeID),
 		}
 		if len(n.Properties) > 0 {
 			out.Props = make(map[string]string, len(n.Properties))
@@ -481,8 +482,14 @@ func buildTree(nodes []*proto.AccessibilityAXNode, bounds map[int]rect) *axNode 
 		byID[n.NodeID] = out
 	}
 	var root *axNode
+	var errs []*proto.AccessibilityAXNode // nodes with aria-errormessage
 	for _, n := range nodes {
 		parent := byID[n.NodeID]
+		for _, p := range n.Properties {
+			if p.Name == proto.AccessibilityAXPropertyNameErrormessage && p.Value != nil && len(p.Value.RelatedNodes) > 0 {
+				errs = append(errs, n)
+			}
+		}
 		for _, id := range n.ChildIDs {
 			if c, ok := byID[id]; ok {
 				parent.Children = append(parent.Children, c)
@@ -492,7 +499,35 @@ func buildTree(nodes []*proto.AccessibilityAXNode, bounds map[int]rect) *axNode 
 			root = parent
 		}
 	}
+	for _, n := range errs {
+		byID[n.NodeID].Props["errormessage"] = errorText(root, n)
+	}
 	return root
+}
+
+// errorText joins the text of the elements an aria-errormessage points at.
+func errorText(root *axNode, n *proto.AccessibilityAXNode) string {
+	var parts []string
+	for _, p := range n.Properties {
+		if p.Name != proto.AccessibilityAXPropertyNameErrormessage || p.Value == nil {
+			continue
+		}
+		for _, rel := range p.Value.RelatedNodes {
+			text := rel.Text
+			if text == "" && root != nil {
+				if target := findBackend(root, int(rel.BackendDOMNodeID)); target != nil {
+					text = target.Name
+					if strings.TrimSpace(text) == "" {
+						text = visibleText(target)
+					}
+				}
+			}
+			if text = strings.TrimSpace(text); text != "" {
+				parts = append(parts, text)
+			}
+		}
+	}
+	return strings.Join(parts, " ")
 }
 
 func axString(v *proto.AccessibilityAXValue) string {

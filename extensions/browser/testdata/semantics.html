@@ -1,0 +1,42 @@
+<!doctype html>
+<html><head><title>Semantic lab</title>
+<style>body{margin:0;font:16px sans-serif}</style>
+</head><body>
+<nav aria-label="Primary"><a href="#account">Account</a> <a href="#results">Results</a></nav>
+<main>
+  <h1>Semantic lab</h1>
+  <section id="account"><h2>Account</h2>
+    <form id="form" novalidate>
+      <label for="email">Email</label>
+      <input id="email" aria-describedby="email-error">
+      <p id="email-error"></p>
+      <label for="code">Code</label>
+      <input id="code" aria-errormessage="code-error">
+      <p id="code-error" hidden>Code must be 6 digits</p>
+      <button>Submit</button>
+    </form>
+  </section>
+  <section id="results"><h2>Results</h2>
+    <button type="button" id="refresh">Refresh status</button>
+    <p id="status" role="status" aria-live="polite">Ready</p>
+    <div aria-live="assertive" id="toast"></div>
+  </section>
+</main>
+<footer>Benchmark v1</footer>
+<script>
+const el = id => document.getElementById(id);
+el('refresh').onclick = () => {
+  el('status').textContent = 'Updated 3 records';
+  el('toast').textContent = 'Sync finished';
+};
+el('form').onsubmit = e => {
+  e.preventDefault();
+  const empty = !el('email').value;
+  el('email').setAttribute('aria-invalid', String(empty));
+  el('email-error').textContent = empty ? 'Email required' : '';
+  const bad = !/^\d{6}$/.test(el('code').value);
+  el('code').setAttribute('aria-invalid', String(bad));
+  el('code-error').hidden = !bad;
+};
+</script>
+</body></html>

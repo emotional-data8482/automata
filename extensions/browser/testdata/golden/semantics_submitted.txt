@@ -1,0 +1,19 @@
+completed 1 action(s).
+
+title: Semantic lab
+url: http://fixture/semantics.html
+
+navigation "Primary"
+  [e1] link "Account"
+  [e2] link "Results"
+main
+  heading "Semantic lab" (level 1)
+  heading "Account" (level 2)
+  form
+    [e3] textbox "Email" description="Email required" (invalid)
+    [e4] textbox "Code" error="Code must be 6 digits" (invalid)
+    [e5] button "Submit" (focused)
+  heading "Results" (level 2)
+  [e6] button "Refresh status"
+  status "Ready" (live polite)
+contentinfo
