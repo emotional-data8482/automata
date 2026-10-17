@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"image/png"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -415,11 +416,21 @@ func TestScreenshot(t *testing.T) {
 		return cfg.Width, cfg.Height
 	}
 
-	if w, h := size(t, run(t, s, "browser_screenshot", nil)); w != 1024 || h != 640 {
-		t.Errorf("viewport screenshot = %dx%d, want 1024x640", w, h)
+	// Non-overlay scrollbars reduce the visual viewport width on Linux.
+	// Check the actual viewport's aspect ratio, not the configured page size.
+	viewport, err := visualViewport(s.page)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if w, h := size(t, run(t, s, "browser_screenshot", map[string]any{"max_px": 200})); w != 200 || h != 125 {
-		t.Errorf("max_px screenshot = %dx%d, want 200x125", w, h)
+	for _, maxPx := range []int{defaultScreenshot, 200} {
+		var input map[string]any
+		if maxPx != defaultScreenshot {
+			input = map[string]any{"max_px": maxPx}
+		}
+		wantH := int(math.Round(viewport.ClientHeight * float64(maxPx) / viewport.ClientWidth))
+		if w, h := size(t, run(t, s, "browser_screenshot", input)); w != maxPx || h != wantH {
+			t.Errorf("max_px %d screenshot = %dx%d, want %dx%d", maxPx, w, h, maxPx, wantH)
+		}
 	}
 	if w, h := size(t, run(t, s, "browser_screenshot", map[string]any{"full_page": true})); h != 1024 || w >= h {
 		t.Errorf("full-page screenshot = %dx%d, want a 1024px-tall portrait image", w, h)
